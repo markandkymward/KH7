@@ -252,7 +252,7 @@ void App_Update(void)
       }
     }
 
-    Motors_WriteUs(s1_us, s2_us, s3_us, s4_us);
+    Motors_WriteUs(s3_us, s2_us, s4_us, s1_us);
 
     if ((now_ms - last_receiver_telemetry_ms) >= 500U)
     {
@@ -414,7 +414,7 @@ void App_Update(void)
         s3_us = App_ClampPulseUs(m_rear_right);
         s4_us = App_ClampPulseUs(m_rear_left);
 
-        Motors_WriteUs(s1_us, s2_us, s3_us, s4_us);
+        Motors_WriteUs(s3_us, s2_us, s4_us, s1_us);
       }
     }
   }
