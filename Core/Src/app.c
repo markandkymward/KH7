@@ -18,6 +18,7 @@
 #define APP_ARM_THRESHOLD_US   1500U
 #define APP_THROTTLE_LOW_US    1050U
 #define APP_ARM_HOLD_MS        300U
+#define APP_BEEPER_TOGGLE_MS   150U
 #define APP_CONTROL_DEADBAND_US 20U
 #define APP_MIX_ATTENUATION_DIV 3
 #define APP_MOTOR_IDLE_US      1080U
@@ -115,6 +116,10 @@ void App_Update(void)
   static uint8_t motors_armed = 0U;
   static uint8_t trim_captured = 0U;
   static uint32_t arm_hold_start_ms = 0U;
+  static uint8_t startup_safety_checked = 0U;
+  static uint8_t startup_arm_blocked = 0U;
+  static uint8_t beeper_on = 0U;
+  static uint32_t last_beeper_toggle_ms = 0U;
   static uint16_t roll_center_us = APP_PWM_MID_US;
   static uint16_t pitch_center_us = APP_PWM_MID_US;
   static uint16_t yaw_center_us = APP_PWM_MID_US;
@@ -194,68 +199,111 @@ void App_Update(void)
     arm_switch_high = (uint8_t)(arm_us >= APP_ARM_THRESHOLD_US);
     throttle_low = (uint8_t)(throttle_us <= APP_THROTTLE_LOW_US);
 
-    if ((receiver_state.link_active == 0U) || (arm_switch_high == 0U))
+    if ((startup_safety_checked == 0U) && (receiver_state.link_active != 0U))
+    {
+      startup_safety_checked = 1U;
+      if (arm_switch_high != 0U)
+      {
+        startup_arm_blocked = 1U;
+      }
+    }
+
+    if (startup_arm_blocked != 0U)
     {
       motors_armed = 0U;
       trim_captured = 0U;
       arm_hold_start_ms = 0U;
-    }
 
-    Motors_SetOutputEnabled(1U);
-
-    if (motors_armed == 0U)
-    {
+      Motors_SetOutputEnabled(0U);
       Motors_StopAll();
-      s1_us = APP_PWM_MIN_US;
-      s2_us = APP_PWM_MIN_US;
-      s3_us = APP_PWM_MIN_US;
-      s4_us = APP_PWM_MIN_US;
 
-      if ((receiver_state.link_active != 0U) &&
-          (arm_switch_high != 0U) &&
-          (throttle_low != 0U))
+      if ((now_ms - last_beeper_toggle_ms) >= APP_BEEPER_TOGGLE_MS)
       {
-        if (arm_hold_start_ms == 0U)
-        {
-          arm_hold_start_ms = now_ms;
-        }
-        else if ((now_ms - arm_hold_start_ms) >= APP_ARM_HOLD_MS)
-        {
-          motors_armed = 1U;
-          trim_captured = 0U;
-        }
+        beeper_on ^= 1U;
+        HAL_GPIO_WritePin(BEEPER_GPIO_Port,
+                          BEEPER_Pin,
+                          (beeper_on != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        last_beeper_toggle_ms = now_ms;
       }
-      else
+
+      if (arm_switch_high == 0U)
       {
+        startup_arm_blocked = 0U;
+        beeper_on = 0U;
+        HAL_GPIO_WritePin(BEEPER_GPIO_Port, BEEPER_Pin, GPIO_PIN_RESET);
+      }
+    }
+    else
+    {
+      if (beeper_on != 0U)
+      {
+        beeper_on = 0U;
+        HAL_GPIO_WritePin(BEEPER_GPIO_Port, BEEPER_Pin, GPIO_PIN_RESET);
+      }
+
+      if ((receiver_state.link_active == 0U) || (arm_switch_high == 0U))
+      {
+        motors_armed = 0U;
+        trim_captured = 0U;
         arm_hold_start_ms = 0U;
       }
-    }
 
-    if (motors_armed != 0U)
-    {
-      if (trim_captured == 0U)
+      Motors_SetOutputEnabled(1U);
+
+      if (motors_armed == 0U)
       {
-        roll_center_us = roll_us;
-        pitch_center_us = pitch_us;
-        yaw_center_us = yaw_us;
-        trim_captured = 1U;
+        Motors_StopAll();
+        s1_us = APP_PWM_MIN_US;
+        s2_us = APP_PWM_MIN_US;
+        s3_us = APP_PWM_MIN_US;
+        s4_us = APP_PWM_MIN_US;
+
+        if ((receiver_state.link_active != 0U) &&
+            (arm_switch_high != 0U) &&
+            (throttle_low != 0U))
+        {
+          if (arm_hold_start_ms == 0U)
+          {
+            arm_hold_start_ms = now_ms;
+          }
+          else if ((now_ms - arm_hold_start_ms) >= APP_ARM_HOLD_MS)
+          {
+            motors_armed = 1U;
+            trim_captured = 0U;
+          }
+        }
+        else
+        {
+          arm_hold_start_ms = 0U;
+        }
       }
 
-      roll_term = App_ApplyDeadbandAndAttenuate((int32_t)roll_us - (int32_t)roll_center_us);
-      pitch_term = App_ApplyDeadbandAndAttenuate((int32_t)pitch_us - (int32_t)pitch_center_us);
-      yaw_term = App_ApplyDeadbandAndAttenuate((int32_t)yaw_us - (int32_t)yaw_center_us);
-      throttle_term = (int32_t)throttle_us;
-      if (throttle_term < (int32_t)APP_MOTOR_IDLE_US)
+      if (motors_armed != 0U)
       {
-        throttle_term = APP_MOTOR_IDLE_US;
+        if (trim_captured == 0U)
+        {
+          roll_center_us = roll_us;
+          pitch_center_us = pitch_us;
+          yaw_center_us = yaw_us;
+          trim_captured = 1U;
+        }
+
+        roll_term = App_ApplyDeadbandAndAttenuate((int32_t)roll_us - (int32_t)roll_center_us);
+        pitch_term = App_ApplyDeadbandAndAttenuate((int32_t)pitch_us - (int32_t)pitch_center_us);
+        yaw_term = App_ApplyDeadbandAndAttenuate((int32_t)yaw_us - (int32_t)yaw_center_us);
+        throttle_term = (int32_t)throttle_us;
+        if (throttle_term < (int32_t)APP_MOTOR_IDLE_US)
+        {
+          throttle_term = APP_MOTOR_IDLE_US;
+        }
+
+        s1_us = App_ClampPulseUs(throttle_term + pitch_term + roll_term - yaw_term);
+        s2_us = App_ClampPulseUs(throttle_term + pitch_term - roll_term + yaw_term);
+        s3_us = App_ClampPulseUs(throttle_term - pitch_term - roll_term - yaw_term);
+        s4_us = App_ClampPulseUs(throttle_term - pitch_term + roll_term + yaw_term);
+
+        Motors_WriteUs(s1_us, s2_us, s3_us, s4_us);
       }
-
-      s1_us = App_ClampPulseUs(throttle_term + pitch_term + roll_term - yaw_term);
-      s2_us = App_ClampPulseUs(throttle_term + pitch_term - roll_term + yaw_term);
-      s3_us = App_ClampPulseUs(throttle_term - pitch_term - roll_term - yaw_term);
-      s4_us = App_ClampPulseUs(throttle_term - pitch_term + roll_term + yaw_term);
-
-      Motors_WriteUs(s1_us, s2_us, s3_us, s4_us);
     }
   }
 
