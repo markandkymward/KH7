@@ -1,0 +1,45 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build KH7 Debug",
+			"type": "shell",
+			"command": "cmake",
+			"args": [
+				"--build",
+				"--preset",
+				"Debug"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Flash KH7 (ST-Link OpenOCD)",
+			"type": "shell",
+			"command": "C:/Users/marka/AppData/Local/Microsoft/WinGet/Packages/xpack-dev-tools.openocd-xpack_Microsoft.Winget.Source_8wekyb3d8bbwe/xpack-openocd-0.12.0-7/bin/openocd.exe",
+			"args": [
+				"-f",
+				"interface/stlink.cfg",
+				"-f",
+				"target/stm32h7x.cfg",
+				"-c",
+				"program ${workspaceFolder}/build/Debug/KH7.elf verify reset exit"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Start KH7 GDB Server (ST-Link OpenOCD)",
+			"type": "shell",
+			"command": "C:/Users/marka/AppData/Local/Microsoft/WinGet/Packages/xpack-dev-tools.openocd-xpack_Microsoft.Winget.Source_8wekyb3d8bbwe/xpack-openocd-0.12.0-7/bin/openocd.exe",
+			"args": [
+				"-f",
+				"interface/stlink.cfg",
+				"-f",
+				"target/stm32h7x.cfg"
+			],
+			"isBackground": true,
+			"problemMatcher": []
+		}
+	]
+}
