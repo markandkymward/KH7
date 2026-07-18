@@ -18,15 +18,11 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "app.h"
 #include "usb_device.h"
-#include "usbd_cdc_if.h"
-#include "arm_math.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <stdio.h>
-#include <string.h>
-#include <math.h>
 
 /* USER CODE END Includes */
 
@@ -37,26 +33,6 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define IMU_READ_BIT                        0x80U
-#define IMU_LOG_PERIOD_MS                   100U
-#define IMU_SPI_TIMEOUT_MS                  100U
-#define IMU_CS_GPIO_PORT                    GPIOE
-#define IMU_CS_PIN                          GPIO_PIN_4
-
-#define IMU_WHOAMI_ICM42688                 0x47U
-
-#define IMU_ICM_PWR_MGMT0                   0x4EU
-#define IMU_ICM_GYRO_CFG0                   0x4FU
-#define IMU_ICM_ACCEL_CFG0                  0x50U
-#define IMU_ICM_BURST_START                 0x1FU
-#define IMU_ICM_WHOAMI_REG                  0x75U
-#define IMU_ICM_BANK_SEL_REG                0x76U
-#define IMU_ICM_DEVICE_CONFIG_REG           0x11U
-
-#define IMU_ACCEL_LSB_PER_G                 2048.0f
-#define IMU_GYRO_LSB_PER_DPS                16.4f
-#define DEG_PER_RAD                         57.2957795f
-#define RAD_PER_DEG                         0.0174532925f
 
 /* USER CODE END PD */
 
@@ -76,6 +52,9 @@ SPI_HandleTypeDef hspi1;
 SPI_HandleTypeDef hspi2;
 SPI_HandleTypeDef hspi4;
 
+TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim3;
+
 UART_HandleTypeDef huart4;
 UART_HandleTypeDef huart7;
 UART_HandleTypeDef huart1;
@@ -84,37 +63,6 @@ UART_HandleTypeDef huart3;
 UART_HandleTypeDef huart6;
 
 /* USER CODE BEGIN PV */
-typedef enum
-{
-  IMU_TYPE_UNKNOWN = 0,
-  IMU_TYPE_ICM42688
-} IMU_TypeDef;
-
-typedef struct
-{
-  int16_t accel_x;
-  int16_t accel_y;
-  int16_t accel_z;
-  int16_t gyro_x;
-  int16_t gyro_y;
-  int16_t gyro_z;
-} IMU_RawData_t;
-
-typedef struct
-{
-  float q0;
-  float q1;
-  float q2;
-  float q3;
-  float integral_x;
-  float integral_y;
-  float integral_z;
-} AHRS_State_t;
-
-static IMU_TypeDef g_imu_type = IMU_TYPE_UNKNOWN;
-static uint8_t g_imu_whoami = 0U;
-static AHRS_State_t g_ahrs = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-extern USBD_HandleTypeDef hUsbDeviceFS;
 
 /* USER CODE END PV */
 
@@ -136,301 +84,14 @@ static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_USART6_UART_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
-static HAL_StatusTypeDef IMU_WriteReg(uint8_t reg, uint8_t value);
-static HAL_StatusTypeDef IMU_ReadRegs(uint8_t reg, uint8_t *data, uint16_t len);
-static HAL_StatusTypeDef IMU_DetectAndInit(void);
-static HAL_StatusTypeDef IMU_ReadRaw(IMU_RawData_t *raw);
-static void IMU_ApplyOrientationCW270(IMU_RawData_t *raw);
-static void AHRS_UpdateIMU(AHRS_State_t *state,
-                           float gx_rad_s,
-                           float gy_rad_s,
-                           float gz_rad_s,
-                           float ax_g,
-                           float ay_g,
-                           float az_g,
-                           float dt_s);
-static void AHRS_GetBoardAnglesDeg(const AHRS_State_t *state,
-                                   float *pitch_deg,
-                                   float *roll_deg,
-                                   float *yaw_deg);
-static float WrapAngle180(float angle_deg);
-static void IMU_PrintAngles(float pitch_deg, float roll_deg, float yaw_deg);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
-static HAL_StatusTypeDef IMU_WriteReg(uint8_t reg, uint8_t value)
-{
-  uint8_t frame[2] = {reg, value};
-  HAL_GPIO_WritePin(IMU_CS_GPIO_PORT, IMU_CS_PIN, GPIO_PIN_RESET);
-  if (HAL_SPI_Transmit(&hspi4, frame, 2U, IMU_SPI_TIMEOUT_MS) != HAL_OK)
-  {
-    HAL_GPIO_WritePin(IMU_CS_GPIO_PORT, IMU_CS_PIN, GPIO_PIN_SET);
-    return HAL_ERROR;
-  }
-  HAL_GPIO_WritePin(IMU_CS_GPIO_PORT, IMU_CS_PIN, GPIO_PIN_SET);
-  return HAL_OK;
-}
-
-static HAL_StatusTypeDef IMU_ReadRegs(uint8_t reg, uint8_t *data, uint16_t len)
-{
-  uint8_t tx[32];
-  uint8_t rx[32];
-
-  if ((len == 0U) || ((len + 1U) > sizeof(tx)))
-  {
-    return HAL_ERROR;
-  }
-
-  memset(tx, 0, sizeof(tx));
-  memset(rx, 0, sizeof(rx));
-  tx[0] = reg | IMU_READ_BIT;
-
-  HAL_GPIO_WritePin(IMU_CS_GPIO_PORT, IMU_CS_PIN, GPIO_PIN_RESET);
-  if (HAL_SPI_TransmitReceive(&hspi4, tx, rx, (uint16_t)(len + 1U), IMU_SPI_TIMEOUT_MS) != HAL_OK)
-  {
-    HAL_GPIO_WritePin(IMU_CS_GPIO_PORT, IMU_CS_PIN, GPIO_PIN_SET);
-    return HAL_ERROR;
-  }
-  HAL_GPIO_WritePin(IMU_CS_GPIO_PORT, IMU_CS_PIN, GPIO_PIN_SET);
-
-  memcpy(data, &rx[1], len);
-  return HAL_OK;
-}
-
-static HAL_StatusTypeDef IMU_DetectAndInit(void)
-{
-  uint8_t whoami = 0U;
-
-  (void)IMU_WriteReg(IMU_ICM_BANK_SEL_REG, 0x00U);
-  if (IMU_ReadRegs(IMU_ICM_WHOAMI_REG, &whoami, 1U) == HAL_OK)
-  {
-    if (whoami == IMU_WHOAMI_ICM42688)
-    {
-      g_imu_type = IMU_TYPE_ICM42688;
-      g_imu_whoami = whoami;
-
-      (void)IMU_WriteReg(IMU_ICM_DEVICE_CONFIG_REG, 0x01U);
-      HAL_Delay(2);
-      (void)IMU_WriteReg(IMU_ICM_BANK_SEL_REG, 0x00U);
-      (void)IMU_WriteReg(IMU_ICM_PWR_MGMT0, 0x0FU);
-      HAL_Delay(10);
-      (void)IMU_WriteReg(IMU_ICM_GYRO_CFG0, 0x06U);
-      (void)IMU_WriteReg(IMU_ICM_ACCEL_CFG0, 0x06U);
-      return HAL_OK;
-    }
-  }
-
-  g_imu_type = IMU_TYPE_UNKNOWN;
-  g_imu_whoami = whoami;
-
-  return HAL_ERROR;
-}
-
-static HAL_StatusTypeDef IMU_ReadRaw(IMU_RawData_t *raw)
-{
-  uint8_t burst[14];
-
-  if (raw == NULL)
-  {
-    return HAL_ERROR;
-  }
-
-  if (g_imu_type == IMU_TYPE_ICM42688)
-  {
-    (void)IMU_WriteReg(IMU_ICM_BANK_SEL_REG, 0x00U);
-    if (IMU_ReadRegs(IMU_ICM_BURST_START, burst, 12U) != HAL_OK)
-    {
-      return HAL_ERROR;
-    }
-
-    raw->accel_x = (int16_t)((burst[0] << 8) | burst[1]);
-    raw->accel_y = (int16_t)((burst[2] << 8) | burst[3]);
-    raw->accel_z = (int16_t)((burst[4] << 8) | burst[5]);
-    raw->gyro_x  = (int16_t)((burst[6] << 8) | burst[7]);
-    raw->gyro_y  = (int16_t)((burst[8] << 8) | burst[9]);
-    raw->gyro_z  = (int16_t)((burst[10] << 8) | burst[11]);
-    return HAL_OK;
-  }
-
-  return HAL_ERROR;
-}
-
-static void IMU_ApplyOrientationCW270(IMU_RawData_t *raw)
-{
-  int16_t old_ax;
-  int16_t old_ay;
-  int16_t old_az;
-  int16_t old_gx;
-  int16_t old_gy;
-  int16_t old_gz;
-
-  old_ax = raw->accel_x;
-  old_ay = raw->accel_y;
-  old_az = raw->accel_z;
-  old_gx = raw->gyro_x;
-  old_gy = raw->gyro_y;
-  old_gz = raw->gyro_z;
-
-  raw->accel_x = (int16_t)(-old_ay);
-  raw->accel_y = (int16_t)(-old_ax);
-  raw->accel_z = old_az;
-  raw->gyro_x = (int16_t)(-old_gy);
-  raw->gyro_y = (int16_t)(-old_gx);
-  raw->gyro_z = old_gz;
-}
-
-static float WrapAngle180(float angle_deg)
-{
-  while (angle_deg <= -180.0f)
-  {
-    angle_deg += 360.0f;
-  }
-  while (angle_deg > 180.0f)
-  {
-    angle_deg -= 360.0f;
-  }
-  return angle_deg;
-}
-
-static void AHRS_UpdateIMU(AHRS_State_t *state,
-                           float gx_rad_s,
-                           float gy_rad_s,
-                           float gz_rad_s,
-                           float ax_g,
-                           float ay_g,
-                           float az_g,
-                           float dt_s)
-{
-  const float two_kp = 3.0f;
-  const float two_ki = 0.2f;
-  float recip_norm;
-  float half_vx;
-  float half_vy;
-  float half_vz;
-  float half_ex;
-  float half_ey;
-  float half_ez;
-  float norm_sq;
-  arm_status status;
-
-  norm_sq = (ax_g * ax_g) + (ay_g * ay_g) + (az_g * az_g);
-  status = arm_sqrt_f32(norm_sq, &recip_norm);
-  if ((status == ARM_MATH_SUCCESS) && (recip_norm > 0.0001f))
-  {
-    ax_g /= recip_norm;
-    ay_g /= recip_norm;
-    az_g /= recip_norm;
-
-    half_vx = state->q1 * state->q3 - state->q0 * state->q2;
-    half_vy = state->q0 * state->q1 + state->q2 * state->q3;
-    half_vz = state->q0 * state->q0 - 0.5f + state->q3 * state->q3;
-
-    half_ex = (ay_g * half_vz) - (az_g * half_vy);
-    half_ey = (az_g * half_vx) - (ax_g * half_vz);
-    half_ez = (ax_g * half_vy) - (ay_g * half_vx);
-
-    state->integral_x += two_ki * half_ex * dt_s;
-    state->integral_y += two_ki * half_ey * dt_s;
-    state->integral_z += two_ki * half_ez * dt_s;
-
-    gx_rad_s += state->integral_x + (two_kp * half_ex);
-    gy_rad_s += state->integral_y + (two_kp * half_ey);
-    gz_rad_s += state->integral_z + (two_kp * half_ez);
-  }
-
-  gx_rad_s *= 0.5f * dt_s;
-  gy_rad_s *= 0.5f * dt_s;
-  gz_rad_s *= 0.5f * dt_s;
-
-  {
-    float qa = state->q0;
-    float qb = state->q1;
-    float qc = state->q2;
-
-    state->q0 += (-qb * gx_rad_s - qc * gy_rad_s - state->q3 * gz_rad_s);
-    state->q1 += (qa * gx_rad_s + qc * gz_rad_s - state->q3 * gy_rad_s);
-    state->q2 += (qa * gy_rad_s - qb * gz_rad_s + state->q3 * gx_rad_s);
-    state->q3 += (qa * gz_rad_s + qb * gy_rad_s - qc * gx_rad_s);
-  }
-
-  norm_sq = (state->q0 * state->q0) +
-            (state->q1 * state->q1) +
-            (state->q2 * state->q2) +
-            (state->q3 * state->q3);
-  status = arm_sqrt_f32(norm_sq, &recip_norm);
-  if ((status == ARM_MATH_SUCCESS) && (recip_norm > 0.0001f))
-  {
-    state->q0 /= recip_norm;
-    state->q1 /= recip_norm;
-    state->q2 /= recip_norm;
-    state->q3 /= recip_norm;
-  }
-}
-
-static void AHRS_GetBoardAnglesDeg(const AHRS_State_t *state,
-                                   float *pitch_deg,
-                                   float *roll_deg,
-                                   float *yaw_deg)
-{
-  float g_x;
-  float g_y;
-  float g_z;
-  float yaw;
-
-  g_x = 2.0f * ((state->q1 * state->q3) - (state->q0 * state->q2));
-  g_y = 2.0f * ((state->q0 * state->q1) + (state->q2 * state->q3));
-  g_z = (state->q0 * state->q0) - (state->q1 * state->q1) - (state->q2 * state->q2) + (state->q3 * state->q3);
-
-  *pitch_deg = WrapAngle180(atan2f(g_x, g_z) * DEG_PER_RAD);
-  *roll_deg = WrapAngle180(atan2f(-g_y, g_z) * DEG_PER_RAD);
-
-  yaw = -atan2f(2.0f * ((state->q0 * state->q3) + (state->q1 * state->q2)),
-                1.0f - 2.0f * ((state->q2 * state->q2) + (state->q3 * state->q3))) * DEG_PER_RAD;
-  *yaw_deg = WrapAngle180(yaw);
-}
-
-static void IMU_PrintAngles(float pitch_deg, float roll_deg, float yaw_deg)
-{
-  int32_t p10;
-  int32_t r10;
-  int32_t y10;
-  int32_t p10_frac;
-  int32_t r10_frac;
-  int32_t y10_frac;
-
-  p10 = (int32_t)(pitch_deg * 10.0f + 0.5f);
-  r10 = (int32_t)(roll_deg * 10.0f + 0.5f);
-  y10 = (int32_t)(yaw_deg * 10.0f + 0.5f);
-
-  p10_frac = p10 % 10;
-  r10_frac = r10 % 10;
-  y10_frac = y10 % 10;
-
-  if (p10_frac < 0)
-  {
-    p10_frac = -p10_frac;
-  }
-  if (r10_frac < 0)
-  {
-    r10_frac = -r10_frac;
-  }
-  if (y10_frac < 0)
-  {
-    y10_frac = -y10_frac;
-  }
-
-  printf("ANGLES[p r y]=[%ld.%01ld %ld.%01ld %ld.%01ld]\r\n",
-         (long)(p10 / 10),
-         (long)p10_frac,
-         (long)(r10 / 10),
-         (long)r10_frac,
-         (long)(y10 / 10),
-         (long)y10_frac);
-}
 
 /* USER CODE END 0 */
 
@@ -483,19 +144,10 @@ int main(void)
   MX_USART3_UART_Init();
   MX_USART6_UART_Init();
   MX_USB_DEVICE_Init();
+  MX_TIM2_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-  IMU_RawData_t imu_raw;
-
-  printf("IMU logger start on SPI4\r\n");
-
-  if (IMU_DetectAndInit() == HAL_OK)
-  {
-    printf("IMU detected: type=%d whoami=0x%02X\r\n", (int)g_imu_type, g_imu_whoami);
-  }
-  else
-  {
-    printf("IMU detection failed on SPI4\r\n");
-  }
+  App_Init();
 
   /* USER CODE END 2 */
 
@@ -503,82 +155,10 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    static uint32_t detect_retry_counter = 0U;
-    static uint32_t last_tick_ms = 0U;
-    static uint8_t yaw_zero_captured = 0U;
-    static float startup_yaw_offset_deg = 0.0f;
-    uint32_t now_ms;
-    float dt_s;
-    float ax_g;
-    float ay_g;
-    float az_g;
-    float gx_dps;
-    float gy_dps;
-    float gz_dps;
-    float pitch_deg;
-    float roll_deg;
-    float yaw_deg;
-
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    HAL_GPIO_TogglePin(LED0_GPIO_Port, LED0_Pin);
-
-    now_ms = HAL_GetTick();
-    if (last_tick_ms == 0U)
-    {
-      dt_s = ((float)IMU_LOG_PERIOD_MS) * 0.001f;
-    }
-    else
-    {
-      dt_s = ((float)(now_ms - last_tick_ms)) * 0.001f;
-    }
-    last_tick_ms = now_ms;
-
-    if ((g_imu_type == IMU_TYPE_UNKNOWN) && ((detect_retry_counter++ % 10U) == 0U))
-    {
-      if (IMU_DetectAndInit() == HAL_OK)
-      {
-        printf("IMU detected: type=%d whoami=0x%02X\r\n", (int)g_imu_type, g_imu_whoami);
-      }
-    }
-
-    if ((g_imu_type != IMU_TYPE_UNKNOWN) && (IMU_ReadRaw(&imu_raw) == HAL_OK))
-    {
-      IMU_ApplyOrientationCW270(&imu_raw);
-
-      ax_g = ((float)imu_raw.accel_x) / IMU_ACCEL_LSB_PER_G;
-      ay_g = ((float)imu_raw.accel_y) / IMU_ACCEL_LSB_PER_G;
-      az_g = ((float)imu_raw.accel_z) / IMU_ACCEL_LSB_PER_G;
-      gx_dps = ((float)imu_raw.gyro_x) / IMU_GYRO_LSB_PER_DPS;
-      gy_dps = ((float)imu_raw.gyro_y) / IMU_GYRO_LSB_PER_DPS;
-      gz_dps = ((float)imu_raw.gyro_z) / IMU_GYRO_LSB_PER_DPS;
-
-      AHRS_UpdateIMU(&g_ahrs,
-                     gx_dps * RAD_PER_DEG,
-                     gy_dps * RAD_PER_DEG,
-                     gz_dps * RAD_PER_DEG,
-                     ax_g,
-                     ay_g,
-                     az_g,
-                     dt_s);
-      AHRS_GetBoardAnglesDeg(&g_ahrs, &pitch_deg, &roll_deg, &yaw_deg);
-
-      if (yaw_zero_captured == 0U)
-      {
-        startup_yaw_offset_deg = yaw_deg;
-        yaw_zero_captured = 1U;
-      }
-
-      yaw_deg = WrapAngle180(yaw_deg - startup_yaw_offset_deg);
-      IMU_PrintAngles(pitch_deg, roll_deg, yaw_deg);
-    }
-    else
-    {
-      printf("IMU read failed (type=%d whoami=0x%02X)\r\n", (int)g_imu_type, g_imu_whoami);
-    }
-
-    HAL_Delay(IMU_LOG_PERIOD_MS);
+    App_Update();
   }
   /* USER CODE END 3 */
 }
@@ -1025,7 +605,7 @@ static void MX_SPI4_Init(void)
   hspi4.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi4.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi4.Init.NSS = SPI_NSS_SOFT;
-  hspi4.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+  hspi4.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
   hspi4.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi4.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi4.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -1051,6 +631,112 @@ static void MX_SPI4_Init(void)
 }
 
 /**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 63;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 2499;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+  HAL_TIM_MspPostInit(&htim2);
+
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 63;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 2499;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+  HAL_TIM_MspPostInit(&htim3);
+
+}
+
+/**
   * @brief UART4 Initialization Function
   * @param None
   * @retval None
@@ -1066,7 +752,7 @@ static void MX_UART4_Init(void)
 
   /* USER CODE END UART4_Init 1 */
   huart4.Instance = UART4;
-  huart4.Init.BaudRate = 115200;
+  huart4.Init.BaudRate = 420000;
   huart4.Init.WordLength = UART_WORDLENGTH_8B;
   huart4.Init.StopBits = UART_STOPBITS_1;
   huart4.Init.Parity = UART_PARITY_NONE;
@@ -1368,12 +1054,12 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /* Configure IMU chip-select pin (PE4) */
-  GPIO_InitStruct.Pin = IMU_CS_PIN;
+  HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
+  GPIO_InitStruct.Pin = IMU_CS_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(IMU_CS_GPIO_PORT, &GPIO_InitStruct);
-  HAL_GPIO_WritePin(IMU_CS_GPIO_PORT, IMU_CS_PIN, GPIO_PIN_SET);
+  HAL_GPIO_Init(IMU_CS_GPIO_Port, &GPIO_InitStruct);
 
   /*AnalogSwitch Config */
   HAL_SYSCFG_AnalogSwitchConfig(SYSCFG_SWITCH_PC2, SYSCFG_SWITCH_PC2_CLOSE);
@@ -1384,33 +1070,6 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-
-int __io_putchar(int ch)
-{
-  uint8_t c;
-  uint8_t tx_status;
-  uint32_t retry;
-
-  c = (uint8_t)ch;
-
-  if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED)
-  {
-    return ch;
-  }
-
-  tx_status = USBD_BUSY;
-  for (retry = 0U; retry < 10U; retry++)
-  {
-    tx_status = CDC_Transmit_FS(&c, 1U);
-    if (tx_status == USBD_OK)
-    {
-      break;
-    }
-    HAL_Delay(1);
-  }
-
-  return ch;
-}
 
 /* USER CODE END 4 */
 

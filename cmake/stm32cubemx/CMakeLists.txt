@@ -30,10 +30,17 @@ set(MX_Application_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../USB_DEVICE/App/usbd_desc.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../USB_DEVICE/App/usbd_cdc_if.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/main.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/app.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/attitude.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/communications.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/imu.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/motors.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/receiver.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32h7xx_it.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32h7xx_hal_msp.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/sysmem.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/syscalls.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/telemetry.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../startup_stm32h743xx.s
 )
 
