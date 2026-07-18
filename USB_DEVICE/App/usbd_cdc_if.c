@@ -22,6 +22,10 @@
 #include "usbd_cdc_if.h"
 
 /* USER CODE BEGIN INCLUDE */
+#include "app.h"
+
+#include <stdlib.h>
+#include <string.h>
 
 /* USER CODE END INCLUDE */
 
@@ -94,6 +98,8 @@ uint8_t UserRxBufferFS[APP_RX_DATA_SIZE];
 uint8_t UserTxBufferFS[APP_TX_DATA_SIZE];
 
 /* USER CODE BEGIN PRIVATE_VARIABLES */
+static char g_usb_cmd_line[64];
+static uint8_t g_usb_cmd_len = 0U;
 
 /* USER CODE END PRIVATE_VARIABLES */
 
@@ -128,6 +134,7 @@ static int8_t CDC_Receive_FS(uint8_t* pbuf, uint32_t *Len);
 static int8_t CDC_TransmitCplt_FS(uint8_t *pbuf, uint32_t *Len, uint8_t epnum);
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_DECLARATION */
+static void CDC_ProcessCommandLine(const char *line);
 
 /* USER CODE END PRIVATE_FUNCTIONS_DECLARATION */
 
@@ -155,6 +162,7 @@ static int8_t CDC_Init_FS(void)
   /* Set Application Buffers */
   USBD_CDC_SetTxBuffer(&hUsbDeviceFS, UserTxBufferFS, 0);
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, UserRxBufferFS);
+  USBD_CDC_ReceivePacket(&hUsbDeviceFS);
   return (USBD_OK);
   /* USER CODE END 3 */
 }
@@ -261,6 +269,39 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
+  uint32_t i;
+  char ch;
+
+  for (i = 0U; i < *Len; i++)
+  {
+    ch = (char)Buf[i];
+
+    if (ch == '\r')
+    {
+      continue;
+    }
+
+    if (ch == '\n')
+    {
+      if (g_usb_cmd_len > 0U)
+      {
+        g_usb_cmd_line[g_usb_cmd_len] = '\0';
+        CDC_ProcessCommandLine(g_usb_cmd_line);
+        g_usb_cmd_len = 0U;
+      }
+      continue;
+    }
+
+    if (g_usb_cmd_len < (sizeof(g_usb_cmd_line) - 1U))
+    {
+      g_usb_cmd_line[g_usb_cmd_len++] = ch;
+    }
+    else
+    {
+      g_usb_cmd_len = 0U;
+    }
+  }
+
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceFS);
   return (USBD_OK);
@@ -316,6 +357,55 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
 }
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_IMPLEMENTATION */
+
+static void CDC_ProcessCommandLine(const char *line)
+{
+  const char *prefix;
+  char *endptr;
+  uint32_t motor_index;
+  uint32_t pulse_us;
+
+  if ((line == NULL) || (line[0] == '\0'))
+  {
+    return;
+  }
+
+  if ((strcmp(line, "MTEST OFF") == 0) || (strcmp(line, "MTEST 0 0") == 0))
+  {
+    App_SetUsbMotorTest(0U, 1U, 1100U);
+    return;
+  }
+
+  prefix = "MTEST ";
+  if (strncmp(line, prefix, strlen(prefix)) != 0)
+  {
+    return;
+  }
+
+  motor_index = strtoul(line + strlen(prefix), &endptr, 10);
+  if ((endptr == NULL) || (*endptr != ' '))
+  {
+    return;
+  }
+
+  pulse_us = strtoul(endptr + 1, NULL, 10);
+
+  if ((motor_index < 1U) || (motor_index > 4U))
+  {
+    return;
+  }
+
+  if (pulse_us < 988U)
+  {
+    pulse_us = 988U;
+  }
+  else if (pulse_us > 2012U)
+  {
+    pulse_us = 2012U;
+  }
+
+  App_SetUsbMotorTest(1U, (uint8_t)motor_index, (uint16_t)pulse_us);
+}
 
 /* USER CODE END PRIVATE_FUNCTIONS_IMPLEMENTATION */
 

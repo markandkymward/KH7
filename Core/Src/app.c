@@ -19,14 +19,26 @@
 #define APP_THROTTLE_LOW_US    1050U
 #define APP_ARM_HOLD_MS        300U
 #define APP_BEEPER_TOGGLE_MS   150U
+#define APP_USB_TEST_ARM_DELAY_MS 2000U
 #define APP_CONTROL_DEADBAND_US 20U
 #define APP_MIX_ATTENUATION_DIV 3
 #define APP_MOTOR_IDLE_US      1080U
+#define APP_ROLL_SIGN          (1)
+#define APP_PITCH_SIGN         (1)
+#define APP_YAW_SIGN           (1)
 #define APP_PWM_MIN_US         988U
 #define APP_PWM_MID_US         1500U
 #define APP_PWM_MAX_US         2012U
 #define APP_CRSF_MIN_RAW       172U
 #define APP_CRSF_MAX_RAW       1811U
+
+/* Motor position mapping used by the mixer:
+ * S1 = Front-Left, S2 = Front-Right, S3 = Rear-Right, S4 = Rear-Left
+ */
+
+static volatile uint8_t g_usb_motor_test_enabled = 0U;
+static volatile uint8_t g_usb_motor_test_motor_index = 1U;
+static volatile uint16_t g_usb_motor_test_pulse_us = 1100U;
 
 static uint16_t App_CrsfRawToUs(uint16_t raw)
 {
@@ -86,6 +98,33 @@ static int32_t App_ApplyDeadbandAndAttenuate(int32_t value)
   return value / APP_MIX_ATTENUATION_DIV;
 }
 
+void App_SetUsbMotorTest(uint8_t enabled, uint8_t motor_index, uint16_t pulse_us)
+{
+  if (motor_index < 1U)
+  {
+    motor_index = 1U;
+  }
+  else if (motor_index > 4U)
+  {
+    motor_index = 4U;
+  }
+
+  if (pulse_us < APP_PWM_MIN_US)
+  {
+    pulse_us = APP_PWM_MIN_US;
+  }
+  else if (pulse_us > APP_PWM_MAX_US)
+  {
+    pulse_us = APP_PWM_MAX_US;
+  }
+
+  __disable_irq();
+  g_usb_motor_test_enabled = (enabled != 0U) ? 1U : 0U;
+  g_usb_motor_test_motor_index = motor_index;
+  g_usb_motor_test_pulse_us = pulse_us;
+  __enable_irq();
+}
+
 void App_Init(void)
 {
   Motors_Init();
@@ -113,6 +152,8 @@ void App_Update(void)
   static uint32_t last_tick_ms = 0U;
   static uint8_t last_motor_test_step = 0xFFU;
   static uint32_t last_receiver_telemetry_ms = 0U;
+  static uint8_t usb_test_was_enabled = 0U;
+  static uint32_t usb_test_arm_start_ms = 0U;
   static uint8_t motors_armed = 0U;
   static uint8_t trim_captured = 0U;
   static uint32_t arm_hold_start_ms = 0U;
@@ -148,12 +189,19 @@ void App_Update(void)
   int32_t pitch_term;
   int32_t yaw_term;
   int32_t throttle_term;
+  int32_t m_front_left;
+  int32_t m_front_right;
+  int32_t m_rear_right;
+  int32_t m_rear_left;
   uint16_t s1_us;
   uint16_t s2_us;
   uint16_t s3_us;
   uint16_t s4_us;
   uint8_t arm_switch_high;
   uint8_t throttle_low;
+  uint8_t usb_motor_test_enabled;
+  uint8_t usb_motor_test_motor_index;
+  uint16_t usb_motor_test_pulse_us;
 
   s1_us = APP_PWM_MIN_US;
   s2_us = APP_PWM_MIN_US;
@@ -165,9 +213,69 @@ void App_Update(void)
 
   HAL_GPIO_TogglePin(LED0_GPIO_Port, LED0_Pin);
 
+  __disable_irq();
+  usb_motor_test_enabled = g_usb_motor_test_enabled;
+  usb_motor_test_motor_index = g_usb_motor_test_motor_index;
+  usb_motor_test_pulse_us = g_usb_motor_test_pulse_us;
+  __enable_irq();
+
+  now_ms = HAL_GetTick();
+
+  if (usb_motor_test_enabled != 0U)
+  {
+    Motors_SetOutputEnabled(1U);
+
+    if (usb_test_was_enabled == 0U)
+    {
+      usb_test_was_enabled = 1U;
+      usb_test_arm_start_ms = now_ms;
+    }
+
+    if ((now_ms - usb_test_arm_start_ms) >= APP_USB_TEST_ARM_DELAY_MS)
+    {
+      switch (usb_motor_test_motor_index)
+      {
+        case 1U:
+          s1_us = usb_motor_test_pulse_us;
+          break;
+        case 2U:
+          s2_us = usb_motor_test_pulse_us;
+          break;
+        case 3U:
+          s3_us = usb_motor_test_pulse_us;
+          break;
+        case 4U:
+          s4_us = usb_motor_test_pulse_us;
+          break;
+        default:
+          break;
+      }
+    }
+
+    Motors_WriteUs(s1_us, s2_us, s3_us, s4_us);
+
+    if ((now_ms - last_receiver_telemetry_ms) >= 500U)
+    {
+      Telemetry_PrintArmState(1U,
+                              0U,
+                              0U,
+                              usb_motor_test_pulse_us,
+                              s1_us,
+                              s2_us,
+                              s3_us,
+                              s4_us);
+      last_receiver_telemetry_ms = now_ms;
+    }
+
+    HAL_Delay(APP_CONTROL_LOOP_MS);
+    return;
+  }
+
+  usb_test_was_enabled = 0U;
+
   if (APP_MOTOR_TEST_MODE != 0U)
   {
-    motor_test_step = Motors_RunTestPattern(HAL_GetTick());
+    motor_test_step = Motors_RunTestPattern(now_ms);
     if (motor_test_step != last_motor_test_step)
     {
       Telemetry_PrintMotorTestStep(motor_test_step);
@@ -175,7 +283,6 @@ void App_Update(void)
     }
   }
 
-  now_ms = HAL_GetTick();
   if (last_tick_ms == 0U)
   {
     dt_s = ((float)APP_CONTROL_LOOP_MS) * 0.001f;
@@ -288,19 +395,24 @@ void App_Update(void)
           trim_captured = 1U;
         }
 
-        roll_term = App_ApplyDeadbandAndAttenuate((int32_t)roll_us - (int32_t)roll_center_us);
-        pitch_term = App_ApplyDeadbandAndAttenuate((int32_t)pitch_us - (int32_t)pitch_center_us);
-        yaw_term = App_ApplyDeadbandAndAttenuate((int32_t)yaw_us - (int32_t)yaw_center_us);
+        roll_term = APP_ROLL_SIGN * App_ApplyDeadbandAndAttenuate((int32_t)roll_us - (int32_t)roll_center_us);
+        pitch_term = APP_PITCH_SIGN * App_ApplyDeadbandAndAttenuate((int32_t)pitch_us - (int32_t)pitch_center_us);
+        yaw_term = APP_YAW_SIGN * App_ApplyDeadbandAndAttenuate((int32_t)yaw_us - (int32_t)yaw_center_us);
         throttle_term = (int32_t)throttle_us;
         if (throttle_term < (int32_t)APP_MOTOR_IDLE_US)
         {
           throttle_term = APP_MOTOR_IDLE_US;
         }
 
-        s1_us = App_ClampPulseUs(throttle_term + pitch_term + roll_term - yaw_term);
-        s2_us = App_ClampPulseUs(throttle_term + pitch_term - roll_term + yaw_term);
-        s3_us = App_ClampPulseUs(throttle_term - pitch_term - roll_term - yaw_term);
-        s4_us = App_ClampPulseUs(throttle_term - pitch_term + roll_term + yaw_term);
+        m_front_left = throttle_term + pitch_term + roll_term - yaw_term;
+        m_front_right = throttle_term + pitch_term - roll_term + yaw_term;
+        m_rear_right = throttle_term - pitch_term - roll_term - yaw_term;
+        m_rear_left = throttle_term - pitch_term + roll_term + yaw_term;
+
+        s1_us = App_ClampPulseUs(m_front_left);
+        s2_us = App_ClampPulseUs(m_front_right);
+        s3_us = App_ClampPulseUs(m_rear_right);
+        s4_us = App_ClampPulseUs(m_rear_left);
 
         Motors_WriteUs(s1_us, s2_us, s3_us, s4_us);
       }
