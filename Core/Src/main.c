@@ -277,10 +277,10 @@ static void IMU_ApplyOrientationCW270(IMU_RawData_t *raw)
 
   raw->accel_x = (int16_t)(-old_ay);
   raw->accel_y = (int16_t)(-old_ax);
-  raw->accel_z = old_az;
+  raw->accel_z = (int16_t)(-old_az);
   raw->gyro_x = (int16_t)(-old_gy);
   raw->gyro_y = (int16_t)(-old_gx);
-  raw->gyro_z = old_gz;
+  raw->gyro_z = (int16_t)(-old_gz);
 }
 
 static float WrapAngle180(float angle_deg)
@@ -388,8 +388,8 @@ static void AHRS_GetBoardAnglesDeg(const AHRS_State_t *state,
   *pitch_deg = WrapAngle180(atan2f(g_x, g_z) * DEG_PER_RAD);
   *roll_deg = WrapAngle180(atan2f(g_y, g_z) * DEG_PER_RAD);
 
-  yaw = atan2f(2.0f * ((state->q0 * state->q3) + (state->q1 * state->q2)),
-               1.0f - 2.0f * ((state->q2 * state->q2) + (state->q3 * state->q3))) * DEG_PER_RAD;
+  yaw = -atan2f(2.0f * ((state->q0 * state->q3) + (state->q1 * state->q2)),
+                1.0f - 2.0f * ((state->q2 * state->q2) + (state->q3 * state->q3))) * DEG_PER_RAD;
   *yaw_deg = WrapAngle180(yaw);
 }
 
@@ -505,10 +505,6 @@ int main(void)
   {
     static uint32_t detect_retry_counter = 0U;
     static uint32_t last_tick_ms = 0U;
-    static uint8_t startup_zero_captured = 0U;
-    static float startup_pitch_offset_deg = 0.0f;
-    static float startup_roll_offset_deg = 0.0f;
-    static float startup_yaw_offset_deg = 0.0f;
     uint32_t now_ms;
     float dt_s;
     float ax_g;
@@ -565,26 +561,6 @@ int main(void)
                      az_g,
                      dt_s);
       AHRS_GetBoardAnglesDeg(&g_ahrs, &pitch_deg, &roll_deg, &yaw_deg);
-
-      if (startup_zero_captured == 0U)
-      {
-        float accel_mag = sqrtf((ax_g * ax_g) + (ay_g * ay_g) + (az_g * az_g));
-        if ((fabsf(gx_dps) < 20.0f) &&
-            (fabsf(gy_dps) < 20.0f) &&
-            (fabsf(gz_dps) < 20.0f) &&
-            (accel_mag > 0.8f) &&
-            (accel_mag < 1.2f))
-        {
-          startup_pitch_offset_deg = pitch_deg;
-          startup_roll_offset_deg = roll_deg;
-          startup_yaw_offset_deg = yaw_deg;
-          startup_zero_captured = 1U;
-        }
-      }
-
-      pitch_deg = WrapAngle180(pitch_deg - startup_pitch_offset_deg);
-      roll_deg = WrapAngle180(roll_deg - startup_roll_offset_deg);
-      yaw_deg = WrapAngle180(yaw_deg - startup_yaw_offset_deg);
       IMU_PrintAngles(pitch_deg, roll_deg, yaw_deg);
     }
     else
