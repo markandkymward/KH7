@@ -46,6 +46,50 @@ void Telemetry_PrintImuReadFailed(IMU_TypeDef type, uint8_t whoami)
   printf("IMU read failed (type=%d whoami=0x%02X)\r\n", (int)type, whoami);
 }
 
+void Telemetry_PrintImuState(float ax_g,
+                             float ay_g,
+                             float az_g,
+                             float gx_dps,
+                             float gy_dps,
+                             float gz_dps,
+                             float pitch_deg,
+                             float roll_deg,
+                             float yaw_deg)
+{
+  int32_t ax_cg;
+  int32_t ay_cg;
+  int32_t az_cg;
+  int32_t gx_d10;
+  int32_t gy_d10;
+  int32_t gz_d10;
+  int32_t p_d10;
+  int32_t r_d10;
+  int32_t y_d10;
+
+  ax_cg = (int32_t)(ax_g * 100.0f);
+  ay_cg = (int32_t)(ay_g * 100.0f);
+  az_cg = (int32_t)(az_g * 100.0f);
+
+  gx_d10 = (int32_t)(gx_dps * 10.0f);
+  gy_d10 = (int32_t)(gy_dps * 10.0f);
+  gz_d10 = (int32_t)(gz_dps * 10.0f);
+
+  p_d10 = (int32_t)(pitch_deg * 10.0f);
+  r_d10 = (int32_t)(roll_deg * 10.0f);
+  y_d10 = (int32_t)(yaw_deg * 10.0f);
+
+  printf("IMU[x100/x10]=[%ld %ld %ld %ld %ld %ld %ld %ld %ld]\r\n",
+         (long)ax_cg,
+         (long)ay_cg,
+         (long)az_cg,
+         (long)gx_d10,
+         (long)gy_d10,
+         (long)gz_d10,
+         (long)p_d10,
+         (long)r_d10,
+         (long)y_d10);
+}
+
 void Telemetry_PrintMotorTestStep(uint8_t step_index)
 {
   if (step_index == 0U)
@@ -102,6 +146,31 @@ void Telemetry_PrintArmState(uint8_t armed,
          (unsigned int)s2_us,
          (unsigned int)s3_us,
          (unsigned int)s4_us);
+}
+
+void Telemetry_PrintRatePid(const App_RatePidGains_t *gains, const char *source)
+{
+  if (gains == NULL)
+  {
+    return;
+  }
+
+  if (source == NULL)
+  {
+    source = "-";
+  }
+
+  printf("PID[src=%s]=[R %.4f %.4f %.4f P %.4f %.4f %.4f Y %.4f %.4f %.4f]\r\n",
+         source,
+         (double)gains->roll.kp,
+         (double)gains->roll.ki,
+         (double)gains->roll.kd,
+         (double)gains->pitch.kp,
+         (double)gains->pitch.ki,
+         (double)gains->pitch.kd,
+         (double)gains->yaw.kp,
+         (double)gains->yaw.ki,
+         (double)gains->yaw.kd);
 }
 
 void Telemetry_PrintAngles(float pitch_deg, float roll_deg, float yaw_deg)

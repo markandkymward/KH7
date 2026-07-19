@@ -1,14 +1,21 @@
 #include "app.h"
 
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
 #include "attitude.h"
 #include "imu.h"
 #include "motors.h"
 #include "receiver.h"
 #include "telemetry.h"
+#include "main.h"
 
 #define APP_MOTOR_TEST_MODE 0U
 #define APP_CONTROL_LOOP_MS 2U
 #define RAD_PER_DEG       0.0174532925f
+#define APP_ENABLE_IMU_RUNTIME_TELEMETRY 1U
+#define APP_ENABLE_ARM_RUNTIME_TELEMETRY 1U
 #define APP_ENABLE_ANGLE_TELEMETRY 0U
 #define APP_CH_ROLL_INDEX      0U
 #define APP_CH_PITCH_INDEX     1U
@@ -20,17 +27,41 @@
 #define APP_ARM_HOLD_MS        300U
 #define APP_BEEPER_TOGGLE_MS   150U
 #define APP_USB_TEST_ARM_DELAY_MS 2000U
+#define APP_IMU_TELEMETRY_MS    100U
 #define APP_CONTROL_DEADBAND_US 20U
-#define APP_MIX_ATTENUATION_DIV 3
 #define APP_MOTOR_IDLE_US      1080U
 #define APP_ROLL_SIGN          (1)
-#define APP_PITCH_SIGN         (1)
+#define APP_PITCH_SIGN         (-1)
 #define APP_YAW_SIGN           (1)
+#define APP_GYRO_YAW_SIGN      (-1)
+#define APP_RATE_CMD_MAX_ROLL_DPS   300.0f
+#define APP_RATE_CMD_MAX_PITCH_DPS  300.0f
+#define APP_RATE_CMD_MAX_YAW_DPS    220.0f
+#define APP_RATE_KP_ROLL_DEFAULT_US_PER_DPS 0.90f
+#define APP_RATE_KP_PITCH_DEFAULT_US_PER_DPS 0.90f
+#define APP_RATE_KP_YAW_DEFAULT_US_PER_DPS  0.80f
+#define APP_RATE_KI_ROLL_DEFAULT_US_PER_DPS_S 0.00f
+#define APP_RATE_KI_PITCH_DEFAULT_US_PER_DPS_S 0.00f
+#define APP_RATE_KI_YAW_DEFAULT_US_PER_DPS_S  0.00f
+#define APP_RATE_KD_ROLL_DEFAULT_US_PER_DPS_PER_S 0.00f
+#define APP_RATE_KD_PITCH_DEFAULT_US_PER_DPS_PER_S 0.00f
+#define APP_RATE_KD_YAW_DEFAULT_US_PER_DPS_PER_S  0.00f
+#define APP_RATE_TERM_LIMIT_US      320
+#define APP_RATE_KP_MIN_US_PER_DPS  0.0f
+#define APP_RATE_KP_MAX_US_PER_DPS  4.0f
+#define APP_RATE_KI_MIN_US_PER_DPS_S 0.0f
+#define APP_RATE_KI_MAX_US_PER_DPS_S 2.0f
+#define APP_RATE_KD_MIN_US_PER_DPS_PER_S 0.0f
+#define APP_RATE_KD_MAX_US_PER_DPS_PER_S 0.2f
 #define APP_PWM_MIN_US         988U
 #define APP_PWM_MID_US         1500U
 #define APP_PWM_MAX_US         2012U
 #define APP_CRSF_MIN_RAW       172U
 #define APP_CRSF_MAX_RAW       1811U
+
+#define APP_PID_FLASH_MAGIC    0x50494447UL
+#define APP_PID_FLASH_VERSION  1UL
+#define APP_PID_FLASH_ADDRESS  0x081E0000UL
 
 /* Motor position mapping used by the mixer:
  * S1 = Front-Left, S2 = Front-Right, S3 = Rear-Right, S4 = Rear-Left
@@ -39,6 +70,46 @@
 static volatile uint8_t g_usb_motor_test_enabled = 0U;
 static volatile uint8_t g_usb_motor_test_motor_index = 1U;
 static volatile uint16_t g_usb_motor_test_pulse_us = 1100U;
+
+typedef enum
+{
+  APP_PID_CMD_NONE = 0,
+  APP_PID_CMD_SET_AND_SAVE = 1,
+  APP_PID_CMD_SAVE = 2,
+  APP_PID_CMD_LOAD = 3,
+  APP_PID_CMD_DEFAULT = 4,
+} App_PidCommand_t;
+
+typedef struct
+{
+  uint32_t magic;
+  uint32_t version;
+  App_RatePidGains_t gains;
+  uint32_t crc32;
+  uint32_t reserved[2];
+} App_PidFlashBlob_t;
+
+typedef union
+{
+  App_PidFlashBlob_t blob;
+  uint32_t words[16];
+} App_PidFlashPage_t;
+
+#if defined(__GNUC__)
+#define APP_FLASHWORD_ALIGN __attribute__((aligned(32)))
+#else
+#define APP_FLASHWORD_ALIGN
+#endif
+
+_Static_assert(sizeof(App_PidFlashBlob_t) <= sizeof(App_PidFlashPage_t), "PID flash blob too large");
+
+static App_RatePidGains_t g_rate_pid_gains = {
+  {APP_RATE_KP_ROLL_DEFAULT_US_PER_DPS, APP_RATE_KI_ROLL_DEFAULT_US_PER_DPS_S, APP_RATE_KD_ROLL_DEFAULT_US_PER_DPS_PER_S},
+  {APP_RATE_KP_PITCH_DEFAULT_US_PER_DPS, APP_RATE_KI_PITCH_DEFAULT_US_PER_DPS_S, APP_RATE_KD_PITCH_DEFAULT_US_PER_DPS_PER_S},
+  {APP_RATE_KP_YAW_DEFAULT_US_PER_DPS, APP_RATE_KI_YAW_DEFAULT_US_PER_DPS_S, APP_RATE_KD_YAW_DEFAULT_US_PER_DPS_PER_S},
+};
+static volatile App_PidCommand_t g_pid_command = APP_PID_CMD_NONE;
+static volatile App_RatePidGains_t g_pid_command_gains;
 
 static uint16_t App_CrsfRawToUs(uint16_t raw)
 {
@@ -74,28 +145,370 @@ static uint16_t App_ClampPulseUs(int32_t pulse_us)
   return (uint16_t)pulse_us;
 }
 
-static int32_t App_ApplyDeadbandAndAttenuate(int32_t value)
+static int32_t App_ApplyDeadbandUs(int32_t value, int32_t deadband_us)
 {
   if (value > 0)
   {
-    if (value <= (int32_t)APP_CONTROL_DEADBAND_US)
+    if (value <= deadband_us)
     {
       return 0;
     }
 
-    value -= (int32_t)APP_CONTROL_DEADBAND_US;
+    value -= deadband_us;
   }
   else if (value < 0)
   {
-    if (value >= -(int32_t)APP_CONTROL_DEADBAND_US)
+    if (value >= -deadband_us)
     {
       return 0;
     }
 
-    value += (int32_t)APP_CONTROL_DEADBAND_US;
+    value += deadband_us;
   }
 
-  return value / APP_MIX_ATTENUATION_DIV;
+  return value;
+}
+
+static float App_ClampFloat(float value, float min_value, float max_value)
+{
+  if (value < min_value)
+  {
+    return min_value;
+  }
+
+  if (value > max_value)
+  {
+    return max_value;
+  }
+
+  return value;
+}
+
+static float App_StickOffsetUsToRateDps(int32_t stick_offset_us, float max_rate_dps)
+{
+  float normalized;
+
+  stick_offset_us = App_ApplyDeadbandUs(stick_offset_us, (int32_t)APP_CONTROL_DEADBAND_US);
+  normalized = ((float)stick_offset_us) / ((float)((int32_t)APP_PWM_MAX_US - (int32_t)APP_PWM_MID_US));
+
+  if (normalized > 1.0f)
+  {
+    normalized = 1.0f;
+  }
+  else if (normalized < -1.0f)
+  {
+    normalized = -1.0f;
+  }
+
+  return normalized * max_rate_dps;
+}
+
+static int32_t App_ClampControlTerm(int32_t value, int32_t limit)
+{
+  if (value > limit)
+  {
+    return limit;
+  }
+
+  if (value < -limit)
+  {
+    return -limit;
+  }
+
+  return value;
+}
+
+static uint32_t App_Crc32(const uint8_t *data, size_t len)
+{
+  uint32_t crc = 0xFFFFFFFFUL;
+  size_t i;
+  uint8_t bit;
+
+  if (data == NULL)
+  {
+    return 0U;
+  }
+
+  for (i = 0U; i < len; i++)
+  {
+    crc ^= (uint32_t)data[i];
+    for (bit = 0U; bit < 8U; bit++)
+    {
+      if ((crc & 1UL) != 0U)
+      {
+        crc = (crc >> 1U) ^ 0xEDB88320UL;
+      }
+      else
+      {
+        crc >>= 1U;
+      }
+    }
+  }
+
+  return ~crc;
+}
+
+static uint8_t App_IsFiniteInRange(float value, float min_value, float max_value)
+{
+  if (value != value)
+  {
+    return 0U;
+  }
+
+  if ((value < min_value) || (value > max_value))
+  {
+    return 0U;
+  }
+
+  return 1U;
+}
+
+static uint8_t App_AreRatePidGainsValid(const App_RatePidGains_t *gains)
+{
+  if (gains == NULL)
+  {
+    return 0U;
+  }
+
+  if ((App_IsFiniteInRange(gains->roll.kp, APP_RATE_KP_MIN_US_PER_DPS, APP_RATE_KP_MAX_US_PER_DPS) == 0U) ||
+      (App_IsFiniteInRange(gains->pitch.kp, APP_RATE_KP_MIN_US_PER_DPS, APP_RATE_KP_MAX_US_PER_DPS) == 0U) ||
+      (App_IsFiniteInRange(gains->yaw.kp, APP_RATE_KP_MIN_US_PER_DPS, APP_RATE_KP_MAX_US_PER_DPS) == 0U) ||
+      (App_IsFiniteInRange(gains->roll.ki, APP_RATE_KI_MIN_US_PER_DPS_S, APP_RATE_KI_MAX_US_PER_DPS_S) == 0U) ||
+      (App_IsFiniteInRange(gains->pitch.ki, APP_RATE_KI_MIN_US_PER_DPS_S, APP_RATE_KI_MAX_US_PER_DPS_S) == 0U) ||
+      (App_IsFiniteInRange(gains->yaw.ki, APP_RATE_KI_MIN_US_PER_DPS_S, APP_RATE_KI_MAX_US_PER_DPS_S) == 0U) ||
+      (App_IsFiniteInRange(gains->roll.kd, APP_RATE_KD_MIN_US_PER_DPS_PER_S, APP_RATE_KD_MAX_US_PER_DPS_PER_S) == 0U) ||
+      (App_IsFiniteInRange(gains->pitch.kd, APP_RATE_KD_MIN_US_PER_DPS_PER_S, APP_RATE_KD_MAX_US_PER_DPS_PER_S) == 0U) ||
+      (App_IsFiniteInRange(gains->yaw.kd, APP_RATE_KD_MIN_US_PER_DPS_PER_S, APP_RATE_KD_MAX_US_PER_DPS_PER_S) == 0U))
+  {
+    return 0U;
+  }
+
+  return 1U;
+}
+
+void App_GetRatePidGains(App_RatePidGains_t *gains)
+{
+  if (gains == NULL)
+  {
+    return;
+  }
+
+  __disable_irq();
+  *gains = g_rate_pid_gains;
+  __enable_irq();
+}
+
+uint8_t App_SetRatePidGains(const App_RatePidGains_t *gains)
+{
+  if (App_AreRatePidGainsValid(gains) == 0U)
+  {
+    return 0U;
+  }
+
+  __disable_irq();
+  g_rate_pid_gains = *gains;
+  __enable_irq();
+
+  return 1U;
+}
+
+void App_ResetRatePidDefaults(void)
+{
+  App_RatePidGains_t defaults = {
+    {APP_RATE_KP_ROLL_DEFAULT_US_PER_DPS, APP_RATE_KI_ROLL_DEFAULT_US_PER_DPS_S, APP_RATE_KD_ROLL_DEFAULT_US_PER_DPS_PER_S},
+    {APP_RATE_KP_PITCH_DEFAULT_US_PER_DPS, APP_RATE_KI_PITCH_DEFAULT_US_PER_DPS_S, APP_RATE_KD_PITCH_DEFAULT_US_PER_DPS_PER_S},
+    {APP_RATE_KP_YAW_DEFAULT_US_PER_DPS, APP_RATE_KI_YAW_DEFAULT_US_PER_DPS_S, APP_RATE_KD_YAW_DEFAULT_US_PER_DPS_PER_S},
+  };
+
+  (void)App_SetRatePidGains(&defaults);
+}
+
+uint8_t App_LoadRatePidGains(void)
+{
+  const App_PidFlashBlob_t *stored;
+  uint32_t expected_crc;
+
+  stored = (const App_PidFlashBlob_t *)APP_PID_FLASH_ADDRESS;
+
+  if ((stored->magic != APP_PID_FLASH_MAGIC) || (stored->version != APP_PID_FLASH_VERSION))
+  {
+    return 0U;
+  }
+
+  expected_crc = App_Crc32((const uint8_t *)stored, offsetof(App_PidFlashBlob_t, crc32));
+  if (expected_crc != stored->crc32)
+  {
+    return 0U;
+  }
+
+  if (App_AreRatePidGainsValid(&stored->gains) == 0U)
+  {
+    return 0U;
+  }
+
+  (void)App_SetRatePidGains(&stored->gains);
+  return 1U;
+}
+
+uint8_t App_SaveRatePidGains(void)
+{
+  FLASH_EraseInitTypeDef erase;
+  uint32_t sector_error = 0U;
+  uint32_t address;
+  App_PidFlashPage_t APP_FLASHWORD_ALIGN page;
+  const App_PidFlashBlob_t *written;
+  uint8_t write_index;
+
+  memset(&page, 0xFF, sizeof(page));
+  page.blob.magic = APP_PID_FLASH_MAGIC;
+  page.blob.version = APP_PID_FLASH_VERSION;
+  App_GetRatePidGains(&page.blob.gains);
+  page.blob.crc32 = App_Crc32((const uint8_t *)&page.blob, offsetof(App_PidFlashBlob_t, crc32));
+
+  if (HAL_FLASH_Unlock() != HAL_OK)
+  {
+    return 0U;
+  }
+
+  memset(&erase, 0, sizeof(erase));
+  erase.TypeErase = FLASH_TYPEERASE_SECTORS;
+  erase.Banks = FLASH_BANK_2;
+  erase.Sector = FLASH_SECTOR_7;
+  erase.NbSectors = 1U;
+  erase.VoltageRange = FLASH_VOLTAGE_RANGE_3;
+
+  if (HAL_FLASHEx_Erase(&erase, &sector_error) != HAL_OK)
+  {
+    (void)HAL_FLASH_Lock();
+    return 0U;
+  }
+
+  address = APP_PID_FLASH_ADDRESS;
+  for (write_index = 0U; write_index < 2U; write_index++)
+  {
+    if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_FLASHWORD,
+                          address,
+                          (uint32_t)&page.words[write_index * 8U]) != HAL_OK)
+    {
+      (void)HAL_FLASH_Lock();
+      return 0U;
+    }
+    address += 32U;
+  }
+
+  (void)HAL_FLASH_Lock();
+
+  written = (const App_PidFlashBlob_t *)APP_PID_FLASH_ADDRESS;
+  if ((written->magic != APP_PID_FLASH_MAGIC) || (written->version != APP_PID_FLASH_VERSION))
+  {
+    return 0U;
+  }
+
+  if (App_Crc32((const uint8_t *)written, offsetof(App_PidFlashBlob_t, crc32)) != written->crc32)
+  {
+    return 0U;
+  }
+
+  return 1U;
+}
+
+uint8_t App_RequestRatePidSetAndSave(const App_RatePidGains_t *gains)
+{
+  if (App_AreRatePidGainsValid(gains) == 0U)
+  {
+    return 0U;
+  }
+
+  __disable_irq();
+  g_pid_command_gains = *gains;
+  g_pid_command = APP_PID_CMD_SET_AND_SAVE;
+  __enable_irq();
+
+  return 1U;
+}
+
+void App_RequestRatePidSave(void)
+{
+  __disable_irq();
+  g_pid_command = APP_PID_CMD_SAVE;
+  __enable_irq();
+}
+
+void App_RequestRatePidLoad(void)
+{
+  __disable_irq();
+  g_pid_command = APP_PID_CMD_LOAD;
+  __enable_irq();
+}
+
+void App_RequestRatePidDefaults(void)
+{
+  __disable_irq();
+  g_pid_command = APP_PID_CMD_DEFAULT;
+  __enable_irq();
+}
+
+static void App_ProcessPendingPidCommand(void)
+{
+  App_PidCommand_t cmd;
+  App_RatePidGains_t cmd_gains;
+  App_RatePidGains_t active;
+  uint8_t op_ok;
+
+  __disable_irq();
+  cmd = g_pid_command;
+  cmd_gains = g_pid_command_gains;
+  g_pid_command = APP_PID_CMD_NONE;
+  __enable_irq();
+
+  if (cmd == APP_PID_CMD_NONE)
+  {
+    return;
+  }
+
+  switch (cmd)
+  {
+    case APP_PID_CMD_SET_AND_SAVE:
+      if (App_SetRatePidGains(&cmd_gains) == 0U)
+      {
+        printf("PID_SET[FAIL]\r\n");
+        break;
+      }
+
+      op_ok = App_SaveRatePidGains();
+      App_GetRatePidGains(&active);
+      Telemetry_PrintRatePid(&active, op_ok != 0U ? "set_saved" : "set_unsaved");
+      printf("PID_SET[%s]\r\n", (op_ok != 0U) ? "OK" : "OK_NO_SAVE");
+      printf("PID_SAVE[%s]\r\n", (op_ok != 0U) ? "OK" : "FAIL");
+      break;
+
+    case APP_PID_CMD_SAVE:
+      op_ok = App_SaveRatePidGains();
+      App_GetRatePidGains(&active);
+      Telemetry_PrintRatePid(&active, op_ok != 0U ? "save_ok" : "save_fail");
+      printf("PID_SAVE[%s]\r\n", (op_ok != 0U) ? "OK" : "FAIL");
+      break;
+
+    case APP_PID_CMD_LOAD:
+      op_ok = App_LoadRatePidGains();
+      if (op_ok == 0U)
+      {
+        App_ResetRatePidDefaults();
+      }
+      App_GetRatePidGains(&active);
+      Telemetry_PrintRatePid(&active, op_ok != 0U ? "load_ok" : "load_default");
+      printf("PID_LOAD[%s]\r\n", (op_ok != 0U) ? "OK" : "DEFAULT");
+      break;
+
+    case APP_PID_CMD_DEFAULT:
+      App_ResetRatePidDefaults();
+      App_GetRatePidGains(&active);
+      Telemetry_PrintRatePid(&active, "default");
+      break;
+
+    default:
+      break;
+  }
 }
 
 void App_SetUsbMotorTest(uint8_t enabled, uint8_t motor_index, uint16_t pulse_us)
@@ -134,7 +547,13 @@ void App_Init(void)
   Attitude_Init();
   Receiver_Init();
 
+  if (App_LoadRatePidGains() == 0U)
+  {
+    App_ResetRatePidDefaults();
+  }
+
   Telemetry_PrintImuLoggerStart();
+  Telemetry_PrintRatePid(&g_rate_pid_gains, "boot");
 
   if (IMU_DetectAndInit() == HAL_OK)
   {
@@ -152,6 +571,10 @@ void App_Update(void)
   static uint32_t last_tick_ms = 0U;
   static uint8_t last_motor_test_step = 0xFFU;
   static uint32_t last_receiver_telemetry_ms = 0U;
+#if APP_ENABLE_IMU_RUNTIME_TELEMETRY
+  static uint32_t last_imu_telemetry_ms = 0U;
+#endif
+  static uint32_t last_imu_error_ms = 0U;
   static uint8_t usb_test_was_enabled = 0U;
   static uint32_t usb_test_arm_start_ms = 0U;
   static uint8_t motors_armed = 0U;
@@ -164,6 +587,16 @@ void App_Update(void)
   static uint16_t roll_center_us = APP_PWM_MID_US;
   static uint16_t pitch_center_us = APP_PWM_MID_US;
   static uint16_t yaw_center_us = APP_PWM_MID_US;
+  static float measured_roll_rate_dps = 0.0f;
+  static float measured_pitch_rate_dps = 0.0f;
+  static float measured_yaw_rate_dps = 0.0f;
+  static float roll_integral_dps_s = 0.0f;
+  static float pitch_integral_dps_s = 0.0f;
+  static float yaw_integral_dps_s = 0.0f;
+  static float prev_roll_rate_error_dps = 0.0f;
+  static float prev_pitch_rate_error_dps = 0.0f;
+  static float prev_yaw_rate_error_dps = 0.0f;
+  static uint8_t pid_state_initialized = 0U;
   static uint8_t yaw_zero_captured = 0U;
   static float startup_yaw_offset_deg = 0.0f;
   IMU_RawData_t imu_raw;
@@ -185,6 +618,22 @@ void App_Update(void)
   uint16_t throttle_us;
   uint16_t yaw_us;
   uint16_t arm_us;
+  float cmd_roll_rate_dps;
+  float cmd_pitch_rate_dps;
+  float cmd_yaw_rate_dps;
+  float roll_rate_error_dps;
+  float pitch_rate_error_dps;
+  float yaw_rate_error_dps;
+  float roll_rate_derivative_dps_per_s;
+  float pitch_rate_derivative_dps_per_s;
+  float yaw_rate_derivative_dps_per_s;
+  float roll_term_f;
+  float pitch_term_f;
+  float yaw_term_f;
+  float integral_limit_roll;
+  float integral_limit_pitch;
+  float integral_limit_yaw;
+  App_RatePidGains_t active_pid_gains;
   int32_t roll_term;
   int32_t pitch_term;
   int32_t yaw_term;
@@ -220,6 +669,7 @@ void App_Update(void)
   __enable_irq();
 
   now_ms = HAL_GetTick();
+  App_ProcessPendingPidCommand();
 
   if (usb_motor_test_enabled != 0U)
   {
@@ -256,6 +706,7 @@ void App_Update(void)
 
     if ((now_ms - last_receiver_telemetry_ms) >= 500U)
     {
+#if APP_ENABLE_ARM_RUNTIME_TELEMETRY
       Telemetry_PrintArmState(1U,
                               0U,
                               0U,
@@ -264,7 +715,69 @@ void App_Update(void)
                               s2_us,
                               s3_us,
                               s4_us);
+#endif
       last_receiver_telemetry_ms = now_ms;
+    }
+
+    if ((IMU_GetType() == IMU_TYPE_UNKNOWN) && ((detect_retry_counter++ % 10U) == 0U))
+    {
+      if (IMU_DetectAndInit() == HAL_OK)
+      {
+        Telemetry_PrintImuDetected(IMU_GetType(), IMU_GetWhoAmI());
+      }
+    }
+
+    if ((IMU_GetType() != IMU_TYPE_UNKNOWN) && (IMU_ReadRawAligned(&imu_raw) == HAL_OK))
+    {
+      ax_g = ((float)imu_raw.accel_x) / IMU_ACCEL_LSB_PER_G;
+      ay_g = ((float)imu_raw.accel_y) / IMU_ACCEL_LSB_PER_G;
+      az_g = ((float)imu_raw.accel_z) / IMU_ACCEL_LSB_PER_G;
+      gx_dps = ((float)imu_raw.gyro_x) / IMU_GYRO_LSB_PER_DPS;
+      gy_dps = ((float)imu_raw.gyro_y) / IMU_GYRO_LSB_PER_DPS;
+      gz_dps = ((float)APP_GYRO_YAW_SIGN) * (((float)imu_raw.gyro_z) / IMU_GYRO_LSB_PER_DPS);
+      measured_roll_rate_dps = gx_dps;
+      measured_pitch_rate_dps = gy_dps;
+      measured_yaw_rate_dps = gz_dps;
+
+      Attitude_UpdateIMU(gx_dps * RAD_PER_DEG,
+                         gy_dps * RAD_PER_DEG,
+                         gz_dps * RAD_PER_DEG,
+                         ax_g,
+                         ay_g,
+                         az_g,
+                         ((float)APP_CONTROL_LOOP_MS) * 0.001f);
+      Attitude_GetBoardAnglesDeg(&pitch_deg, &roll_deg, &yaw_deg);
+
+      if (yaw_zero_captured == 0U)
+      {
+        startup_yaw_offset_deg = yaw_deg;
+        yaw_zero_captured = 1U;
+      }
+
+      yaw_deg = Attitude_WrapAngle180(yaw_deg - startup_yaw_offset_deg);
+
+#if APP_ENABLE_IMU_RUNTIME_TELEMETRY
+      if ((now_ms - last_imu_telemetry_ms) >= APP_IMU_TELEMETRY_MS)
+      {
+        Telemetry_PrintImuState(ax_g,
+                                ay_g,
+                                az_g,
+                                gx_dps,
+                                gy_dps,
+                                gz_dps,
+                                pitch_deg,
+                                roll_deg,
+                                yaw_deg);
+        last_imu_telemetry_ms = now_ms;
+      }
+#endif
+    }
+    else if ((now_ms - last_imu_error_ms) >= 1000U)
+    {
+#if APP_ENABLE_IMU_RUNTIME_TELEMETRY
+      Telemetry_PrintImuReadFailed(IMU_GetType(), IMU_GetWhoAmI());
+#endif
+      last_imu_error_ms = now_ms;
     }
 
     HAL_Delay(APP_CONTROL_LOOP_MS);
@@ -353,6 +866,10 @@ void App_Update(void)
         motors_armed = 0U;
         trim_captured = 0U;
         arm_hold_start_ms = 0U;
+        roll_integral_dps_s = 0.0f;
+        pitch_integral_dps_s = 0.0f;
+        yaw_integral_dps_s = 0.0f;
+        pid_state_initialized = 0U;
       }
 
       Motors_SetOutputEnabled(1U);
@@ -387,6 +904,8 @@ void App_Update(void)
 
       if (motors_armed != 0U)
       {
+        App_GetRatePidGains(&active_pid_gains);
+
         if (trim_captured == 0U)
         {
           roll_center_us = roll_us;
@@ -395,9 +914,73 @@ void App_Update(void)
           trim_captured = 1U;
         }
 
-        roll_term = APP_ROLL_SIGN * App_ApplyDeadbandAndAttenuate((int32_t)roll_us - (int32_t)roll_center_us);
-        pitch_term = APP_PITCH_SIGN * App_ApplyDeadbandAndAttenuate((int32_t)pitch_us - (int32_t)pitch_center_us);
-        yaw_term = APP_YAW_SIGN * App_ApplyDeadbandAndAttenuate((int32_t)yaw_us - (int32_t)yaw_center_us);
+        cmd_roll_rate_dps = ((float)APP_ROLL_SIGN) * App_StickOffsetUsToRateDps((int32_t)roll_us - (int32_t)roll_center_us,
+                           APP_RATE_CMD_MAX_ROLL_DPS);
+        cmd_pitch_rate_dps = ((float)APP_PITCH_SIGN) * App_StickOffsetUsToRateDps((int32_t)pitch_us - (int32_t)pitch_center_us,
+                             APP_RATE_CMD_MAX_PITCH_DPS);
+        cmd_yaw_rate_dps = ((float)APP_YAW_SIGN) * App_StickOffsetUsToRateDps((int32_t)yaw_us - (int32_t)yaw_center_us,
+                               APP_RATE_CMD_MAX_YAW_DPS);
+
+        roll_rate_error_dps = cmd_roll_rate_dps - measured_roll_rate_dps;
+        pitch_rate_error_dps = cmd_pitch_rate_dps - measured_pitch_rate_dps;
+        yaw_rate_error_dps = cmd_yaw_rate_dps - measured_yaw_rate_dps;
+
+        if ((dt_s < 0.0005f) || (dt_s > 0.050f))
+        {
+          dt_s = ((float)APP_CONTROL_LOOP_MS) * 0.001f;
+        }
+
+        if (pid_state_initialized == 0U)
+        {
+          prev_roll_rate_error_dps = roll_rate_error_dps;
+          prev_pitch_rate_error_dps = pitch_rate_error_dps;
+          prev_yaw_rate_error_dps = yaw_rate_error_dps;
+          pid_state_initialized = 1U;
+        }
+
+        roll_integral_dps_s += roll_rate_error_dps * dt_s;
+        pitch_integral_dps_s += pitch_rate_error_dps * dt_s;
+        yaw_integral_dps_s += yaw_rate_error_dps * dt_s;
+
+        if (active_pid_gains.roll.ki > 0.000001f)
+        {
+          integral_limit_roll = ((float)APP_RATE_TERM_LIMIT_US) / active_pid_gains.roll.ki;
+          roll_integral_dps_s = App_ClampFloat(roll_integral_dps_s, -integral_limit_roll, integral_limit_roll);
+        }
+
+        if (active_pid_gains.pitch.ki > 0.000001f)
+        {
+          integral_limit_pitch = ((float)APP_RATE_TERM_LIMIT_US) / active_pid_gains.pitch.ki;
+          pitch_integral_dps_s = App_ClampFloat(pitch_integral_dps_s, -integral_limit_pitch, integral_limit_pitch);
+        }
+
+        if (active_pid_gains.yaw.ki > 0.000001f)
+        {
+          integral_limit_yaw = ((float)APP_RATE_TERM_LIMIT_US) / active_pid_gains.yaw.ki;
+          yaw_integral_dps_s = App_ClampFloat(yaw_integral_dps_s, -integral_limit_yaw, integral_limit_yaw);
+        }
+
+        roll_rate_derivative_dps_per_s = (roll_rate_error_dps - prev_roll_rate_error_dps) / dt_s;
+        pitch_rate_derivative_dps_per_s = (pitch_rate_error_dps - prev_pitch_rate_error_dps) / dt_s;
+        yaw_rate_derivative_dps_per_s = (yaw_rate_error_dps - prev_yaw_rate_error_dps) / dt_s;
+
+        prev_roll_rate_error_dps = roll_rate_error_dps;
+        prev_pitch_rate_error_dps = pitch_rate_error_dps;
+        prev_yaw_rate_error_dps = yaw_rate_error_dps;
+
+        roll_term_f = (active_pid_gains.roll.kp * roll_rate_error_dps) +
+                      (active_pid_gains.roll.ki * roll_integral_dps_s) +
+                      (active_pid_gains.roll.kd * roll_rate_derivative_dps_per_s);
+        pitch_term_f = (active_pid_gains.pitch.kp * pitch_rate_error_dps) +
+                       (active_pid_gains.pitch.ki * pitch_integral_dps_s) +
+                       (active_pid_gains.pitch.kd * pitch_rate_derivative_dps_per_s);
+        yaw_term_f = (active_pid_gains.yaw.kp * yaw_rate_error_dps) +
+                     (active_pid_gains.yaw.ki * yaw_integral_dps_s) +
+                     (active_pid_gains.yaw.kd * yaw_rate_derivative_dps_per_s);
+
+        roll_term = App_ClampControlTerm((int32_t)roll_term_f, APP_RATE_TERM_LIMIT_US);
+        pitch_term = App_ClampControlTerm((int32_t)pitch_term_f, APP_RATE_TERM_LIMIT_US);
+        yaw_term = App_ClampControlTerm((int32_t)yaw_term_f, APP_RATE_TERM_LIMIT_US);
         throttle_term = (int32_t)throttle_us;
         if (throttle_term < (int32_t)APP_MOTOR_IDLE_US)
         {
@@ -422,6 +1005,7 @@ void App_Update(void)
   if ((now_ms - last_receiver_telemetry_ms) >= 500U)
   {
     Telemetry_PrintReceiverState(&receiver_state);
+#if APP_ENABLE_ARM_RUNTIME_TELEMETRY
     Telemetry_PrintArmState(motors_armed,
                             arm_switch_high,
                             throttle_low,
@@ -430,6 +1014,7 @@ void App_Update(void)
                             s2_us,
                             s3_us,
                             s4_us);
+#endif
     last_receiver_telemetry_ms = now_ms;
   }
 
@@ -448,7 +1033,10 @@ void App_Update(void)
     az_g = ((float)imu_raw.accel_z) / IMU_ACCEL_LSB_PER_G;
     gx_dps = ((float)imu_raw.gyro_x) / IMU_GYRO_LSB_PER_DPS;
     gy_dps = ((float)imu_raw.gyro_y) / IMU_GYRO_LSB_PER_DPS;
-    gz_dps = ((float)imu_raw.gyro_z) / IMU_GYRO_LSB_PER_DPS;
+    gz_dps = ((float)APP_GYRO_YAW_SIGN) * (((float)imu_raw.gyro_z) / IMU_GYRO_LSB_PER_DPS);
+    measured_roll_rate_dps = gx_dps;
+    measured_pitch_rate_dps = gy_dps;
+    measured_yaw_rate_dps = gz_dps;
 
     Attitude_UpdateIMU(gx_dps * RAD_PER_DEG,
                        gy_dps * RAD_PER_DEG,
@@ -466,13 +1054,31 @@ void App_Update(void)
     }
 
     yaw_deg = Attitude_WrapAngle180(yaw_deg - startup_yaw_offset_deg);
+
+#if APP_ENABLE_IMU_RUNTIME_TELEMETRY
+    if ((now_ms - last_imu_telemetry_ms) >= APP_IMU_TELEMETRY_MS)
+    {
+      Telemetry_PrintImuState(ax_g,
+                              ay_g,
+                              az_g,
+                              gx_dps,
+                              gy_dps,
+                              gz_dps,
+                              pitch_deg,
+                              roll_deg,
+                              yaw_deg);
+      last_imu_telemetry_ms = now_ms;
+    }
+#endif
 #if APP_ENABLE_ANGLE_TELEMETRY
     Telemetry_PrintAngles(pitch_deg, roll_deg, yaw_deg);
 #endif
   }
   else
   {
+#if APP_ENABLE_IMU_RUNTIME_TELEMETRY
     Telemetry_PrintImuReadFailed(IMU_GetType(), IMU_GetWhoAmI());
+#endif
   }
 
   HAL_Delay(APP_CONTROL_LOOP_MS);

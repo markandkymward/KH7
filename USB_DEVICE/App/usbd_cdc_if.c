@@ -23,7 +23,9 @@
 
 /* USER CODE BEGIN INCLUDE */
 #include "app.h"
+#include "telemetry.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -98,7 +100,7 @@ uint8_t UserRxBufferFS[APP_RX_DATA_SIZE];
 uint8_t UserTxBufferFS[APP_TX_DATA_SIZE];
 
 /* USER CODE BEGIN PRIVATE_VARIABLES */
-static char g_usb_cmd_line[64];
+static char g_usb_cmd_line[192];
 static uint8_t g_usb_cmd_len = 0U;
 
 /* USER CODE END PRIVATE_VARIABLES */
@@ -362,11 +364,127 @@ static void CDC_ProcessCommandLine(const char *line)
 {
   const char *prefix;
   char *endptr;
+  char *cursor;
+  char *token_end;
   uint32_t motor_index;
   uint32_t pulse_us;
+  App_RatePidGains_t gains;
 
   if ((line == NULL) || (line[0] == '\0'))
   {
+    return;
+  }
+
+  if (strcmp(line, "PID GET") == 0)
+  {
+    App_GetRatePidGains(&gains);
+    Telemetry_PrintRatePid(&gains, "get");
+    return;
+  }
+
+  if (strcmp(line, "PID DEFAULT") == 0)
+  {
+    App_RequestRatePidDefaults();
+    printf("PID_DEFAULT[QUEUED]\r\n");
+    return;
+  }
+
+  if (strcmp(line, "PID SAVE") == 0)
+  {
+    App_RequestRatePidSave();
+    printf("PID_SAVE[QUEUED]\r\n");
+    return;
+  }
+
+  if (strcmp(line, "PID LOAD") == 0)
+  {
+    App_RequestRatePidLoad();
+    printf("PID_LOAD[QUEUED]\r\n");
+    return;
+  }
+
+  prefix = "PID SET ";
+  if (strncmp(line, prefix, strlen(prefix)) == 0)
+  {
+    cursor = (char *)(line + strlen(prefix));
+
+    gains.roll.kp = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != ' '))
+    {
+      printf("PID_SET[FAIL]\r\n");
+      return;
+    }
+    cursor = token_end + 1;
+
+    gains.roll.ki = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != ' '))
+    {
+      printf("PID_SET[FAIL]\r\n");
+      return;
+    }
+    cursor = token_end + 1;
+
+    gains.roll.kd = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != ' '))
+    {
+      printf("PID_SET[FAIL]\r\n");
+      return;
+    }
+    cursor = token_end + 1;
+
+    gains.pitch.kp = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != ' '))
+    {
+      printf("PID_SET[FAIL]\r\n");
+      return;
+    }
+    cursor = token_end + 1;
+
+    gains.pitch.ki = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != ' '))
+    {
+      printf("PID_SET[FAIL]\r\n");
+      return;
+    }
+    cursor = token_end + 1;
+
+    gains.pitch.kd = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != ' '))
+    {
+      printf("PID_SET[FAIL]\r\n");
+      return;
+    }
+    cursor = token_end + 1;
+
+    gains.yaw.kp = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != ' '))
+    {
+      printf("PID_SET[FAIL]\r\n");
+      return;
+    }
+    cursor = token_end + 1;
+
+    gains.yaw.ki = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != ' '))
+    {
+      printf("PID_SET[FAIL]\r\n");
+      return;
+    }
+    cursor = token_end + 1;
+
+    gains.yaw.kd = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != '\0'))
+    {
+      printf("PID_SET[FAIL]\r\n");
+      return;
+    }
+
+    if (App_RequestRatePidSetAndSave(&gains) == 0U)
+    {
+      printf("PID_SET[FAIL]\r\n");
+      return;
+    }
+    printf("PID_SET[QUEUED]\r\n");
     return;
   }
 
