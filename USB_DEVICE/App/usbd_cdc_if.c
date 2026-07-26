@@ -23,6 +23,7 @@
 
 /* USER CODE BEGIN INCLUDE */
 #include "app.h"
+#include "communications.h"
 #include "telemetry.h"
 
 #include <stdio.h>
@@ -102,6 +103,8 @@ uint8_t UserTxBufferFS[APP_TX_DATA_SIZE];
 /* USER CODE BEGIN PRIVATE_VARIABLES */
 static char g_usb_cmd_line[192];
 static uint8_t g_usb_cmd_len = 0U;
+static const char g_escpt_escape_seq[] = "+++ESCPTOFF+++";
+static uint8_t g_escpt_escape_match = 0U;
 
 /* USER CODE END PRIVATE_VARIABLES */
 
@@ -136,7 +139,7 @@ static int8_t CDC_Receive_FS(uint8_t* pbuf, uint32_t *Len);
 static int8_t CDC_TransmitCplt_FS(uint8_t *pbuf, uint32_t *Len, uint8_t epnum);
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_DECLARATION */
-static void CDC_ProcessCommandLine(const char *line);
+void CDC_ProcessCommandLine(const char *line);
 
 /* USER CODE END PRIVATE_FUNCTIONS_DECLARATION */
 
@@ -274,6 +277,33 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
   uint32_t i;
   char ch;
 
+  if (Communications_IsEscPassthroughEnabled() != 0U)
+  {
+    for (i = 0U; i < *Len; i++)
+    {
+      uint8_t b = Buf[i];
+      if (b == (uint8_t)g_escpt_escape_seq[g_escpt_escape_match])
+      {
+        g_escpt_escape_match++;
+        if (g_escpt_escape_match >= (sizeof(g_escpt_escape_seq) - 1U))
+        {
+          Communications_EscPassthroughSetEnabled(0U);
+          g_escpt_escape_match = 0U;
+          printf("ESCPT[OFF]\r\n");
+        }
+      }
+      else
+      {
+        g_escpt_escape_match = (b == (uint8_t)g_escpt_escape_seq[0]) ? 1U : 0U;
+      }
+    }
+
+    Communications_EscPassthroughFromUsb(Buf, (uint16_t)(*Len));
+    USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
+    USBD_CDC_ReceivePacket(&hUsbDeviceFS);
+    return (USBD_OK);
+  }
+
   for (i = 0U; i < *Len; i++)
   {
     ch = (char)Buf[i];
@@ -360,7 +390,7 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_IMPLEMENTATION */
 
-static void CDC_ProcessCommandLine(const char *line)
+void CDC_ProcessCommandLine(const char *line)
 {
   const char *prefix;
   char *endptr;
@@ -372,6 +402,23 @@ static void CDC_ProcessCommandLine(const char *line)
 
   if ((line == NULL) || (line[0] == '\0'))
   {
+    return;
+  }
+
+  if (strcmp(line, "ESCPT ON") == 0)
+  {
+    g_usb_cmd_len = 0U;
+    g_escpt_escape_match = 0U;
+    Communications_EscPassthroughSetEnabled(1U);
+    printf("ESCPT[ON UART7 115200] SEND +++ESCPTOFF+++ TO EXIT\r\n");
+    return;
+  }
+
+  if (strcmp(line, "ESCPT OFF") == 0)
+  {
+    Communications_EscPassthroughSetEnabled(0U);
+    g_escpt_escape_match = 0U;
+    printf("ESCPT[OFF]\r\n");
     return;
   }
 
@@ -400,6 +447,12 @@ static void CDC_ProcessCommandLine(const char *line)
   {
     App_RequestRatePidLoad();
     printf("PID_LOAD[QUEUED]\r\n");
+    return;
+  }
+
+  if (strcmp(line, "PID DEBUG") == 0)
+  {
+    App_PrintPidDebug();
     return;
   }
 
@@ -485,6 +538,20 @@ static void CDC_ProcessCommandLine(const char *line)
       return;
     }
     printf("PID_SET[QUEUED]\r\n");
+    return;
+  }
+
+  if (strcmp(line, "BOOT LOG") == 0)
+  {
+    const char *boot_log = App_GetBootLog();
+    if ((boot_log != NULL) && (boot_log[0] != '\0'))
+    {
+      printf("--- BOOT LOG START ---\r\n%s--- BOOT LOG END ---\r\n", boot_log);
+    }
+    else
+    {
+      printf("--- BOOT LOG EMPTY ---\r\n");
+    }
     return;
   }
 

@@ -1,8 +1,11 @@
 #include "receiver.h"
+#include "communications.h"
+#include "app.h"
 
 #include "main.h"
 
 #include <string.h>
+#include <stdio.h>
 
 #define CRSF_PAYLOAD_MAX_SIZE          62U
 #define CRSF_FRAME_MAX_SIZE            (CRSF_PAYLOAD_MAX_SIZE + 2U)
@@ -18,10 +21,12 @@ typedef struct
 } receiver_parser_t;
 
 extern UART_HandleTypeDef huart4;
+extern UART_HandleTypeDef huart6;
 
 static volatile receiver_state_t g_receiver_state;
 static receiver_parser_t g_parser;
 static uint8_t g_rx_byte;
+static uint8_t g_uart6_bridge_byte;
 
 static uint8_t Receiver_Crc8(const uint8_t *data, uint8_t length)
 {
@@ -140,6 +145,8 @@ static void Receiver_HandleByte(uint8_t byte)
 void Receiver_Init(void)
 {
   uint8_t channel_index;
+  HAL_StatusTypeDef status4, status6;
+  char msg[128];
 
   memset((void *)&g_receiver_state, 0, sizeof(g_receiver_state));
   for (channel_index = 0U; channel_index < RECEIVER_CHANNEL_COUNT; channel_index++)
@@ -148,7 +155,18 @@ void Receiver_Init(void)
   }
 
   Receiver_ResetParser();
-  (void)HAL_UART_Receive_IT(&huart4, &g_rx_byte, 1U);
+  printf("[Receiver_Init] Starting UART4/UART6 RX interrupts\r\n");
+  App_AppendBootLog("[Receiver_Init] Starting UART4/UART6 RX interrupts\r\n");
+  
+  status4 = HAL_UART_Receive_IT(&huart4, &g_rx_byte, 1U);
+  snprintf(msg, sizeof(msg), "[Receiver_Init] UART4 Receive_IT status = %d (0=OK)\r\n", (int)status4);
+  printf("%s", msg);
+  App_AppendBootLog(msg);
+  
+  status6 = HAL_UART_Receive_IT(&huart6, &g_uart6_bridge_byte, 1U);
+  snprintf(msg, sizeof(msg), "[Receiver_Init] UART6 Receive_IT status = %d (0=OK)\r\n", (int)status6);
+  printf("%s", msg);
+  App_AppendBootLog(msg);
 }
 
 void Receiver_Update(uint32_t now_ms)
@@ -180,6 +198,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     Receiver_HandleByte(g_rx_byte);
     (void)HAL_UART_Receive_IT(&huart4, &g_rx_byte, 1U);
   }
+  else if (huart->Instance == USART6)
+  {
+    Communications_HandleUart6Byte(g_uart6_bridge_byte);
+    (void)HAL_UART_Receive_IT(huart, &g_uart6_bridge_byte, 1U);
+  }
 }
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
@@ -189,5 +212,10 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     Receiver_ResetParser();
     (void)HAL_UART_AbortReceive(huart);
     (void)HAL_UART_Receive_IT(&huart4, &g_rx_byte, 1U);
+  }
+  else if (huart->Instance == USART6)
+  {
+    (void)HAL_UART_AbortReceive(huart);
+    (void)HAL_UART_Receive_IT(huart, &g_uart6_bridge_byte, 1U);
   }
 }

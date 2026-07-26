@@ -26,6 +26,7 @@ void Telemetry_PrintImuState(float ax_g,
 							 float yaw_deg);
 void Telemetry_PrintMotorTestStep(uint8_t step_index);
 void Telemetry_PrintReceiverState(const receiver_state_t *state);
+void Telemetry_PrintReceiverState16(const receiver_state_t *state);
 void Telemetry_PrintArmState(uint8_t armed,
 							 uint8_t arm_switch_high,
 							 uint8_t arm_low_seen,
@@ -36,6 +37,7 @@ void Telemetry_PrintArmState(uint8_t armed,
 							 uint16_t s4_us);
 void Telemetry_PrintRatePid(const App_RatePidGains_t *gains, const char *source);
 void Telemetry_PrintAngles(float pitch_deg, float roll_deg, float yaw_deg);
+void Telemetry_PrintBatteryState(float battery_voltage_v, uint32_t adc_raw);
 
 #ifdef __cplusplus
 }

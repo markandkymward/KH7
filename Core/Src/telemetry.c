@@ -128,6 +128,42 @@ void Telemetry_PrintReceiverState(const receiver_state_t *state)
          (unsigned int)ch3_us);
 }
 
+void Telemetry_PrintReceiverState16(const receiver_state_t *state)
+{
+  uint16_t ch_us[RECEIVER_CHANNEL_COUNT];
+  uint8_t i;
+
+  if (state == NULL)
+  {
+    return;
+  }
+
+  for (i = 0U; i < RECEIVER_CHANNEL_COUNT; i++)
+  {
+    ch_us[i] = Telemetry_CrsfRawToUs(state->channels[i]);
+  }
+
+  printf("RX16[link=%u frames=%lu us]=[%u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u]\r\n",
+         (unsigned int)state->link_active,
+         (unsigned long)state->frame_count,
+         (unsigned int)ch_us[0],
+         (unsigned int)ch_us[1],
+         (unsigned int)ch_us[2],
+         (unsigned int)ch_us[3],
+         (unsigned int)ch_us[4],
+         (unsigned int)ch_us[5],
+         (unsigned int)ch_us[6],
+         (unsigned int)ch_us[7],
+         (unsigned int)ch_us[8],
+         (unsigned int)ch_us[9],
+         (unsigned int)ch_us[10],
+         (unsigned int)ch_us[11],
+         (unsigned int)ch_us[12],
+         (unsigned int)ch_us[13],
+         (unsigned int)ch_us[14],
+         (unsigned int)ch_us[15]);
+}
+
 void Telemetry_PrintArmState(uint8_t armed,
                              uint8_t arm_switch_high,
                              uint8_t arm_low_seen,
@@ -210,4 +246,19 @@ void Telemetry_PrintAngles(float pitch_deg, float roll_deg, float yaw_deg)
          (long)r10_frac,
          (long)(y10 / 10),
          (long)y10_frac);
+}
+
+void Telemetry_PrintBatteryState(float battery_voltage_v, uint32_t adc_raw)
+{
+  int32_t battery_mv;
+
+  battery_mv = (int32_t)(battery_voltage_v * 1000.0f + 0.5f);
+  if (battery_mv < 0)
+  {
+    battery_mv = 0;
+  }
+
+  printf("VBAT[mV raw]=[%ld %lu]\r\n",
+         (long)battery_mv,
+         (unsigned long)adc_raw);
 }

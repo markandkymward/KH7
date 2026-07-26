@@ -33,6 +33,12 @@ uint8_t App_RequestRatePidSetAndSave(const App_RatePidGains_t *gains);
 void App_RequestRatePidSave(void);
 void App_RequestRatePidLoad(void);
 void App_RequestRatePidDefaults(void);
+void App_GetPidCommandDebug(uint32_t *queued_count,
+							uint32_t *handled_count,
+							uint32_t *pending_cmd);
+void App_PrintPidDebug(void);
+const char *App_GetBootLog(void);
+void App_AppendBootLog(const char *str);
 
 #ifdef __cplusplus
 }

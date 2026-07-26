@@ -7,6 +7,7 @@
 #include "attitude.h"
 #include "imu.h"
 #include "motors.h"
+#include "communications.h"
 #include "receiver.h"
 #include "telemetry.h"
 #include "main.h"
@@ -16,6 +17,7 @@
 #define RAD_PER_DEG       0.0174532925f
 #define APP_ENABLE_IMU_RUNTIME_TELEMETRY 1U
 #define APP_ENABLE_ARM_RUNTIME_TELEMETRY 1U
+#define APP_ENABLE_RECEIVER_RUNTIME_TELEMETRY 0U
 #define APP_ENABLE_ANGLE_TELEMETRY 0U
 #define APP_CH_ROLL_INDEX      0U
 #define APP_CH_PITCH_INDEX     1U
@@ -23,17 +25,31 @@
 #define APP_CH_YAW_INDEX       3U
 #define APP_CH_ARM_INDEX       4U
 #define APP_ARM_THRESHOLD_US   1500U
-#define APP_THROTTLE_LOW_US    1050U
+#define APP_THROTTLE_LOW_US    1100U
 #define APP_ARM_HOLD_MS        300U
 #define APP_BEEPER_TOGGLE_MS   150U
 #define APP_USB_TEST_ARM_DELAY_MS 2000U
-#define APP_IMU_TELEMETRY_MS    100U
+#define APP_IMU_TELEMETRY_MS    120U
+#define APP_ARM_TELEMETRY_MS    150U
+#define APP_RX16_TELEMETRY_MS   120U
+#define APP_LOW_THROTTLE_MIX_DISABLE_US 40U
 #define APP_CONTROL_DEADBAND_US 20U
 #define APP_MOTOR_IDLE_US      1080U
 #define APP_ROLL_SIGN          (1)
 #define APP_PITCH_SIGN         (-1)
 #define APP_YAW_SIGN           (1)
 #define APP_GYRO_YAW_SIGN      (-1)
+#define APP_GYRO_STILL_DPS     0.5f
+#define APP_ACCEL_STILL_TOL_G  0.08f
+#define APP_YAW_BIAS_ALPHA     0.001f
+#define APP_YAW_BIAS_SETTLE_SAMPLES 1000U
+#define APP_ADC_MAX_COUNT      65535.0f
+#define APP_ADC_REF_V          3.3f
+#define APP_BATTERY_DIVIDER_RATIO 11.13f
+#define APP_BATTERY_FILTER_ALPHA 0.60f
+#define APP_BATTERY_ADC_SAMPLES 2U
+#define APP_BATTERY_SAMPLE_MS   120U
+#define APP_BATTERY_CHANNEL      ADC_CHANNEL_10
 #define APP_RATE_CMD_MAX_ROLL_DPS   300.0f
 #define APP_RATE_CMD_MAX_PITCH_DPS  300.0f
 #define APP_RATE_CMD_MAX_YAW_DPS    220.0f
@@ -56,6 +72,7 @@
 #define APP_PWM_MIN_US         988U
 #define APP_PWM_MID_US         1500U
 #define APP_PWM_MAX_US         2012U
+#define APP_THROTTLE_MAX_US    1880U
 #define APP_CRSF_MIN_RAW       172U
 #define APP_CRSF_MAX_RAW       1811U
 
@@ -110,6 +127,21 @@ static App_RatePidGains_t g_rate_pid_gains = {
 };
 static volatile App_PidCommand_t g_pid_command = APP_PID_CMD_NONE;
 static volatile App_RatePidGains_t g_pid_command_gains;
+static volatile uint32_t g_pid_command_queued_count = 0U;
+static volatile uint32_t g_pid_command_handled_count = 0U;
+
+static uint8_t g_boot_log_pending = 1U;
+static uint8_t g_boot_pid_loaded = 0U;
+static float g_yaw_gyro_bias_dps = 0.0f;
+static float g_yaw_gyro_bias_sum_dps = 0.0f;
+static uint32_t g_yaw_stationary_sample_count = 0U;
+static uint8_t g_yaw_gyro_bias_ready = 0U;
+
+extern ADC_HandleTypeDef hadc1;
+
+#define APP_BOOT_LOG_SIZE 2048U
+static char g_boot_log_buffer[APP_BOOT_LOG_SIZE];
+static uint16_t g_boot_log_pos = 0U;
 
 static uint16_t App_CrsfRawToUs(uint16_t raw)
 {
@@ -128,6 +160,125 @@ static uint16_t App_CrsfRawToUs(uint16_t raw)
   scaled = (uint32_t)(raw - APP_CRSF_MIN_RAW) * (APP_PWM_MAX_US - APP_PWM_MIN_US);
   scaled = (scaled / (APP_CRSF_MAX_RAW - APP_CRSF_MIN_RAW)) + APP_PWM_MIN_US;
   return (uint16_t)scaled;
+}
+
+static uint8_t App_UpdateYawGyroBias(float ax_g,
+                                     float ay_g,
+                                     float az_g,
+                                     float gx_dps,
+                                     float gy_dps,
+                                     float gz_dps,
+                                     uint8_t motors_armed,
+                                     uint16_t throttle_us)
+{
+  float accel_mag_sq;
+  float accel_min_sq;
+  float accel_max_sq;
+  uint8_t stationary;
+
+  if ((motors_armed != 0U) && (throttle_us > APP_THROTTLE_LOW_US))
+  {
+    return 0U;
+  }
+
+  accel_mag_sq = (ax_g * ax_g) + (ay_g * ay_g) + (az_g * az_g);
+  accel_min_sq = (1.0f - APP_ACCEL_STILL_TOL_G) * (1.0f - APP_ACCEL_STILL_TOL_G);
+  accel_max_sq = (1.0f + APP_ACCEL_STILL_TOL_G) * (1.0f + APP_ACCEL_STILL_TOL_G);
+  stationary = ((accel_mag_sq >= accel_min_sq) &&
+                (accel_mag_sq <= accel_max_sq) &&
+                (gx_dps > -APP_GYRO_STILL_DPS) && (gx_dps < APP_GYRO_STILL_DPS) &&
+                (gy_dps > -APP_GYRO_STILL_DPS) && (gy_dps < APP_GYRO_STILL_DPS) &&
+                (gz_dps > -APP_GYRO_STILL_DPS) && (gz_dps < APP_GYRO_STILL_DPS)) ? 1U : 0U;
+
+  if (stationary == 0U)
+  {
+    return 0U;
+  }
+
+  if (g_yaw_gyro_bias_ready == 0U)
+  {
+    g_yaw_gyro_bias_sum_dps += gz_dps;
+    g_yaw_stationary_sample_count++;
+
+    if (g_yaw_stationary_sample_count >= APP_YAW_BIAS_SETTLE_SAMPLES)
+    {
+      g_yaw_gyro_bias_dps = g_yaw_gyro_bias_sum_dps / ((float)g_yaw_stationary_sample_count);
+      g_yaw_gyro_bias_ready = 1U;
+    }
+  }
+  else
+  {
+    g_yaw_gyro_bias_dps = ((1.0f - APP_YAW_BIAS_ALPHA) * g_yaw_gyro_bias_dps) + (APP_YAW_BIAS_ALPHA * gz_dps);
+  }
+
+  return g_yaw_gyro_bias_ready;
+}
+
+static uint8_t App_ReadBatteryVoltage(float *battery_voltage_v, uint32_t *adc_raw)
+{
+  ADC_ChannelConfTypeDef sConfig;
+  uint32_t sum_samples;
+  uint32_t sample;
+  uint32_t throwaway_sample;
+  uint32_t i;
+  float adc_pin_voltage_v;
+
+  if ((battery_voltage_v == NULL) || (adc_raw == NULL))
+  {
+    return 0U;
+  }
+
+  sConfig.Channel = APP_BATTERY_CHANNEL;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_387CYCLES_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  sConfig.OffsetSignedSaturation = DISABLE;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    return 0U;
+  }
+
+  if (HAL_ADC_Start(&hadc1) != HAL_OK)
+  {
+    return 0U;
+  }
+
+  if (HAL_ADC_PollForConversion(&hadc1, 3U) != HAL_OK)
+  {
+    (void)HAL_ADC_Stop(&hadc1);
+    return 0U;
+  }
+
+  throwaway_sample = HAL_ADC_GetValue(&hadc1);
+  (void)throwaway_sample;
+  (void)HAL_ADC_Stop(&hadc1);
+
+  sum_samples = 0U;
+  for (i = 0U; i < APP_BATTERY_ADC_SAMPLES; i++)
+  {
+    if (HAL_ADC_Start(&hadc1) != HAL_OK)
+    {
+      return 0U;
+    }
+
+    if (HAL_ADC_PollForConversion(&hadc1, 3U) != HAL_OK)
+    {
+      (void)HAL_ADC_Stop(&hadc1);
+      return 0U;
+    }
+
+    sum_samples += HAL_ADC_GetValue(&hadc1);
+    (void)HAL_ADC_Stop(&hadc1);
+  }
+
+  sample = sum_samples / APP_BATTERY_ADC_SAMPLES;
+
+  adc_pin_voltage_v = (((float)sample) / APP_ADC_MAX_COUNT) * APP_ADC_REF_V;
+  *battery_voltage_v = adc_pin_voltage_v * APP_BATTERY_DIVIDER_RATIO;
+  *adc_raw = sample;
+  return 1U;
 }
 
 static uint16_t App_ClampPulseUs(int32_t pulse_us)
@@ -218,6 +369,21 @@ static int32_t App_ClampControlTerm(int32_t value, int32_t limit)
   return value;
 }
 
+static int32_t App_ClampInt32(int32_t value, int32_t min_value, int32_t max_value)
+{
+  if (value < min_value)
+  {
+    return min_value;
+  }
+
+  if (value > max_value)
+  {
+    return max_value;
+  }
+
+  return value;
+}
+
 static uint32_t App_Crc32(const uint8_t *data, size_t len)
 {
   uint32_t crc = 0xFFFFFFFFUL;
@@ -286,6 +452,36 @@ static uint8_t App_AreRatePidGainsValid(const App_RatePidGains_t *gains)
   return 1U;
 }
 
+void App_AppendBootLog(const char *str)
+{
+  size_t len;
+  
+  if ((str == NULL) || (g_boot_log_pos >= APP_BOOT_LOG_SIZE))
+  {
+    return;
+  }
+
+  len = strlen(str);
+  if (len == 0U)
+  {
+    return;
+  }
+
+  if ((g_boot_log_pos + len) >= APP_BOOT_LOG_SIZE)
+  {
+    len = APP_BOOT_LOG_SIZE - g_boot_log_pos - 1U;
+  }
+
+  memcpy(&g_boot_log_buffer[g_boot_log_pos], str, len);
+  g_boot_log_pos += len;
+  g_boot_log_buffer[g_boot_log_pos] = '\0';
+}
+
+const char *App_GetBootLog(void)
+{
+  return g_boot_log_buffer;
+}
+
 void App_GetRatePidGains(App_RatePidGains_t *gains)
 {
   if (gains == NULL)
@@ -330,19 +526,27 @@ uint8_t App_LoadRatePidGains(void)
 
   stored = (const App_PidFlashBlob_t *)APP_PID_FLASH_ADDRESS;
 
+  printf("PID_LOAD_DBG: magic=0x%08lX ver=%lu\r\n",
+         (unsigned long)stored->magic, (unsigned long)stored->version);
+
   if ((stored->magic != APP_PID_FLASH_MAGIC) || (stored->version != APP_PID_FLASH_VERSION))
   {
+    printf("PID_LOAD_DBG: bad header (expected magic=0x%08lX ver=%lu)\r\n",
+           (unsigned long)APP_PID_FLASH_MAGIC, (unsigned long)APP_PID_FLASH_VERSION);
     return 0U;
   }
 
   expected_crc = App_Crc32((const uint8_t *)stored, offsetof(App_PidFlashBlob_t, crc32));
   if (expected_crc != stored->crc32)
   {
+    printf("PID_LOAD_DBG: crc mismatch stored=0x%08lX computed=0x%08lX\r\n",
+           (unsigned long)stored->crc32, (unsigned long)expected_crc);
     return 0U;
   }
 
   if (App_AreRatePidGainsValid(&stored->gains) == 0U)
   {
+    printf("PID_LOAD_DBG: gains out of range\r\n");
     return 0U;
   }
 
@@ -367,6 +571,7 @@ uint8_t App_SaveRatePidGains(void)
 
   if (HAL_FLASH_Unlock() != HAL_OK)
   {
+    printf("PID_SAVE_DBG: unlock fail err=0x%08lX\r\n", (unsigned long)HAL_FLASH_GetError());
     return 0U;
   }
 
@@ -379,6 +584,8 @@ uint8_t App_SaveRatePidGains(void)
 
   if (HAL_FLASHEx_Erase(&erase, &sector_error) != HAL_OK)
   {
+    printf("PID_SAVE_DBG: erase fail sector_err=%lu flash_err=0x%08lX\r\n",
+           (unsigned long)sector_error, (unsigned long)HAL_FLASH_GetError());
     (void)HAL_FLASH_Lock();
     return 0U;
   }
@@ -390,6 +597,8 @@ uint8_t App_SaveRatePidGains(void)
                           address,
                           (uint32_t)&page.words[write_index * 8U]) != HAL_OK)
     {
+      printf("PID_SAVE_DBG: write fail word=%u addr=0x%08lX err=0x%08lX\r\n",
+             (unsigned)write_index, (unsigned long)address, (unsigned long)HAL_FLASH_GetError());
       (void)HAL_FLASH_Lock();
       return 0U;
     }
@@ -401,11 +610,16 @@ uint8_t App_SaveRatePidGains(void)
   written = (const App_PidFlashBlob_t *)APP_PID_FLASH_ADDRESS;
   if ((written->magic != APP_PID_FLASH_MAGIC) || (written->version != APP_PID_FLASH_VERSION))
   {
+    printf("PID_SAVE_DBG: verify header fail magic=0x%08lX ver=%lu\r\n",
+           (unsigned long)written->magic, (unsigned long)written->version);
     return 0U;
   }
 
   if (App_Crc32((const uint8_t *)written, offsetof(App_PidFlashBlob_t, crc32)) != written->crc32)
   {
+    printf("PID_SAVE_DBG: verify crc fail stored=0x%08lX computed=0x%08lX\r\n",
+           (unsigned long)written->crc32,
+           (unsigned long)App_Crc32((const uint8_t *)written, offsetof(App_PidFlashBlob_t, crc32)));
     return 0U;
   }
 
@@ -422,6 +636,7 @@ uint8_t App_RequestRatePidSetAndSave(const App_RatePidGains_t *gains)
   __disable_irq();
   g_pid_command_gains = *gains;
   g_pid_command = APP_PID_CMD_SET_AND_SAVE;
+  g_pid_command_queued_count++;
   __enable_irq();
 
   return 1U;
@@ -431,6 +646,7 @@ void App_RequestRatePidSave(void)
 {
   __disable_irq();
   g_pid_command = APP_PID_CMD_SAVE;
+  g_pid_command_queued_count++;
   __enable_irq();
 }
 
@@ -438,6 +654,7 @@ void App_RequestRatePidLoad(void)
 {
   __disable_irq();
   g_pid_command = APP_PID_CMD_LOAD;
+  g_pid_command_queued_count++;
   __enable_irq();
 }
 
@@ -445,7 +662,73 @@ void App_RequestRatePidDefaults(void)
 {
   __disable_irq();
   g_pid_command = APP_PID_CMD_DEFAULT;
+  g_pid_command_queued_count++;
   __enable_irq();
+}
+
+void App_GetPidCommandDebug(uint32_t *queued_count,
+							uint32_t *handled_count,
+							uint32_t *pending_cmd)
+{
+  __disable_irq();
+  if (queued_count != NULL)
+  {
+    *queued_count = g_pid_command_queued_count;
+  }
+
+  if (handled_count != NULL)
+  {
+    *handled_count = g_pid_command_handled_count;
+  }
+
+  if (pending_cmd != NULL)
+  {
+    *pending_cmd = (uint32_t)g_pid_command;
+  }
+  __enable_irq();
+}
+
+void App_PrintPidDebug(void)
+{
+  const App_PidFlashBlob_t *stored;
+  uint32_t queued_count;
+  uint32_t handled_count;
+  uint32_t pending_cmd;
+  uint32_t computed_crc;
+  uint8_t header_ok;
+  uint8_t crc_ok;
+  uint8_t gains_ok;
+  App_RatePidGains_t active;
+
+  stored = (const App_PidFlashBlob_t *)APP_PID_FLASH_ADDRESS;
+  computed_crc = App_Crc32((const uint8_t *)stored, offsetof(App_PidFlashBlob_t, crc32));
+  header_ok = (uint8_t)((stored->magic == APP_PID_FLASH_MAGIC) &&
+                        (stored->version == APP_PID_FLASH_VERSION));
+  crc_ok = (uint8_t)(computed_crc == stored->crc32);
+  gains_ok = App_AreRatePidGainsValid(&stored->gains);
+
+  App_GetPidCommandDebug(&queued_count, &handled_count, &pending_cmd);
+  App_GetRatePidGains(&active);
+
+  printf("PID_DEBUG[q=%lu h=%lu p=%lu]\r\n",
+         (unsigned long)queued_count,
+         (unsigned long)handled_count,
+         (unsigned long)pending_cmd);
+  printf("PID_FLASH[addr=0x%08lX magic=0x%08lX ver=%lu crc=0x%08lX calc=0x%08lX header=%u crc_ok=%u gains_ok=%u]\r\n",
+         (unsigned long)APP_PID_FLASH_ADDRESS,
+         (unsigned long)stored->magic,
+         (unsigned long)stored->version,
+         (unsigned long)stored->crc32,
+         (unsigned long)computed_crc,
+         (unsigned)header_ok,
+         (unsigned)crc_ok,
+         (unsigned)gains_ok);
+  Telemetry_PrintRatePid(&active, "debug_active");
+
+  if ((header_ok != 0U) && (crc_ok != 0U) && (gains_ok != 0U))
+  {
+    Telemetry_PrintRatePid(&stored->gains, "debug_flash");
+  }
 }
 
 static void App_ProcessPendingPidCommand(void)
@@ -465,6 +748,10 @@ static void App_ProcessPendingPidCommand(void)
   {
     return;
   }
+
+  __disable_irq();
+  g_pid_command_handled_count++;
+  __enable_irq();
 
   switch (cmd)
   {
@@ -538,24 +825,11 @@ void App_SetUsbMotorTest(uint8_t enabled, uint8_t motor_index, uint16_t pulse_us
   __enable_irq();
 }
 
-void App_Init(void)
+static void App_EmitBootLog(void)
 {
-  Motors_Init();
-  Motors_SetOutputEnabled(APP_MOTOR_TEST_MODE);
-  Motors_StopAll();
-
-  Attitude_Init();
-  Receiver_Init();
-
-  if (App_LoadRatePidGains() == 0U)
-  {
-    App_ResetRatePidDefaults();
-  }
-
   Telemetry_PrintImuLoggerStart();
-  Telemetry_PrintRatePid(&g_rate_pid_gains, "boot");
-
-  if (IMU_DetectAndInit() == HAL_OK)
+  Telemetry_PrintRatePid(&g_rate_pid_gains, g_boot_pid_loaded ? "boot" : "boot_default");
+  if (IMU_GetType() != IMU_TYPE_UNKNOWN)
   {
     Telemetry_PrintImuDetected(IMU_GetType(), IMU_GetWhoAmI());
   }
@@ -565,14 +839,47 @@ void App_Init(void)
   }
 }
 
+void App_Init(void)
+{
+  Motors_Init();
+  Motors_SetOutputEnabled(APP_MOTOR_TEST_MODE);
+  Motors_StopAll();
+
+  (void)HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
+
+  Attitude_Init();
+  Receiver_Init();
+
+  g_boot_pid_loaded = App_LoadRatePidGains();
+  if (g_boot_pid_loaded == 0U)
+  {
+    App_ResetRatePidDefaults();
+  }
+
+  (void)IMU_DetectAndInit();
+}
+
 void App_Update(void)
 {
   static uint32_t detect_retry_counter = 0U;
   static uint32_t last_tick_ms = 0U;
   static uint8_t last_motor_test_step = 0xFFU;
+
+  if (g_boot_log_pending != 0U)
+  {
+    if (HAL_GetTick() >= 2000U)
+    {
+      g_boot_log_pending = 0U;
+      App_EmitBootLog();
+    }
+  }
   static uint32_t last_receiver_telemetry_ms = 0U;
+  static uint32_t last_rx16_telemetry_ms = 0U;
 #if APP_ENABLE_IMU_RUNTIME_TELEMETRY
   static uint32_t last_imu_telemetry_ms = 0U;
+#endif
+#if APP_ENABLE_ARM_RUNTIME_TELEMETRY
+  static uint32_t last_arm_telemetry_ms = 0U;
 #endif
   static uint32_t last_imu_error_ms = 0U;
   static uint8_t usb_test_was_enabled = 0U;
@@ -599,6 +906,10 @@ void App_Update(void)
   static uint8_t pid_state_initialized = 0U;
   static uint8_t yaw_zero_captured = 0U;
   static float startup_yaw_offset_deg = 0.0f;
+  static float battery_voltage_filtered_v = 0.0f;
+  static uint8_t battery_voltage_valid = 0U;
+  static uint32_t battery_adc_raw = 0U;
+  static uint32_t last_battery_sample_ms = 0U;
   IMU_RawData_t imu_raw;
   uint8_t motor_test_step;
   uint32_t now_ms;
@@ -613,6 +924,7 @@ void App_Update(void)
   float pitch_deg;
   float roll_deg;
   float yaw_deg;
+  float battery_voltage_v;
   uint16_t roll_us;
   uint16_t pitch_us;
   uint16_t throttle_us;
@@ -642,6 +954,9 @@ void App_Update(void)
   int32_t m_front_right;
   int32_t m_rear_right;
   int32_t m_rear_left;
+  int32_t mix_max;
+  int32_t mix_min;
+  int32_t mix_offset;
   uint16_t s1_us;
   uint16_t s2_us;
   uint16_t s3_us;
@@ -669,6 +984,9 @@ void App_Update(void)
   __enable_irq();
 
   now_ms = HAL_GetTick();
+
+  Communications_ServiceEscPassthrough();
+  Communications_ServiceUart6Commands();
   App_ProcessPendingPidCommand();
 
   if (usb_motor_test_enabled != 0U)
@@ -702,11 +1020,24 @@ void App_Update(void)
       }
     }
 
-    Motors_WriteUs(s3_us, s2_us, s4_us, s1_us);
+    /* Physical channels map as: CH1=LA, CH2=LF, CH3=RA, CH4=RF. */
+    Motors_WriteUs(s4_us, s1_us, s3_us, s2_us);
 
-    if ((now_ms - last_receiver_telemetry_ms) >= 500U)
+    if ((now_ms - last_receiver_telemetry_ms) >= 1000U)
     {
+      last_receiver_telemetry_ms = now_ms;
+    }
+
+    if ((now_ms - last_rx16_telemetry_ms) >= APP_RX16_TELEMETRY_MS)
+    {
+      Receiver_GetState(&receiver_state);
+      Telemetry_PrintReceiverState16(&receiver_state);
+      last_rx16_telemetry_ms = now_ms;
+    }
+
 #if APP_ENABLE_ARM_RUNTIME_TELEMETRY
+    if ((now_ms - last_arm_telemetry_ms) >= APP_ARM_TELEMETRY_MS)
+    {
       Telemetry_PrintArmState(1U,
                               0U,
                               0U,
@@ -715,8 +1046,25 @@ void App_Update(void)
                               s2_us,
                               s3_us,
                               s4_us);
+      last_arm_telemetry_ms = now_ms;
+    }
 #endif
-      last_receiver_telemetry_ms = now_ms;
+
+    if ((now_ms - last_battery_sample_ms) >= APP_BATTERY_SAMPLE_MS)
+    {
+      if (App_ReadBatteryVoltage(&battery_voltage_v, &battery_adc_raw) != 0U)
+      {
+        if (battery_voltage_valid == 0U)
+        {
+          battery_voltage_filtered_v = battery_voltage_v;
+          battery_voltage_valid = 1U;
+        }
+        else
+        {
+          battery_voltage_filtered_v += APP_BATTERY_FILTER_ALPHA * (battery_voltage_v - battery_voltage_filtered_v);
+        }
+      }
+      last_battery_sample_ms = now_ms;
     }
 
     if ((IMU_GetType() == IMU_TYPE_UNKNOWN) && ((detect_retry_counter++ % 10U) == 0U))
@@ -735,6 +1083,9 @@ void App_Update(void)
       gx_dps = ((float)imu_raw.gyro_x) / IMU_GYRO_LSB_PER_DPS;
       gy_dps = ((float)imu_raw.gyro_y) / IMU_GYRO_LSB_PER_DPS;
       gz_dps = ((float)APP_GYRO_YAW_SIGN) * (((float)imu_raw.gyro_z) / IMU_GYRO_LSB_PER_DPS);
+      (void)App_UpdateYawGyroBias(ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps, 1U, usb_motor_test_pulse_us);
+      gz_dps -= g_yaw_gyro_bias_dps;
+
       measured_roll_rate_dps = gx_dps;
       measured_pitch_rate_dps = gy_dps;
       measured_yaw_rate_dps = gz_dps;
@@ -768,6 +1119,10 @@ void App_Update(void)
                                 pitch_deg,
                                 roll_deg,
                                 yaw_deg);
+        if (battery_voltage_valid != 0U)
+        {
+          Telemetry_PrintBatteryState(battery_voltage_filtered_v, battery_adc_raw);
+        }
         last_imu_telemetry_ms = now_ms;
       }
 #endif
@@ -834,7 +1189,9 @@ void App_Update(void)
       trim_captured = 0U;
       arm_hold_start_ms = 0U;
 
-      Motors_SetOutputEnabled(0U);
+      /* Keep valid minimum PWM while startup arm safety is active so ESCs
+       * can still complete their own ready sequence. */
+      Motors_SetOutputEnabled(1U);
       Motors_StopAll();
 
       if ((now_ms - last_beeper_toggle_ms) >= APP_BEEPER_TOGGLE_MS)
@@ -986,26 +1343,118 @@ void App_Update(void)
         {
           throttle_term = APP_MOTOR_IDLE_US;
         }
+        throttle_term = App_ClampInt32(throttle_term,
+                                       (int32_t)APP_MOTOR_IDLE_US,
+                                       (int32_t)APP_THROTTLE_MAX_US);
+
+        /* Keep startup spool-up symmetric: suppress attitude/yaw correction
+         * very close to idle so one motor does not start noticeably earlier. */
+        if (throttle_term <= ((int32_t)APP_MOTOR_IDLE_US + (int32_t)APP_LOW_THROTTLE_MIX_DISABLE_US))
+        {
+          roll_term = 0;
+          pitch_term = 0;
+          yaw_term = 0;
+          roll_integral_dps_s = 0.0f;
+          pitch_integral_dps_s = 0.0f;
+          yaw_integral_dps_s = 0.0f;
+          pid_state_initialized = 0U;
+        }
 
         m_front_left = throttle_term + pitch_term + roll_term - yaw_term;
         m_front_right = throttle_term + pitch_term - roll_term + yaw_term;
         m_rear_right = throttle_term - pitch_term - roll_term - yaw_term;
         m_rear_left = throttle_term - pitch_term + roll_term + yaw_term;
 
+        /* Keep mixer authority at high throttle by shifting all motors together
+         * instead of clipping each output independently. */
+        mix_max = m_front_left;
+        if (m_front_right > mix_max)
+        {
+          mix_max = m_front_right;
+        }
+        if (m_rear_right > mix_max)
+        {
+          mix_max = m_rear_right;
+        }
+        if (m_rear_left > mix_max)
+        {
+          mix_max = m_rear_left;
+        }
+
+        mix_min = m_front_left;
+        if (m_front_right < mix_min)
+        {
+          mix_min = m_front_right;
+        }
+        if (m_rear_right < mix_min)
+        {
+          mix_min = m_rear_right;
+        }
+        if (m_rear_left < mix_min)
+        {
+          mix_min = m_rear_left;
+        }
+
+        if (mix_max > (int32_t)APP_PWM_MAX_US)
+        {
+          mix_offset = mix_max - (int32_t)APP_PWM_MAX_US;
+          m_front_left -= mix_offset;
+          m_front_right -= mix_offset;
+          m_rear_right -= mix_offset;
+          m_rear_left -= mix_offset;
+        }
+
+        mix_min = m_front_left;
+        if (m_front_right < mix_min)
+        {
+          mix_min = m_front_right;
+        }
+        if (m_rear_right < mix_min)
+        {
+          mix_min = m_rear_right;
+        }
+        if (m_rear_left < mix_min)
+        {
+          mix_min = m_rear_left;
+        }
+
+        if (mix_min < (int32_t)APP_PWM_MIN_US)
+        {
+          mix_offset = (int32_t)APP_PWM_MIN_US - mix_min;
+          m_front_left += mix_offset;
+          m_front_right += mix_offset;
+          m_rear_right += mix_offset;
+          m_rear_left += mix_offset;
+        }
+
         s1_us = App_ClampPulseUs(m_front_left);
         s2_us = App_ClampPulseUs(m_front_right);
         s3_us = App_ClampPulseUs(m_rear_right);
         s4_us = App_ClampPulseUs(m_rear_left);
 
-        Motors_WriteUs(s3_us, s2_us, s4_us, s1_us);
+        /* Physical channels map as: CH1=LA, CH2=LF, CH3=RA, CH4=RF. */
+        Motors_WriteUs(s4_us, s1_us, s3_us, s2_us);
       }
     }
   }
 
-  if ((now_ms - last_receiver_telemetry_ms) >= 500U)
+  if ((now_ms - last_receiver_telemetry_ms) >= 1000U)
   {
+#if APP_ENABLE_RECEIVER_RUNTIME_TELEMETRY
     Telemetry_PrintReceiverState(&receiver_state);
+#endif
+    last_receiver_telemetry_ms = now_ms;
+  }
+
+  if ((now_ms - last_rx16_telemetry_ms) >= APP_RX16_TELEMETRY_MS)
+  {
+    Telemetry_PrintReceiverState16(&receiver_state);
+    last_rx16_telemetry_ms = now_ms;
+  }
+
 #if APP_ENABLE_ARM_RUNTIME_TELEMETRY
+  if ((now_ms - last_arm_telemetry_ms) >= APP_ARM_TELEMETRY_MS)
+  {
     Telemetry_PrintArmState(motors_armed,
                             arm_switch_high,
                             throttle_low,
@@ -1014,8 +1463,25 @@ void App_Update(void)
                             s2_us,
                             s3_us,
                             s4_us);
+    last_arm_telemetry_ms = now_ms;
+  }
 #endif
-    last_receiver_telemetry_ms = now_ms;
+
+  if ((now_ms - last_battery_sample_ms) >= APP_BATTERY_SAMPLE_MS)
+  {
+    if (App_ReadBatteryVoltage(&battery_voltage_v, &battery_adc_raw) != 0U)
+    {
+      if (battery_voltage_valid == 0U)
+      {
+        battery_voltage_filtered_v = battery_voltage_v;
+        battery_voltage_valid = 1U;
+      }
+      else
+      {
+        battery_voltage_filtered_v += APP_BATTERY_FILTER_ALPHA * (battery_voltage_v - battery_voltage_filtered_v);
+      }
+    }
+    last_battery_sample_ms = now_ms;
   }
 
   if ((IMU_GetType() == IMU_TYPE_UNKNOWN) && ((detect_retry_counter++ % 10U) == 0U))
@@ -1034,6 +1500,9 @@ void App_Update(void)
     gx_dps = ((float)imu_raw.gyro_x) / IMU_GYRO_LSB_PER_DPS;
     gy_dps = ((float)imu_raw.gyro_y) / IMU_GYRO_LSB_PER_DPS;
     gz_dps = ((float)APP_GYRO_YAW_SIGN) * (((float)imu_raw.gyro_z) / IMU_GYRO_LSB_PER_DPS);
+    (void)App_UpdateYawGyroBias(ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps, motors_armed, throttle_us);
+    gz_dps -= g_yaw_gyro_bias_dps;
+
     measured_roll_rate_dps = gx_dps;
     measured_pitch_rate_dps = gy_dps;
     measured_yaw_rate_dps = gz_dps;
@@ -1067,6 +1536,10 @@ void App_Update(void)
                               pitch_deg,
                               roll_deg,
                               yaw_deg);
+      if (battery_voltage_valid != 0U)
+      {
+        Telemetry_PrintBatteryState(battery_voltage_filtered_v, battery_adc_raw);
+      }
       last_imu_telemetry_ms = now_ms;
     }
 #endif

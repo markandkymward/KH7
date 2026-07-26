@@ -2,7 +2,7 @@
 setlocal
 
 set "SCRIPT_DIR=%~dp0"
-set "VIEWER_SCRIPT=%SCRIPT_DIR%tools\imu_board_viewer.py"
+set "VIEWER_SCRIPT=%SCRIPT_DIR%tools\motor_test_gui.py"
 set "PYTHON_EXE=C:\Users\marka\AppData\Local\Python\pythoncore-3.14-64\python.exe"
 
 if exist "%PYTHON_EXE%" (

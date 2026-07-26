@@ -23,7 +23,7 @@
 				"-f",
 				"target/stm32h7x.cfg",
 				"-c",
-				"program ${workspaceFolder}/build/Debug/KH7.elf verify reset exit"
+				"program C:/Projects/KH7/build/Debug/KH7.elf verify reset exit"
 			],
 			"isBackground": false,
 			"group": "build"
