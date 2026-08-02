@@ -196,17 +196,32 @@ void Telemetry_PrintRatePid(const App_RatePidGains_t *gains, const char *source)
     source = "-";
   }
 
-  printf("PID[src=%s]=[R %.4f %.4f %.4f P %.4f %.4f %.4f Y %.4f %.4f %.4f]\r\n",
+  printf("PID[src=%s]=[R %.4f %.4f %.4f %.4f P %.4f %.4f %.4f %.4f Y %.4f %.4f %.4f %.4f]\r\n",
          source,
          (double)gains->roll.kp,
          (double)gains->roll.ki,
          (double)gains->roll.kd,
+         (double)gains->roll.kff,
          (double)gains->pitch.kp,
          (double)gains->pitch.ki,
          (double)gains->pitch.kd,
+         (double)gains->pitch.kff,
          (double)gains->yaw.kp,
          (double)gains->yaw.ki,
-         (double)gains->yaw.kd);
+         (double)gains->yaw.kd,
+         (double)gains->yaw.kff);
+}
+
+void Telemetry_PrintFlightMode(const char *mode_name, uint16_t mode_us)
+{
+  if ((mode_name == NULL) || (mode_name[0] == '\0'))
+  {
+    mode_name = "-";
+  }
+
+  printf("MODE[name=%s ch6=%u]\r\n",
+         mode_name,
+         (unsigned int)mode_us);
 }
 
 void Telemetry_PrintAngles(float pitch_deg, float roll_deg, float yaw_deg)

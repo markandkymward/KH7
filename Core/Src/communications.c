@@ -117,6 +117,8 @@ static uint8_t Communications_IsUart6AutoExecutableCommand(const char *line, siz
   normalized[out_len] = '\0';
 
   if ((strcmp(normalized, "PID GET") == 0) ||
+      (strcmp(normalized, "ATT GET") == 0) ||
+      (strcmp(normalized, "ATT DEFAULT") == 0) ||
       (strcmp(normalized, "PID DEFAULT") == 0) ||
       (strcmp(normalized, "PID SAVE") == 0) ||
       (strcmp(normalized, "PID LOAD") == 0) ||
@@ -421,16 +423,19 @@ void Communications_ServiceUart6Commands(void)
     App_GetRatePidGains(&gains);
     pid_line_len = snprintf(pid_line,
                             sizeof(pid_line),
-                            "PID[src=get]=[R %.4f %.4f %.4f P %.4f %.4f %.4f Y %.4f %.4f %.4f]\r\n",
+                            "PID[src=get]=[R %.4f %.4f %.4f %.4f P %.4f %.4f %.4f %.4f Y %.4f %.4f %.4f %.4f]\r\n",
                             (double)gains.roll.kp,
                             (double)gains.roll.ki,
                             (double)gains.roll.kd,
+                            (double)gains.roll.kff,
                             (double)gains.pitch.kp,
                             (double)gains.pitch.ki,
                             (double)gains.pitch.kd,
+                            (double)gains.pitch.kff,
                             (double)gains.yaw.kp,
                             (double)gains.yaw.ki,
-                            (double)gains.yaw.kd);
+                            (double)gains.yaw.kd,
+                            (double)gains.yaw.kff);
     if (pid_line_len > 0)
     {
       uint16_t tx_len = (uint16_t)((pid_line_len < (int)sizeof(pid_line)) ? pid_line_len : (int)sizeof(pid_line));

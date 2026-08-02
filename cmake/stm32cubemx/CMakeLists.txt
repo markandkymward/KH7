@@ -36,6 +36,7 @@ set(MX_Application_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/imu.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/motors.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/receiver.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/sdcard.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32h7xx_it.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32h7xx_hal_msp.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/sysmem.c

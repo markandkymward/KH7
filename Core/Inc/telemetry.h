@@ -36,6 +36,7 @@ void Telemetry_PrintArmState(uint8_t armed,
 							 uint16_t s3_us,
 							 uint16_t s4_us);
 void Telemetry_PrintRatePid(const App_RatePidGains_t *gains, const char *source);
+void Telemetry_PrintFlightMode(const char *mode_name, uint16_t mode_us);
 void Telemetry_PrintAngles(float pitch_deg, float roll_deg, float yaw_deg);
 void Telemetry_PrintBatteryState(float battery_voltage_v, uint32_t adc_raw);
 

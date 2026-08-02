@@ -23,8 +23,12 @@ IMU_LINE_RE = re.compile(
     r"IMU\[x100/x10\]=\[\s*(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s*\]"
 )
 VBAT_LINE_RE = re.compile(r"VBAT\[mV raw\]=\[\s*(\d+)\s+(\d+)\s*\]")
+MODE_LINE_RE = re.compile(r"MODE\[name=([^\s\]]+) ch6=(\d+)\]")
+ATT_LINE_RE = re.compile(r"ATT\[src=([^\]]+)\]=\[ROLL_KP\s+([-+]?\d*\.?\d+)\s+PITCH_KP\s+([-+]?\d*\.?\d+)\s+MAX_ANG\s+([-+]?\d*\.?\d+)\]")
 PID_LINE_RE = re.compile(
-    r"PID\[src=([^\]]+)\]=\[R\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+P\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+Y\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\]"
+    r"PID\[src=([^\]]+)\]=\[R\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+"
+    r"P\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+"
+    r"Y\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\]"
 )
 PID_STATUS_RE = re.compile(r"PID_(SET|SAVE|LOAD)\[([^\]]+)\]")
 PID_DEBUG_RE = re.compile(r"PID_DEBUG\[q=(\d+) h=(\d+) p=(\d+)\]")
@@ -42,6 +46,9 @@ PID_LIMITS = {
     "roll_kd": (0.0, 0.2),
     "pitch_kd": (0.0, 0.2),
     "yaw_kd": (0.0, 0.2),
+    "roll_kff": (0.0, 0.5),
+    "pitch_kff": (0.0, 0.5),
+    "yaw_kff": (0.0, 0.5),
 }
 
 GUI_STATE_PATH = Path.home() / ".kh7_ground_gui_state.json"
@@ -88,7 +95,9 @@ class Kh7GroundGui:
         self.bridge_status_var = tk.StringVar(value="Bridge status: -")
         self.bridge_status_lines = []
         self.battery_var = tk.StringVar(value="Battery: -")
+        self.mode_var = tk.StringVar(value="Mode: -")
         self.pid_status_var = tk.StringVar(value="PID: idle")
+        self.att_status_var = tk.StringVar(value="ATT: idle")
         self.pid_debug_var = tk.StringVar(value="PID debug: -")
         self.pid_flash_var = tk.StringVar(value="PID flash: -")
         self.pid_health_var = tk.StringVar(value="PID link: waiting for checks")
@@ -118,13 +127,22 @@ class Kh7GroundGui:
             "roll_kp": tk.StringVar(value="0.9000"),
             "roll_ki": tk.StringVar(value="0.0000"),
             "roll_kd": tk.StringVar(value="0.0000"),
+            "roll_kff": tk.StringVar(value="0.0000"),
             "pitch_kp": tk.StringVar(value="0.9000"),
             "pitch_ki": tk.StringVar(value="0.0000"),
             "pitch_kd": tk.StringVar(value="0.0000"),
+            "pitch_kff": tk.StringVar(value="0.0000"),
             "yaw_kp": tk.StringVar(value="0.8000"),
             "yaw_ki": tk.StringVar(value="0.0000"),
             "yaw_kd": tk.StringVar(value="0.0000"),
+            "yaw_kff": tk.StringVar(value="0.0000"),
         }
+        self.att_vars = {
+            "roll_kp": tk.StringVar(value="5.0000"),
+            "pitch_kp": tk.StringVar(value="5.0000"),
+            "max_angle": tk.StringVar(value="35.0"),
+        }
+        self.current_tuning_mode = "RATE"
 
         self.motor_var = tk.IntVar(value=1)
         self.pulse_var = tk.IntVar(value=1100)
@@ -134,11 +152,14 @@ class Kh7GroundGui:
         self.pid_received_once = False
         self.pid_sync_retries_left = 0
         self.pid_sync_after_id = None
+        self.att_verify_target = None
+        self.att_verify_timeout_after_id = None
         self.toggle_motor_test_button = None
         self.toggle_pid_button = None
         self.right_panel = None
         self.motor_test_box = None
         self.pid_box = None
+        self.att_pid_box = None
         self.log_text = None
         self.log_line_count = 0
         self.log_max_lines = 800
@@ -269,6 +290,13 @@ class Kh7GroundGui:
             anchor="e",
             justify=tk.RIGHT,
         ).grid(row=0, column=6, rowspan=3, sticky="e", padx=(12, 14), pady=(4, 6))
+        ttk.Label(
+            telemetry,
+            textvariable=self.mode_var,
+            font=("Segoe UI", 16, "bold"),
+            anchor="e",
+            justify=tk.RIGHT,
+        ).grid(row=3, column=6, sticky="e", padx=(12, 14), pady=(0, 8))
 
         mid = ttk.Frame(body)
         mid.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
@@ -276,7 +304,7 @@ class Kh7GroundGui:
         map_box = ttk.LabelFrame(mid, text="Logical Motor Map and Commanded Output")
         map_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
 
-        self.motor_canvas = tk.Canvas(map_box, width=320, height=320, bg="#101214", highlightthickness=0)
+        self.motor_canvas = tk.Canvas(map_box, width=320, height=213, bg="#101214", highlightthickness=0)
         self.motor_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         self.motor_canvas.bind("<Configure>", self._on_motor_canvas_resize)
         self._init_motor_map()
@@ -284,7 +312,7 @@ class Kh7GroundGui:
         pose_box = ttk.LabelFrame(mid, text="Air Vehicle Pose")
         pose_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
 
-        self.pose_canvas = tk.Canvas(pose_box, width=320, height=320, bg="#0b1015", highlightthickness=0)
+        self.pose_canvas = tk.Canvas(pose_box, width=320, height=213, bg="#0b1015", highlightthickness=0)
         self.pose_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         self.pose_canvas.bind("<Configure>", self._on_pose_canvas_resize)
         self._draw_pose_canvas(0.0, 0.0, 0.0)
@@ -292,7 +320,7 @@ class Kh7GroundGui:
         rc_box = ttk.LabelFrame(mid, text="RC Channel Status")
         rc_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
 
-        self.rc_canvas = tk.Canvas(rc_box, width=320, height=320, bg="#0b1015", highlightthickness=0)
+        self.rc_canvas = tk.Canvas(rc_box, width=320, height=213, bg="#0b1015", highlightthickness=0)
         self.rc_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         self.rc_canvas.bind("<Configure>", self._on_rc_canvas_resize)
         self._draw_rc_canvas()
@@ -340,13 +368,14 @@ class Kh7GroundGui:
         ttk.Label(self.pid_box, text="Kp").grid(row=0, column=1, sticky="w", padx=4, pady=(6, 4))
         ttk.Label(self.pid_box, text="Ki").grid(row=0, column=2, sticky="w", padx=4, pady=(6, 4))
         ttk.Label(self.pid_box, text="Kd").grid(row=0, column=3, sticky="w", padx=4, pady=(6, 4))
+        ttk.Label(self.pid_box, text="Kff").grid(row=0, column=4, sticky="w", padx=4, pady=(6, 4))
 
         self._add_pid_row(self.pid_box, 1, "Roll", "roll")
         self._add_pid_row(self.pid_box, 2, "Pitch", "pitch")
         self._add_pid_row(self.pid_box, 3, "Yaw", "yaw")
 
         pid_btns = ttk.Frame(self.pid_box)
-        pid_btns.grid(row=4, column=0, columnspan=4, sticky="ew", padx=6, pady=(6, 6))
+        pid_btns.grid(row=4, column=0, columnspan=5, sticky="ew", padx=6, pady=(6, 6))
 
         ttk.Button(pid_btns, text="Read", command=self.pid_read).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(pid_btns, text="Apply", command=self.pid_apply).pack(side=tk.LEFT, padx=4)
@@ -355,14 +384,21 @@ class Kh7GroundGui:
         ttk.Button(pid_btns, text="Defaults", command=self.pid_defaults).pack(side=tk.LEFT, padx=4)
         ttk.Button(pid_btns, text="Debug", command=self.pid_debug).pack(side=tk.LEFT, padx=4)
 
+        ttk.Label(
+            self.pid_box,
+            text="Max allowed: Kp <= 4.0, Ki <= 2.0, Kd <= 0.2, Kff <= 0.5",
+            foreground="#9aa6b2",
+            justify=tk.LEFT,
+        ).grid(row=5, column=0, columnspan=5, sticky="w", padx=6, pady=(0, 6))
+
         ttk.Label(self.pid_box, textvariable=self.pid_status_var).grid(
-            row=5, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 6)
+            row=6, column=0, columnspan=5, sticky="w", padx=6, pady=(0, 6)
         )
         ttk.Label(self.pid_box, textvariable=self.pid_debug_var, justify=tk.LEFT).grid(
-            row=6, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 2)
+            row=7, column=0, columnspan=5, sticky="w", padx=6, pady=(0, 2)
         )
         ttk.Label(self.pid_box, textvariable=self.pid_flash_var, justify=tk.LEFT).grid(
-            row=7, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 6)
+            row=8, column=0, columnspan=5, sticky="w", padx=6, pady=(0, 6)
         )
         self.pid_health_label = tk.Label(
             self.pid_box,
@@ -372,7 +408,32 @@ class Kh7GroundGui:
             justify=tk.LEFT,
             font=("Segoe UI", 9, "bold"),
         )
-        self.pid_health_label.grid(row=8, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 8))
+        self.pid_health_label.grid(row=9, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 8))
+
+        self.att_pid_box = ttk.LabelFrame(self.right_panel, text="Attitude Tuning")
+        ttk.Label(self.att_pid_box, text="Roll Kp").grid(row=0, column=0, sticky="w", padx=(6, 4), pady=(8, 4))
+        ttk.Entry(self.att_pid_box, width=8, textvariable=self.att_vars["roll_kp"]).grid(row=0, column=1, sticky="w", padx=(0, 8), pady=(8, 4))
+        ttk.Label(self.att_pid_box, text="Pitch Kp").grid(row=1, column=0, sticky="w", padx=(6, 4), pady=4)
+        ttk.Entry(self.att_pid_box, width=8, textvariable=self.att_vars["pitch_kp"]).grid(row=1, column=1, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(self.att_pid_box, text="Max Angle").grid(row=2, column=0, sticky="w", padx=(6, 4), pady=4)
+        ttk.Entry(self.att_pid_box, width=8, textvariable=self.att_vars["max_angle"]).grid(row=2, column=1, sticky="w", padx=(0, 8), pady=4)
+
+        att_btns = ttk.Frame(self.att_pid_box)
+        att_btns.grid(row=3, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 6))
+        ttk.Button(att_btns, text="Read", command=self.att_read).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(att_btns, text="Apply", command=self.att_apply).pack(side=tk.LEFT, padx=4)
+        ttk.Button(att_btns, text="Defaults", command=self.att_defaults).pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(
+            self.att_pid_box,
+            text="Max allowed: Roll/Pitch Kp <= 25.0, Max Angle <= 70 deg",
+            foreground="#9aa6b2",
+            justify=tk.LEFT,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6))
+
+        ttk.Label(self.att_pid_box, textvariable=self.att_status_var).grid(
+            row=5, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 8)
+        )
 
         self._apply_right_panel_visibility()
 
@@ -463,19 +524,24 @@ class Kh7GroundGui:
         ttk.Entry(parent, width=7, textvariable=self.pid_vars[f"{prefix}_kp"]).grid(row=row, column=1, sticky="w", padx=4, pady=2)
         ttk.Entry(parent, width=7, textvariable=self.pid_vars[f"{prefix}_ki"]).grid(row=row, column=2, sticky="w", padx=4, pady=2)
         ttk.Entry(parent, width=7, textvariable=self.pid_vars[f"{prefix}_kd"]).grid(row=row, column=3, sticky="w", padx=4, pady=2)
+        ttk.Entry(parent, width=7, textvariable=self.pid_vars[f"{prefix}_kff"]).grid(row=row, column=4, sticky="w", padx=4, pady=2)
 
     def _apply_right_panel_visibility(self) -> None:
-        if self.motor_test_box is None or self.pid_box is None:
+        if self.motor_test_box is None or self.pid_box is None or self.att_pid_box is None:
             return
 
         self.motor_test_box.pack_forget()
         self.pid_box.pack_forget()
+        self.att_pid_box.pack_forget()
 
         if self.motor_test_visible:
             self.motor_test_box.pack(side=tk.TOP, fill=tk.X, pady=(0, 8))
 
         if self.pid_panel_visible:
-            self.pid_box.pack(side=tk.TOP, fill=tk.X)
+            if self.current_tuning_mode == "ATTITUDE":
+                self.att_pid_box.pack(side=tk.TOP, fill=tk.X)
+            else:
+                self.pid_box.pack(side=tk.TOP, fill=tk.X)
 
     def toggle_motor_test_panel(self) -> None:
         if self.motor_test_box is None:
@@ -1201,6 +1267,7 @@ class Kh7GroundGui:
 
         if connected:
             self.start_pid_sync()
+            self.att_read()
 
         return connected
 
@@ -1241,6 +1308,22 @@ class Kh7GroundGui:
         self.pid_sync_retries_left -= 1
         self.pid_sync_after_id = self.root.after(350, self._pid_sync_tick)
 
+    def _cancel_att_verify(self) -> None:
+        self.att_verify_target = None
+        if self.att_verify_timeout_after_id is not None:
+            try:
+                self.root.after_cancel(self.att_verify_timeout_after_id)
+            except Exception:
+                pass
+            self.att_verify_timeout_after_id = None
+
+    def _att_verify_timeout(self) -> None:
+        self.att_verify_timeout_after_id = None
+        if self.att_verify_target is None:
+            return
+        self.att_verify_target = None
+        self.att_status_var.set("ATT verify timeout: no readback from FC")
+
     def disconnect(self) -> None:
         if self.serial_port is not None:
             try:
@@ -1259,6 +1342,7 @@ class Kh7GroundGui:
         self.tcp_rx_buffer = bytearray()
         self.pid_received_once = False
         self.pid_sync_retries_left = 0
+        self._cancel_att_verify()
         if self.pid_sync_after_id is not None:
             try:
                 self.root.after_cancel(self.pid_sync_after_id)
@@ -1336,12 +1420,15 @@ class Kh7GroundGui:
             self.pid_vars["roll_kp"].set(f"{float(m_pid.group(2)):.4f}")
             self.pid_vars["roll_ki"].set(f"{float(m_pid.group(3)):.4f}")
             self.pid_vars["roll_kd"].set(f"{float(m_pid.group(4)):.4f}")
-            self.pid_vars["pitch_kp"].set(f"{float(m_pid.group(5)):.4f}")
-            self.pid_vars["pitch_ki"].set(f"{float(m_pid.group(6)):.4f}")
-            self.pid_vars["pitch_kd"].set(f"{float(m_pid.group(7)):.4f}")
-            self.pid_vars["yaw_kp"].set(f"{float(m_pid.group(8)):.4f}")
-            self.pid_vars["yaw_ki"].set(f"{float(m_pid.group(9)):.4f}")
-            self.pid_vars["yaw_kd"].set(f"{float(m_pid.group(10)):.4f}")
+            self.pid_vars["roll_kff"].set(f"{float(m_pid.group(5)):.4f}")
+            self.pid_vars["pitch_kp"].set(f"{float(m_pid.group(6)):.4f}")
+            self.pid_vars["pitch_ki"].set(f"{float(m_pid.group(7)):.4f}")
+            self.pid_vars["pitch_kd"].set(f"{float(m_pid.group(8)):.4f}")
+            self.pid_vars["pitch_kff"].set(f"{float(m_pid.group(9)):.4f}")
+            self.pid_vars["yaw_kp"].set(f"{float(m_pid.group(10)):.4f}")
+            self.pid_vars["yaw_ki"].set(f"{float(m_pid.group(11)):.4f}")
+            self.pid_vars["yaw_kd"].set(f"{float(m_pid.group(12)):.4f}")
+            self.pid_vars["yaw_kff"].set(f"{float(m_pid.group(13)):.4f}")
             self.pid_status_var.set(f"PID source: {m_pid.group(1)}")
             self._update_pid_health()
             return
@@ -1349,6 +1436,47 @@ class Kh7GroundGui:
         m_pid_status = PID_STATUS_RE.search(line)
         if m_pid_status is not None:
             self.pid_status_var.set(f"{m_pid_status.group(1)}: {m_pid_status.group(2)}")
+            return
+
+        m_mode = MODE_LINE_RE.search(line)
+        if m_mode is not None:
+            mode_name = m_mode.group(1)
+            mode_ch6 = int(m_mode.group(2))
+            self.mode_var.set(f"Mode: {mode_name} (ch6 {mode_ch6})")
+            if mode_name in ("RATE", "ATTITUDE") and mode_name != self.current_tuning_mode:
+                self.current_tuning_mode = mode_name
+                self._apply_right_panel_visibility()
+                if mode_name == "ATTITUDE":
+                    self.att_read()
+                else:
+                    self.pid_read()
+            self.event_var.set(line)
+            return
+
+        m_att = ATT_LINE_RE.search(line)
+        if m_att is not None:
+            roll_kp = float(m_att.group(2))
+            pitch_kp = float(m_att.group(3))
+            max_angle = float(m_att.group(4))
+
+            self.att_vars["roll_kp"].set(f"{roll_kp:.4f}")
+            self.att_vars["pitch_kp"].set(f"{pitch_kp:.4f}")
+            self.att_vars["max_angle"].set(f"{max_angle:.2f}")
+
+            if self.att_verify_target is not None:
+                exp_roll_kp, exp_pitch_kp, exp_max_angle = self.att_verify_target
+                roll_ok = abs(roll_kp - exp_roll_kp) <= 0.0005
+                pitch_ok = abs(pitch_kp - exp_pitch_kp) <= 0.0005
+                angle_ok = abs(max_angle - exp_max_angle) <= 0.05
+                if roll_ok and pitch_ok and angle_ok:
+                    self.att_status_var.set(f"ATT saved on FC (verified, src={m_att.group(1)})")
+                else:
+                    self.att_status_var.set(
+                        "ATT verify mismatch: FC values differ from requested"
+                    )
+                self._cancel_att_verify()
+            else:
+                self.att_status_var.set(f"ATT source: {m_att.group(1)}")
             return
 
         m_arm = ARM_LINE_RE.search(line)
@@ -1600,12 +1728,15 @@ class Kh7GroundGui:
                 "roll_kp": float(self.pid_vars["roll_kp"].get()),
                 "roll_ki": float(self.pid_vars["roll_ki"].get()),
                 "roll_kd": float(self.pid_vars["roll_kd"].get()),
+                "roll_kff": float(self.pid_vars["roll_kff"].get()),
                 "pitch_kp": float(self.pid_vars["pitch_kp"].get()),
                 "pitch_ki": float(self.pid_vars["pitch_ki"].get()),
                 "pitch_kd": float(self.pid_vars["pitch_kd"].get()),
+                "pitch_kff": float(self.pid_vars["pitch_kff"].get()),
                 "yaw_kp": float(self.pid_vars["yaw_kp"].get()),
                 "yaw_ki": float(self.pid_vars["yaw_ki"].get()),
                 "yaw_kd": float(self.pid_vars["yaw_kd"].get()),
+                "yaw_kff": float(self.pid_vars["yaw_kff"].get()),
             }
         except ValueError:
             messagebox.showerror("Invalid PID", "All PID fields must be numeric values.")
@@ -1624,16 +1755,22 @@ class Kh7GroundGui:
             values["roll_kp"],
             values["roll_ki"],
             values["roll_kd"],
+            values["roll_kff"],
             values["pitch_kp"],
             values["pitch_ki"],
             values["pitch_kd"],
+            values["pitch_kff"],
             values["yaw_kp"],
             values["yaw_ki"],
             values["yaw_kd"],
+            values["yaw_kff"],
         ]
 
     def pid_read(self) -> None:
         self.send_command("PID GET")
+
+    def att_read(self) -> None:
+        self.send_command("ATT GET")
 
     def pid_apply(self) -> None:
         values = self._pid_values_from_ui()
@@ -1657,6 +1794,32 @@ class Kh7GroundGui:
 
     def pid_defaults(self) -> None:
         self.send_command("PID DEFAULT")
+
+    def att_defaults(self) -> None:
+        self.send_command("ATT DEFAULT")
+
+    def att_apply(self) -> None:
+        try:
+            roll_kp = float(self.att_vars["roll_kp"].get())
+            pitch_kp = float(self.att_vars["pitch_kp"].get())
+            max_angle = float(self.att_vars["max_angle"].get())
+        except ValueError:
+            messagebox.showerror("Invalid Attitude", "Attitude fields must be numeric values.")
+            return
+
+        if not (0.2 <= roll_kp <= 25.0 and 0.2 <= pitch_kp <= 25.0 and 5.0 <= max_angle <= 70.0):
+            messagebox.showerror(
+                "Attitude Out of Range",
+                "Roll/Pitch Kp must be 0.2..25.0 and Max Angle must be 5..70 deg.",
+            )
+            return
+
+        self._cancel_att_verify()
+        self.att_verify_target = (roll_kp, pitch_kp, max_angle)
+        self.att_status_var.set("ATT apply sent, verifying on FC...")
+        self.send_command(f"ATT SET {roll_kp:.4f} {pitch_kp:.4f} {max_angle:.2f}")
+        self.send_command("ATT GET")
+        self.att_verify_timeout_after_id = self.root.after(1200, self._att_verify_timeout)
 
     def pid_debug(self) -> None:
         self.send_command("PID DEBUG")

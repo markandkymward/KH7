@@ -399,6 +399,7 @@ void CDC_ProcessCommandLine(const char *line)
   uint32_t motor_index;
   uint32_t pulse_us;
   App_RatePidGains_t gains;
+  App_AttitudeGains_t att_gains;
 
   if ((line == NULL) || (line[0] == '\0'))
   {
@@ -429,6 +430,23 @@ void CDC_ProcessCommandLine(const char *line)
     return;
   }
 
+  if (strcmp(line, "ATT GET") == 0)
+  {
+    App_GetAttitudeGains(&att_gains);
+    printf("ATT[src=get]=[ROLL_KP %.4f PITCH_KP %.4f MAX_ANG %.2f]\r\n",
+           (double)att_gains.roll_kp,
+           (double)att_gains.pitch_kp,
+           (double)att_gains.max_angle_deg);
+    return;
+  }
+
+  if (strcmp(line, "ATT DEFAULT") == 0)
+  {
+    App_RequestAttitudeDefaults();
+    printf("ATT_DEFAULT[QUEUED]\r\n");
+    return;
+  }
+
   if (strcmp(line, "PID DEFAULT") == 0)
   {
     App_RequestRatePidDefaults();
@@ -456,6 +474,42 @@ void CDC_ProcessCommandLine(const char *line)
     return;
   }
 
+  if (strcmp(line, "GLOG DUMP") == 0)
+  {
+    App_RequestGyroLogDump();
+    printf("GLOG_DUMP[QUEUED]\r\n");
+    return;
+  }
+
+  if (strcmp(line, "SD INIT") == 0)
+  {
+    App_RequestSdInit();
+    printf("SD_INIT[QUEUED]\r\n");
+    return;
+  }
+
+  if (strcmp(line, "SD STATUS") == 0)
+  {
+    App_RequestSdStatus();
+    return;
+  }
+
+  prefix = "SD RBLOCK ";
+  if (strncmp(line, prefix, strlen(prefix)) == 0)
+  {
+    uint32_t block = (uint32_t)strtoul(line + strlen(prefix), NULL, 10);
+    App_RequestSdReadBlock(block);
+    return;
+  }
+
+  prefix = "SD WBLOCK ";
+  if (strncmp(line, prefix, strlen(prefix)) == 0)
+  {
+    uint32_t block = (uint32_t)strtoul(line + strlen(prefix), NULL, 10);
+    App_RequestSdWriteBlock(block);
+    return;
+  }
+
   prefix = "PID SET ";
   if (strncmp(line, prefix, strlen(prefix)) == 0)
   {
@@ -464,7 +518,7 @@ void CDC_ProcessCommandLine(const char *line)
     gains.roll.kp = strtof(cursor, &token_end);
     if ((token_end == cursor) || (*token_end != ' '))
     {
-      printf("PID_SET[FAIL]\r\n");
+      printf("PID_SET[FAIL field=roll.kp]\r\n");
       return;
     }
     cursor = token_end + 1;
@@ -472,7 +526,7 @@ void CDC_ProcessCommandLine(const char *line)
     gains.roll.ki = strtof(cursor, &token_end);
     if ((token_end == cursor) || (*token_end != ' '))
     {
-      printf("PID_SET[FAIL]\r\n");
+      printf("PID_SET[FAIL field=roll.ki]\r\n");
       return;
     }
     cursor = token_end + 1;
@@ -480,7 +534,15 @@ void CDC_ProcessCommandLine(const char *line)
     gains.roll.kd = strtof(cursor, &token_end);
     if ((token_end == cursor) || (*token_end != ' '))
     {
-      printf("PID_SET[FAIL]\r\n");
+      printf("PID_SET[FAIL field=roll.kd]\r\n");
+      return;
+    }
+    cursor = token_end + 1;
+
+    gains.roll.kff = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != ' '))
+    {
+      printf("PID_SET[FAIL field=roll.kff]\r\n");
       return;
     }
     cursor = token_end + 1;
@@ -488,7 +550,7 @@ void CDC_ProcessCommandLine(const char *line)
     gains.pitch.kp = strtof(cursor, &token_end);
     if ((token_end == cursor) || (*token_end != ' '))
     {
-      printf("PID_SET[FAIL]\r\n");
+      printf("PID_SET[FAIL field=pitch.kp]\r\n");
       return;
     }
     cursor = token_end + 1;
@@ -496,7 +558,7 @@ void CDC_ProcessCommandLine(const char *line)
     gains.pitch.ki = strtof(cursor, &token_end);
     if ((token_end == cursor) || (*token_end != ' '))
     {
-      printf("PID_SET[FAIL]\r\n");
+      printf("PID_SET[FAIL field=pitch.ki]\r\n");
       return;
     }
     cursor = token_end + 1;
@@ -504,7 +566,15 @@ void CDC_ProcessCommandLine(const char *line)
     gains.pitch.kd = strtof(cursor, &token_end);
     if ((token_end == cursor) || (*token_end != ' '))
     {
-      printf("PID_SET[FAIL]\r\n");
+      printf("PID_SET[FAIL field=pitch.kd]\r\n");
+      return;
+    }
+    cursor = token_end + 1;
+
+    gains.pitch.kff = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != ' '))
+    {
+      printf("PID_SET[FAIL field=pitch.kff]\r\n");
       return;
     }
     cursor = token_end + 1;
@@ -512,7 +582,7 @@ void CDC_ProcessCommandLine(const char *line)
     gains.yaw.kp = strtof(cursor, &token_end);
     if ((token_end == cursor) || (*token_end != ' '))
     {
-      printf("PID_SET[FAIL]\r\n");
+      printf("PID_SET[FAIL field=yaw.kp]\r\n");
       return;
     }
     cursor = token_end + 1;
@@ -520,24 +590,70 @@ void CDC_ProcessCommandLine(const char *line)
     gains.yaw.ki = strtof(cursor, &token_end);
     if ((token_end == cursor) || (*token_end != ' '))
     {
-      printf("PID_SET[FAIL]\r\n");
+      printf("PID_SET[FAIL field=yaw.ki]\r\n");
       return;
     }
     cursor = token_end + 1;
 
     gains.yaw.kd = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != ' '))
+    {
+      printf("PID_SET[FAIL field=yaw.kd]\r\n");
+      return;
+    }
+    cursor = token_end + 1;
+
+    gains.yaw.kff = strtof(cursor, &token_end);
     if ((token_end == cursor) || (*token_end != '\0'))
     {
-      printf("PID_SET[FAIL]\r\n");
+      printf("PID_SET[FAIL field=yaw.kff trailing=%d]\r\n", (int)(*token_end));
       return;
     }
 
     if (App_RequestRatePidSetAndSave(&gains) == 0U)
     {
-      printf("PID_SET[FAIL]\r\n");
+      printf("PID_SET[FAIL range]\r\n");
       return;
     }
     printf("PID_SET[QUEUED]\r\n");
+    return;
+  }
+
+  prefix = "ATT SET ";
+  if (strncmp(line, prefix, strlen(prefix)) == 0)
+  {
+    cursor = (char *)(line + strlen(prefix));
+
+    att_gains.roll_kp = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != ' '))
+    {
+      printf("ATT_SET[FAIL]\r\n");
+      return;
+    }
+    cursor = token_end + 1;
+
+    att_gains.pitch_kp = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != ' '))
+    {
+      printf("ATT_SET[FAIL]\r\n");
+      return;
+    }
+    cursor = token_end + 1;
+
+    att_gains.max_angle_deg = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != '\0'))
+    {
+      printf("ATT_SET[FAIL]\r\n");
+      return;
+    }
+
+    if (App_RequestAttitudeSetAndSave(&att_gains) == 0U)
+    {
+      printf("ATT_SET[FAIL]\r\n");
+      return;
+    }
+
+    printf("ATT_SET[QUEUED]\r\n");
     return;
   }
 
