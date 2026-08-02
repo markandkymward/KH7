@@ -1,5 +1,6 @@
 #include "app.h"
 
+#include <math.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -16,8 +17,8 @@
 #define APP_MOTOR_TEST_MODE 0U
 #define APP_CONTROL_LOOP_MS 2U
 #define RAD_PER_DEG       0.0174532925f
-#define APP_ENABLE_IMU_RUNTIME_TELEMETRY 1U
-#define APP_ENABLE_ARM_RUNTIME_TELEMETRY 1U
+#define APP_ENABLE_IMU_RUNTIME_TELEMETRY 0U
+#define APP_ENABLE_ARM_RUNTIME_TELEMETRY 0U
 #define APP_ENABLE_RECEIVER_RUNTIME_TELEMETRY 0U
 #define APP_ENABLE_ANGLE_TELEMETRY 0U
 #define APP_CH_ROLL_INDEX      0U
@@ -44,15 +45,16 @@
 #define APP_PITCH_SIGN         (-1)
 #define APP_YAW_SIGN           (1)
 #define APP_GYRO_YAW_SIGN      (-1)
-/* Single-pole EMA alpha for a ~70Hz gyro feedback filter (motor/prop vibration) at
- * APP_CONTROL_LOOP_MS sample time. Feeds the rate loop's P-error/D-source only -
- * AHRS and GLOG capture still see the raw, unfiltered gyro. */
-#define APP_GYRO_RATE_LPF_ALPHA 0.585f
-/* Single-pole EMA alpha for a ~20Hz D-term-only noise filter at APP_CONTROL_LOOP_MS sample time. */
-#define APP_DTERM_LPF_ALPHA    0.201f
-/* Single-pole EMA alpha for a ~13Hz feedforward-only smoothing filter at APP_CONTROL_LOOP_MS sample time.
- * Lowered from ~29Hz: higher Kff was overshooting on fast stick edges before this got smoothed out. */
-#define APP_FF_LPF_ALPHA       0.15f
+/* These express each filter's intended cutoff directly; the alpha applied each iteration is
+ * derived from the actual measured dt_s (see App_LpfAlpha()) instead of assuming a fixed
+ * APP_CONTROL_LOOP_MS sample time, since the real loop period varies well beyond 2ms under load. */
+#define APP_GYRO_RATE_LPF_HZ   70.0f  /* gyro feedback filter (motor/prop vibration). Feeds the rate
+                                        * loop's P-error/D-source only - AHRS and GLOG capture still
+                                        * see the raw, unfiltered gyro. */
+#define APP_DTERM_LPF_HZ       20.0f  /* D-term-only noise filter. */
+#define APP_FF_LPF_HZ          13.0f  /* feedforward-only smoothing filter.
+                                        * Lowered from ~29Hz: higher Kff was overshooting on fast
+                                        * stick edges before this got smoothed out. */
 #define APP_MODE_SWITCH_THRESHOLD_US 1500U
 #define APP_ATTITUDE_MAX_ANGLE_DEG   35.0f
 #define APP_ATTITUDE_ANGLE_KP_DPS_PER_DEG 5.0f
@@ -859,6 +861,14 @@ static float App_ClampFloat(float value, float min_value, float max_value)
   }
 
   return value;
+}
+
+/* Single-pole EMA alpha derived from the actual sample time so the filter holds its
+ * intended cutoff even when the loop period drifts (SD writes, telemetry, jitter). */
+static float App_LpfAlpha(float dt_s, float cutoff_hz)
+{
+  float tau_s = 1.0f / (2.0f * 3.14159265f * cutoff_hz);
+  return 1.0f - expf(-dt_s / tau_s);
 }
 
 static float App_ComputeVoltageCompFactor(float battery_voltage_v)
@@ -1687,6 +1697,9 @@ void App_Update(void)
   uint32_t now_ms;
   receiver_state_t receiver_state;
   float dt_s;
+  float gyro_lpf_alpha;
+  float dterm_lpf_alpha;
+  float ff_lpf_alpha;
   float ax_g;
   float ay_g;
   float az_g;
@@ -1888,9 +1901,10 @@ void App_Update(void)
       gy_dps -= g_pitch_gyro_bias_dps;
       gz_dps -= g_yaw_gyro_bias_dps;
 
-      filtered_gyro_roll_rate_dps += APP_GYRO_RATE_LPF_ALPHA * (gx_dps - filtered_gyro_roll_rate_dps);
-      filtered_gyro_pitch_rate_dps += APP_GYRO_RATE_LPF_ALPHA * (gy_dps - filtered_gyro_pitch_rate_dps);
-      filtered_gyro_yaw_rate_dps += APP_GYRO_RATE_LPF_ALPHA * (gz_dps - filtered_gyro_yaw_rate_dps);
+      gyro_lpf_alpha = App_LpfAlpha(((float)APP_CONTROL_LOOP_MS) * 0.001f, APP_GYRO_RATE_LPF_HZ);
+      filtered_gyro_roll_rate_dps += gyro_lpf_alpha * (gx_dps - filtered_gyro_roll_rate_dps);
+      filtered_gyro_pitch_rate_dps += gyro_lpf_alpha * (gy_dps - filtered_gyro_pitch_rate_dps);
+      filtered_gyro_yaw_rate_dps += gyro_lpf_alpha * (gz_dps - filtered_gyro_yaw_rate_dps);
 
       measured_roll_rate_dps = filtered_gyro_roll_rate_dps;
       measured_pitch_rate_dps = filtered_gyro_pitch_rate_dps;
@@ -2182,9 +2196,10 @@ void App_Update(void)
         }
 
         /* D term uses its own low-pass-filtered rate signal so raw gyro noise/spikes don't kick it. */
-        dterm_filt_roll_rate_dps += APP_DTERM_LPF_ALPHA * (measured_roll_rate_dps - dterm_filt_roll_rate_dps);
-        dterm_filt_pitch_rate_dps += APP_DTERM_LPF_ALPHA * (measured_pitch_rate_dps - dterm_filt_pitch_rate_dps);
-        dterm_filt_yaw_rate_dps += APP_DTERM_LPF_ALPHA * (measured_yaw_rate_dps - dterm_filt_yaw_rate_dps);
+        dterm_lpf_alpha = App_LpfAlpha(dt_s, APP_DTERM_LPF_HZ);
+        dterm_filt_roll_rate_dps += dterm_lpf_alpha * (measured_roll_rate_dps - dterm_filt_roll_rate_dps);
+        dterm_filt_pitch_rate_dps += dterm_lpf_alpha * (measured_pitch_rate_dps - dterm_filt_pitch_rate_dps);
+        dterm_filt_yaw_rate_dps += dterm_lpf_alpha * (measured_yaw_rate_dps - dterm_filt_yaw_rate_dps);
 
         roll_rate_derivative_dps_per_s = -(dterm_filt_roll_rate_dps - prev_dterm_filt_roll_rate_dps) / dt_s;
         pitch_rate_derivative_dps_per_s = -(dterm_filt_pitch_rate_dps - prev_dterm_filt_pitch_rate_dps) / dt_s;
@@ -2195,9 +2210,10 @@ void App_Update(void)
         prev_dterm_filt_yaw_rate_dps = dterm_filt_yaw_rate_dps;
 
         /* Feedforward tracks the commanded rate's own derivative, bypassing the error/I/D path entirely. */
-        ff_filt_cmd_roll_rate_dps += APP_FF_LPF_ALPHA * (cmd_roll_rate_dps - ff_filt_cmd_roll_rate_dps);
-        ff_filt_cmd_pitch_rate_dps += APP_FF_LPF_ALPHA * (cmd_pitch_rate_dps - ff_filt_cmd_pitch_rate_dps);
-        ff_filt_cmd_yaw_rate_dps += APP_FF_LPF_ALPHA * (cmd_yaw_rate_dps - ff_filt_cmd_yaw_rate_dps);
+        ff_lpf_alpha = App_LpfAlpha(dt_s, APP_FF_LPF_HZ);
+        ff_filt_cmd_roll_rate_dps += ff_lpf_alpha * (cmd_roll_rate_dps - ff_filt_cmd_roll_rate_dps);
+        ff_filt_cmd_pitch_rate_dps += ff_lpf_alpha * (cmd_pitch_rate_dps - ff_filt_cmd_pitch_rate_dps);
+        ff_filt_cmd_yaw_rate_dps += ff_lpf_alpha * (cmd_yaw_rate_dps - ff_filt_cmd_yaw_rate_dps);
 
         roll_rate_ff_dps_per_s = (ff_filt_cmd_roll_rate_dps - prev_ff_filt_cmd_roll_rate_dps) / dt_s;
         pitch_rate_ff_dps_per_s = (ff_filt_cmd_pitch_rate_dps - prev_ff_filt_cmd_pitch_rate_dps) / dt_s;
@@ -2420,9 +2436,10 @@ void App_Update(void)
     gy_dps -= g_pitch_gyro_bias_dps;
     gz_dps -= g_yaw_gyro_bias_dps;
 
-    filtered_gyro_roll_rate_dps += APP_GYRO_RATE_LPF_ALPHA * (gx_dps - filtered_gyro_roll_rate_dps);
-    filtered_gyro_pitch_rate_dps += APP_GYRO_RATE_LPF_ALPHA * (gy_dps - filtered_gyro_pitch_rate_dps);
-    filtered_gyro_yaw_rate_dps += APP_GYRO_RATE_LPF_ALPHA * (gz_dps - filtered_gyro_yaw_rate_dps);
+    gyro_lpf_alpha = App_LpfAlpha(dt_s, APP_GYRO_RATE_LPF_HZ);
+    filtered_gyro_roll_rate_dps += gyro_lpf_alpha * (gx_dps - filtered_gyro_roll_rate_dps);
+    filtered_gyro_pitch_rate_dps += gyro_lpf_alpha * (gy_dps - filtered_gyro_pitch_rate_dps);
+    filtered_gyro_yaw_rate_dps += gyro_lpf_alpha * (gz_dps - filtered_gyro_yaw_rate_dps);
 
     measured_roll_rate_dps = filtered_gyro_roll_rate_dps;
     measured_pitch_rate_dps = filtered_gyro_pitch_rate_dps;
