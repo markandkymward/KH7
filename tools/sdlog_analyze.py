@@ -21,8 +21,10 @@ Usage:
 Board must be disarmed - "SDLOG DUMP" is refused while armed (motors spinning).
 """
 import argparse
+import os
 import re
 import struct
+import subprocess
 import sys
 import time
 from typing import List, Optional, Tuple
@@ -205,6 +207,19 @@ def print_summary(a: dict) -> None:
               f"mean={a[motor].mean():.0f}us")
 
 
+def _open_file(path: str) -> None:
+    # Agg is headless (no plt.show() window) - opening the saved PNG is how the user actually sees it.
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)  # nosec - opening our own just-written PNG
+        elif sys.platform == "darwin":
+            subprocess.run(["open", path], check=False)
+        else:
+            subprocess.run(["xdg-open", path], check=False)
+    except OSError as exc:
+        print(f"Could not auto-open {path}: {exc}", file=sys.stderr)
+
+
 def plot_dashboard(a: dict, out_path: str) -> None:
     import matplotlib
     matplotlib.use("Agg")
@@ -257,7 +272,8 @@ def plot_dashboard(a: dict, out_path: str) -> None:
 
     fig.suptitle(f"KH7 SD flight log - {t[-1]:.1f}s, ~{a['fs_hz']:.0f}Hz", fontsize=13)
     fig.savefig(out_path, dpi=130)
-    print(f"Saved dashboard: {out_path}")
+    plt.close(fig)
+    print(f"Saved dashboard: {os.path.abspath(out_path)}")
 
 
 def main() -> None:
@@ -274,6 +290,7 @@ def main() -> None:
     parser.add_argument("--save-raw", help="save the raw dump text to this file")
     parser.add_argument("--idle-timeout", type=float, default=8.0)
     parser.add_argument("--max-timeout", type=float, default=900.0)
+    parser.add_argument("--no-open", action="store_true", help="don't auto-open the saved PNG(s)")
     args = parser.parse_args()
 
     if args.raw_in:
@@ -302,6 +319,8 @@ def main() -> None:
         print_summary(a)
         out_path = f"{args.out}.png" if not args.all else f"{args.out}_flight{real_idx}.png"
         plot_dashboard(a, out_path)
+        if not args.no_open:
+            _open_file(out_path)
 
 
 if __name__ == "__main__":
