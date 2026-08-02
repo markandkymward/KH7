@@ -285,6 +285,8 @@ void App_RequestSdWriteBlock(uint32_t block)
   g_sd_cmd_pending = APP_SD_CMD_WBLOCK;
 }
 
+static void App_SdLogLoadSuperblock(void);
+
 static void App_ServiceSdCommands(void)
 {
   App_SdCmd_t cmd = g_sd_cmd_pending;
@@ -303,6 +305,10 @@ static void App_ServiceSdCommands(void)
   {
   case APP_SD_CMD_INIT:
     st = SD_Init();
+    if (st == SD_OK)
+    {
+      App_SdLogLoadSuperblock();
+    }
     printf("SD_INIT[status=%d hc=%u]\r\n", (int)st, (unsigned int)SD_IsHighCapacity());
     break;
 
@@ -335,6 +341,232 @@ static void App_ServiceSdCommands(void)
 
   default:
     break;
+  }
+}
+
+/* Continuous flight data logger, written directly to the SD card so a whole
+ * flight (not just the last few seconds of RAM) can be pulled and analyzed
+ * later with tools/sdlog_analyze.py. Block 0 is a small superblock holding
+ * the next free data block, so each flight (and each reboot) appends after
+ * the last one instead of overwriting it. Records are buffered one SD block
+ * (16 records) at a time and flushed with a single SD_WriteBlock() call -
+ * logging is decimated to APP_SDLOG_DECIMATION so that blocking SD write
+ * (a few ms typical, occasionally longer on cheap cards) happens rarely
+ * enough to keep control-loop jitter negligible. */
+#define APP_SDLOG_MAGIC 0x4B484C47UL /* "KHLG" */
+#define APP_SDLOG_DECIMATION 4U /* every 4th 2ms control tick -> 125Hz log rate */
+#define APP_SDLOG_FLAG_ARMED 0x01U
+#define APP_SDLOG_FLAG_MODE_SHIFT 1U
+#define APP_SDLOG_FLAG_MODE_MASK 0x06U
+
+/* Fixed 32-byte little-endian record (matches tools/sdlog_analyze.py's struct format). */
+typedef struct __attribute__((packed))
+{
+  uint32_t time_ms;
+  int16_t setpoint_roll_dps;
+  int16_t setpoint_pitch_dps;
+  int16_t setpoint_yaw_dps;
+  int16_t gyro_roll_dps_x10;
+  int16_t gyro_pitch_dps_x10;
+  int16_t gyro_yaw_dps_x10;
+  int16_t pid_roll_us;
+  int16_t pid_pitch_us;
+  int16_t pid_yaw_us;
+  uint16_t motor_fl_us;
+  uint16_t motor_fr_us;
+  uint16_t motor_rr_us;
+  uint16_t motor_rl_us;
+  uint8_t battery_decivolts;
+  uint8_t flags;
+} App_SdLogRecord_t;
+
+#define APP_SDLOG_RECORDS_PER_BLOCK (SD_BLOCK_SIZE / sizeof(App_SdLogRecord_t))
+
+static uint8_t g_sdlog_ready = 0U;      /* superblock loaded, card usable for logging */
+static uint8_t g_sdlog_active = 0U;     /* currently capturing a flight */
+static uint32_t g_sdlog_next_free_block = 1U;
+static uint32_t g_sdlog_flight_next_block = 0U;
+static uint8_t g_sdlog_block_buf[SD_BLOCK_SIZE];
+static uint16_t g_sdlog_buf_count = 0U;
+
+static void App_SdLogSaveSuperblock(void)
+{
+  uint8_t buf[SD_BLOCK_SIZE] = {0};
+  uint32_t magic = APP_SDLOG_MAGIC;
+
+  memcpy(&buf[0], &magic, sizeof(magic));
+  memcpy(&buf[4], &g_sdlog_next_free_block, sizeof(g_sdlog_next_free_block));
+  (void)SD_WriteBlock(0U, buf);
+}
+
+static void App_SdLogLoadSuperblock(void)
+{
+  uint8_t buf[SD_BLOCK_SIZE];
+  uint32_t magic;
+
+  g_sdlog_ready = 0U;
+  g_sdlog_next_free_block = 1U;
+
+  if (SD_ReadBlock(0U, buf) != SD_OK)
+  {
+    return;
+  }
+
+  memcpy(&magic, &buf[0], sizeof(magic));
+  if (magic == APP_SDLOG_MAGIC)
+  {
+    memcpy(&g_sdlog_next_free_block, &buf[4], sizeof(g_sdlog_next_free_block));
+    if (g_sdlog_next_free_block < 1U)
+    {
+      g_sdlog_next_free_block = 1U;
+    }
+  }
+  else
+  {
+    /* Blank/foreign card - claim it with a fresh superblock. */
+    g_sdlog_next_free_block = 1U;
+    App_SdLogSaveSuperblock();
+  }
+  g_sdlog_ready = 1U;
+}
+
+static void App_SdLogArmStart(void)
+{
+  if (g_sdlog_ready != 0U)
+  {
+    g_sdlog_flight_next_block = g_sdlog_next_free_block;
+    g_sdlog_buf_count = 0U;
+    g_sdlog_active = 1U;
+  }
+}
+
+static void App_SdLogFlushFlight(void)
+{
+  if (g_sdlog_buf_count > 0U)
+  {
+    memset(&g_sdlog_block_buf[g_sdlog_buf_count * sizeof(App_SdLogRecord_t)],
+           0,
+           sizeof(g_sdlog_block_buf) - (g_sdlog_buf_count * sizeof(App_SdLogRecord_t)));
+    (void)SD_WriteBlock(g_sdlog_flight_next_block, g_sdlog_block_buf);
+    g_sdlog_flight_next_block++;
+    g_sdlog_buf_count = 0U;
+  }
+  g_sdlog_active = 0U;
+  g_sdlog_next_free_block = g_sdlog_flight_next_block;
+  App_SdLogSaveSuperblock();
+}
+
+static void App_SdLogAppendRecord(const App_SdLogRecord_t *rec)
+{
+  if ((g_sdlog_active == 0U) || (g_sdlog_ready == 0U))
+  {
+    return;
+  }
+
+  memcpy(&g_sdlog_block_buf[g_sdlog_buf_count * sizeof(App_SdLogRecord_t)], rec, sizeof(*rec));
+  g_sdlog_buf_count++;
+
+  if (g_sdlog_buf_count >= APP_SDLOG_RECORDS_PER_BLOCK)
+  {
+    (void)SD_WriteBlock(g_sdlog_flight_next_block, g_sdlog_block_buf);
+    g_sdlog_flight_next_block++;
+    g_sdlog_buf_count = 0U;
+  }
+}
+
+typedef enum
+{
+  APP_SDLOGCMD_NONE = 0,
+  APP_SDLOGCMD_STATUS,
+  APP_SDLOGCMD_DUMP
+} App_SdLogCmd_t;
+
+#define APP_SDLOG_DUMP_BLOCKS_PER_CALL 4U
+
+static volatile App_SdLogCmd_t g_sdlog_cmd_pending = APP_SDLOGCMD_NONE;
+static uint8_t g_sdlog_dump_active = 0U;
+static uint32_t g_sdlog_dump_block = 0U;
+static uint32_t g_sdlog_dump_end_block = 0U;
+
+void App_RequestSdLogStatus(void)
+{
+  g_sdlog_cmd_pending = APP_SDLOGCMD_STATUS;
+}
+
+void App_RequestSdLogDump(void)
+{
+  g_sdlog_cmd_pending = APP_SDLOGCMD_DUMP;
+}
+
+static void App_ServiceSdLog(void)
+{
+  App_SdLogCmd_t cmd = g_sdlog_cmd_pending;
+  uint8_t buf[SD_BLOCK_SIZE];
+  uint32_t i;
+
+  if (cmd != APP_SDLOGCMD_NONE)
+  {
+    g_sdlog_cmd_pending = APP_SDLOGCMD_NONE;
+
+    if (cmd == APP_SDLOGCMD_STATUS)
+    {
+      printf("SDLOG_STATUS[ready=%u next_free_block=%lu record_bytes=%u]\r\n",
+             (unsigned int)g_sdlog_ready,
+             (unsigned long)g_sdlog_next_free_block,
+             (unsigned int)sizeof(App_SdLogRecord_t));
+    }
+    else if (cmd == APP_SDLOGCMD_DUMP)
+    {
+      if (g_glog_armed_state != 0U)
+      {
+        printf("SDLOG_DUMP[BUSY armed]\r\n");
+      }
+      else if ((g_sdlog_ready == 0U) || (g_sdlog_next_free_block <= 1U))
+      {
+        printf("SDLOG_DUMP[EMPTY]\r\n");
+      }
+      else
+      {
+        g_sdlog_dump_block = 1U;
+        g_sdlog_dump_end_block = g_sdlog_next_free_block - 1U;
+        g_sdlog_dump_active = 1U;
+        printf("SDLOG_DUMP[START first=1 last=%lu record_bytes=%u]\r\n",
+               (unsigned long)g_sdlog_dump_end_block,
+               (unsigned int)sizeof(App_SdLogRecord_t));
+      }
+    }
+  }
+
+  /* Dumping is chunked across many App_Update() calls (a few blocks at a
+   * time) instead of one long synchronous loop, so a large dump never stalls
+   * telemetry/receiver servicing for more than a few SD block reads. */
+  for (i = 0U; (i < APP_SDLOG_DUMP_BLOCKS_PER_CALL) && (g_sdlog_dump_active != 0U); i++)
+  {
+    uint16_t b;
+
+    if (SD_ReadBlock(g_sdlog_dump_block, buf) == SD_OK)
+    {
+      printf("SDLOG[%lu]=", (unsigned long)g_sdlog_dump_block);
+      for (b = 0U; b < SD_BLOCK_SIZE; b++)
+      {
+        printf("%02X", buf[b]);
+      }
+      printf("\r\n");
+    }
+    else
+    {
+      printf("SDLOG_DUMP[READ_ERR block=%lu]\r\n", (unsigned long)g_sdlog_dump_block);
+    }
+
+    if (g_sdlog_dump_block >= g_sdlog_dump_end_block)
+    {
+      g_sdlog_dump_active = 0U;
+      printf("SDLOG_DUMP[END]\r\n");
+    }
+    else
+    {
+      g_sdlog_dump_block++;
+    }
   }
 }
 
@@ -1370,6 +1602,11 @@ void App_Init(void)
   }
 
   (void)IMU_DetectAndInit();
+
+  if (SD_Init() == SD_OK)
+  {
+    App_SdLogLoadSuperblock();
+  }
 }
 
 void App_Update(void)
@@ -1405,6 +1642,7 @@ void App_Update(void)
   static uint8_t startup_arm_blocked = 0U;
   static uint8_t beeper_on = 0U;
   static uint32_t last_beeper_toggle_ms = 0U;
+  static uint32_t sdlog_decim_counter = 0U;
   static uint16_t roll_center_us = APP_PWM_MID_US;
   static uint16_t pitch_center_us = APP_PWM_MID_US;
   static uint16_t yaw_center_us = APP_PWM_MID_US;
@@ -1541,6 +1779,7 @@ void App_Update(void)
   App_ProcessPendingPidCommand();
   App_ServiceGyroLogDump();
   App_ServiceSdCommands();
+  App_ServiceSdLog();
 
   if (usb_motor_test_enabled != 0U)
   {
@@ -1807,6 +2046,10 @@ void App_Update(void)
 
       if ((receiver_state.link_active == 0U) || (arm_switch_high == 0U))
       {
+        if ((motors_armed != 0U) && (g_sdlog_active != 0U))
+        {
+          App_SdLogFlushFlight();
+        }
         motors_armed = 0U;
         trim_captured = 0U;
         arm_hold_start_ms = 0U;
@@ -1840,6 +2083,7 @@ void App_Update(void)
             trim_captured = 0U;
             g_glog_count = 0U;
             g_glog_capturing = 1U;
+            App_SdLogArmStart();
           }
         }
         else
@@ -2083,16 +2327,32 @@ void App_Update(void)
 
         /* Physical channels map as: CH1=LA, CH2=LF, CH3=RA, CH4=RF. */
         Motors_WriteUs(s4_us, s1_us, s3_us, s2_us);
+
+        if ((g_sdlog_active != 0U) && ((sdlog_decim_counter++ % APP_SDLOG_DECIMATION) == 0U))
+        {
+          App_SdLogRecord_t sdlog_rec;
+
+          sdlog_rec.time_ms = now_ms;
+          sdlog_rec.setpoint_roll_dps = (int16_t)cmd_roll_rate_dps;
+          sdlog_rec.setpoint_pitch_dps = (int16_t)cmd_pitch_rate_dps;
+          sdlog_rec.setpoint_yaw_dps = (int16_t)cmd_yaw_rate_dps;
+          sdlog_rec.gyro_roll_dps_x10 = (int16_t)(measured_roll_rate_dps * 10.0f);
+          sdlog_rec.gyro_pitch_dps_x10 = (int16_t)(measured_pitch_rate_dps * 10.0f);
+          sdlog_rec.gyro_yaw_dps_x10 = (int16_t)(measured_yaw_rate_dps * 10.0f);
+          sdlog_rec.pid_roll_us = (int16_t)roll_term;
+          sdlog_rec.pid_pitch_us = (int16_t)pitch_term;
+          sdlog_rec.pid_yaw_us = (int16_t)yaw_term;
+          sdlog_rec.motor_fl_us = s1_us;
+          sdlog_rec.motor_fr_us = s2_us;
+          sdlog_rec.motor_rr_us = s3_us;
+          sdlog_rec.motor_rl_us = s4_us;
+          sdlog_rec.battery_decivolts = (uint8_t)App_ClampFloat(battery_voltage_filtered_v * 10.0f, 0.0f, 255.0f);
+          sdlog_rec.flags = (uint8_t)(APP_SDLOG_FLAG_ARMED |
+                                      (((uint8_t)flight_mode << APP_SDLOG_FLAG_MODE_SHIFT) & APP_SDLOG_FLAG_MODE_MASK));
+          App_SdLogAppendRecord(&sdlog_rec);
+        }
       }
     }
-  }
-
-  if ((now_ms - last_receiver_telemetry_ms) >= 1000U)
-  {
-#if APP_ENABLE_RECEIVER_RUNTIME_TELEMETRY
-    Telemetry_PrintReceiverState(&receiver_state);
-#endif
-    last_receiver_telemetry_ms = now_ms;
   }
 
   if ((now_ms - last_rx16_telemetry_ms) >= APP_RX16_TELEMETRY_MS)

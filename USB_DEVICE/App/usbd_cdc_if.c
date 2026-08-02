@@ -510,6 +510,18 @@ void CDC_ProcessCommandLine(const char *line)
     return;
   }
 
+  if (strcmp(line, "SDLOG STATUS") == 0)
+  {
+    App_RequestSdLogStatus();
+    return;
+  }
+
+  if (strcmp(line, "SDLOG DUMP") == 0)
+  {
+    App_RequestSdLogDump();
+    return;
+  }
+
   prefix = "PID SET ";
   if (strncmp(line, prefix, strlen(prefix)) == 0)
   {

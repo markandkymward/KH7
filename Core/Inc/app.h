@@ -57,6 +57,8 @@ void App_RequestSdInit(void);
 void App_RequestSdStatus(void);
 void App_RequestSdReadBlock(uint32_t block);
 void App_RequestSdWriteBlock(uint32_t block);
+void App_RequestSdLogStatus(void);
+void App_RequestSdLogDump(void);
 
 #ifdef __cplusplus
 }
