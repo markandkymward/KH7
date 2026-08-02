@@ -24,7 +24,6 @@ import argparse
 import os
 import re
 import struct
-import subprocess
 import sys
 import time
 from typing import List, Optional, Tuple
@@ -38,6 +37,10 @@ DUMP_EMPTY_RE = re.compile(r"SDLOG_DUMP\[EMPTY\]")
 DUMP_END_RE = re.compile(r"SDLOG_DUMP\[END\]")
 DUMP_ERR_RE = re.compile(r"SDLOG_DUMP\[READ_ERR block=(\d+)\]")
 BLOCK_RE = re.compile(r"SDLOG\[(\d+)\]=([0-9A-Fa-f]+)")
+
+# Anchor default output to the script's own folder so the PNG always lands in a
+# predictable place regardless of the caller's current working directory.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 RECORD_STRUCT = struct.Struct("<I9hHHHHBB")
 RECORD_SIZE = RECORD_STRUCT.size  # 32 bytes, matches App_SdLogRecord_t in Core/Src/app.c
@@ -207,23 +210,31 @@ def print_summary(a: dict) -> None:
               f"mean={a[motor].mean():.0f}us")
 
 
-def _open_file(path: str) -> None:
-    # Agg is headless (no plt.show() window) - opening the saved PNG is how the user actually sees it.
-    try:
-        if sys.platform == "win32":
-            os.startfile(path)  # nosec - opening our own just-written PNG
-        elif sys.platform == "darwin":
-            subprocess.run(["open", path], check=False)
-        else:
-            subprocess.run(["xdg-open", path], check=False)
-    except OSError as exc:
-        print(f"Could not auto-open {path}: {exc}", file=sys.stderr)
+_PYPLOT_CACHE: dict = {}
 
 
-def plot_dashboard(a: dict, out_path: str) -> None:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+def _get_pyplot():
+    """Import pyplot with a real GUI backend when one is available, falling back to
+    the headless Agg backend (savefig only, no on-screen window) otherwise. Cached
+    so the backend probe only happens once even when rendering multiple flights."""
+    if not _PYPLOT_CACHE:
+        import matplotlib
+        try:
+            import matplotlib.pyplot as plt
+            plt.figure()
+            plt.close("all")
+            _PYPLOT_CACHE["plt"] = plt
+            _PYPLOT_CACHE["interactive"] = True
+        except Exception:
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            _PYPLOT_CACHE["plt"] = plt
+            _PYPLOT_CACHE["interactive"] = False
+    return _PYPLOT_CACHE["plt"], _PYPLOT_CACHE["interactive"]
+
+
+def plot_dashboard(a: dict, out_path: str):
+    plt, interactive = _get_pyplot()
 
     t = a["t_s"]
     fig = plt.figure(figsize=(16, 18))
@@ -272,8 +283,8 @@ def plot_dashboard(a: dict, out_path: str) -> None:
 
     fig.suptitle(f"KH7 SD flight log - {t[-1]:.1f}s, ~{a['fs_hz']:.0f}Hz", fontsize=13)
     fig.savefig(out_path, dpi=130)
-    plt.close(fig)
     print(f"Saved dashboard: {os.path.abspath(out_path)}")
+    return fig, interactive
 
 
 def main() -> None:
@@ -290,7 +301,7 @@ def main() -> None:
     parser.add_argument("--save-raw", help="save the raw dump text to this file")
     parser.add_argument("--idle-timeout", type=float, default=8.0)
     parser.add_argument("--max-timeout", type=float, default=900.0)
-    parser.add_argument("--no-open", action="store_true", help="don't auto-open the saved PNG(s)")
+    parser.add_argument("--no-open", action="store_true", help="don't display the plot window(s)")
     args = parser.parse_args()
 
     if args.raw_in:
@@ -307,6 +318,7 @@ def main() -> None:
         return
 
     targets = range(len(flights)) if args.all else [args.flight]
+    figs = []
     for idx in targets:
         try:
             start, end = flights[idx]
@@ -317,10 +329,18 @@ def main() -> None:
         a = _flight_arrays(records[start:end])
         print(f"\n=== Flight {real_idx} ===")
         print_summary(a)
-        out_path = f"{args.out}.png" if not args.all else f"{args.out}_flight{real_idx}.png"
-        plot_dashboard(a, out_path)
-        if not args.no_open:
-            _open_file(out_path)
+        out_name = f"{args.out}.png" if not args.all else f"{args.out}_flight{real_idx}.png"
+        out_path = out_name if os.path.isabs(out_name) else os.path.join(SCRIPT_DIR, out_name)
+        fig, interactive = plot_dashboard(a, out_path)
+        figs.append(fig)
+
+    if figs and not args.no_open:
+        if _PYPLOT_CACHE.get("interactive"):
+            _PYPLOT_CACHE["plt"].show()
+        else:
+            print("No GUI backend available - PNG(s) saved but not displayed.", file=sys.stderr)
+    for fig in figs:
+        _PYPLOT_CACHE["plt"].close(fig)
 
 
 if __name__ == "__main__":
