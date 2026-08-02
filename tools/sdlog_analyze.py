@@ -55,6 +55,8 @@ FIELD_NAMES = (
 FLIGHT_MODE_NAMES = {0: "RATE", 1: "ATTITUDE"}
 FLIGHT_GAP_MS = 1500  # a stored-sample time gap bigger than this means a new flight
 PID_TERM_LIMIT_US = 320  # APP_RATE_TERM_LIMIT_US in Core/Src/app.c - used for saturation %
+LANDING_CLIP_S = 1.0  # trailing seconds always trimmed - landing/disarm produces a large
+                      # non-representative tracking-error/PID spike right before the log ends
 
 
 def collect_raw(port: str, baud: int, idle_timeout_s: float, max_timeout_s: float,
@@ -176,6 +178,13 @@ def _flight_arrays(sub: List[dict]) -> dict:
     dt = np.diff(a["time_ms"])
     dt = dt[dt > 0]
     a["fs_hz"] = 1000.0 / np.median(dt) if dt.size else 125.0
+
+    if a["t_s"][-1] > (2.0 * LANDING_CLIP_S):
+        keep = a["t_s"] <= (a["t_s"][-1] - LANDING_CLIP_S)
+        n_before = keep.shape[0]
+        for key, val in a.items():
+            if isinstance(val, np.ndarray) and val.shape[0] == n_before:
+                a[key] = val[keep]
     return a
 
 
@@ -318,6 +327,7 @@ def main() -> None:
         return
 
     targets = range(len(flights)) if args.all else [args.flight]
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
     figs = []
     for idx in targets:
         try:
@@ -329,7 +339,8 @@ def main() -> None:
         a = _flight_arrays(records[start:end])
         print(f"\n=== Flight {real_idx} ===")
         print_summary(a)
-        out_name = f"{args.out}.png" if not args.all else f"{args.out}_flight{real_idx}.png"
+        out_name = (f"{args.out}_{timestamp}.png" if not args.all
+                    else f"{args.out}_{timestamp}_flight{real_idx}.png")
         out_path = out_name if os.path.isabs(out_name) else os.path.join(SCRIPT_DIR, out_name)
         fig, interactive = plot_dashboard(a, out_path)
         figs.append(fig)
