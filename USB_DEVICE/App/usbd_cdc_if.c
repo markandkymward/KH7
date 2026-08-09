@@ -447,6 +447,27 @@ void CDC_ProcessCommandLine(const char *line)
     return;
   }
 
+  if (strcmp(line, "ATT ZERO") == 0)
+  {
+    App_RequestAttitudeZero();
+    printf("ATT_ZERO[QUEUED]\r\n");
+    return;
+  }
+
+  if (strcmp(line, "MAG CAL START") == 0)
+  {
+    App_RequestMagCalStart();
+    printf("MAG_CAL[QUEUED start]\r\n");
+    return;
+  }
+
+  if (strcmp(line, "MAG CAL STOP") == 0)
+  {
+    App_RequestMagCalStop();
+    printf("MAG_CAL[QUEUED stop]\r\n");
+    return;
+  }
+
   if (strcmp(line, "PID DEFAULT") == 0)
   {
     App_RequestRatePidDefaults();
@@ -519,6 +540,19 @@ void CDC_ProcessCommandLine(const char *line)
   if (strcmp(line, "SDLOG DUMP") == 0)
   {
     App_RequestSdLogDump();
+    return;
+  }
+
+  if (strcmp(line, "SDLOG DUMP LAST") == 0)
+  {
+    App_RequestSdLogDumpLast();
+    return;
+  }
+
+  if (strcmp(line, "SDLOG ERASE") == 0)
+  {
+    App_RequestSdLogErase();
+    printf("SDLOG_ERASE[QUEUED]\r\n");
     return;
   }
 

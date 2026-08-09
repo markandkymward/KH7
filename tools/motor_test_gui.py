@@ -1,9 +1,12 @@
 import json
+import queue
 import re
 import socket
+import struct
+import threading
 from pathlib import Path
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import serial
 import serial.tools.list_ports
@@ -23,6 +26,22 @@ IMU_LINE_RE = re.compile(
     r"IMU\[x100/x10\]=\[\s*(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s*\]"
 )
 VBAT_LINE_RE = re.compile(r"VBAT\[mV raw\]=\[\s*(\d+)\s+(\d+)\s*\]")
+BARO_LINE_RE = re.compile(r"BARO\[healthy cm cm_s\]=\[\s*(\d+)\s+(-?\d+)\s+(-?\d+)\s*\]")
+BARO_INIT_LINE_RE = re.compile(r"BARO_INIT\[(OK) addr=0x([0-9A-Fa-f]{2})\]|BARO_INIT\[(FAIL) chip_id=0x([0-9A-Fa-f]{2})\]")
+GPS_LINE_RE = re.compile(
+    r"GPS\[cfg healthy fix sats\]=\[\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*\]\s+"
+    r"lla=\[\s*(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\s*\]"
+)
+GPS_INIT_LINE_RE = re.compile(r"GPS_INIT\[(OK)\]|GPS_INIT\[(FAIL) prt_ack=(\d) msg_ack=(\d)\]")
+MAG_LINE_RE = re.compile(
+    r"MAG\[healthy heading_x10 mg\]=\[\s*(\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s*\]"
+)
+MAG_INIT_LINE_RE = re.compile(r"MAG_INIT\[(OK|FAIL) chip_id=0x([0-9A-Fa-f]{2})\]")
+MAG_CAL_STARTED_RE = re.compile(r"MAG_CAL\[STARTED\]")
+MAG_CAL_OK_RE = re.compile(
+    r"MAG_CAL\[OK ox=(-?\d*\.?\d+) oy=(-?\d*\.?\d+) sx=(-?\d*\.?\d+) sy=(-?\d*\.?\d+)\]"
+)
+MAG_CAL_FAIL_RE = re.compile(r"MAG_CAL\[FAIL([^\]]*)\]")
 MODE_LINE_RE = re.compile(r"MODE\[name=([^\s\]]+) ch6=(\d+)\]")
 ATT_LINE_RE = re.compile(r"ATT\[src=([^\]]+)\]=\[ROLL_KP\s+([-+]?\d*\.?\d+)\s+PITCH_KP\s+([-+]?\d*\.?\d+)\s+MAX_ANG\s+([-+]?\d*\.?\d+)\]")
 PID_LINE_RE = re.compile(
@@ -35,6 +54,55 @@ PID_DEBUG_RE = re.compile(r"PID_DEBUG\[q=(\d+) h=(\d+) p=(\d+)\]")
 PID_FLASH_RE = re.compile(
     r"PID_FLASH\[addr=(0x[0-9A-Fa-f]+) magic=(0x[0-9A-Fa-f]+) ver=(\d+) crc=(0x[0-9A-Fa-f]+) calc=(0x[0-9A-Fa-f]+) header=(\d+) crc_ok=(\d+) gains_ok=(\d+)\]"
 )
+
+# Blackbox (SD log) playback: parses raw "SDLOG DUMP"/"SDLOG DUMP LAST" text dumps saved by
+# tools/sdlog_analyze.py (--save-raw), mirroring its RECORD_STRUCT/FIELD_NAMES/flight
+# segmentation without pulling in numpy/matplotlib.
+BB_BLOCK_RE = re.compile(r"SDLOG\[(\d+)\]=([0-9A-Fa-f]+)")
+BB_RECORD_STRUCT = struct.Struct("<I9hHHHHBB")
+BB_RECORD_SIZE = BB_RECORD_STRUCT.size  # 32 bytes, matches App_SdLogRecord_t in Core/Src/app.c
+BB_FIELD_NAMES = (
+    "time_ms",
+    "setpoint_roll_dps", "setpoint_pitch_dps", "setpoint_yaw_dps",
+    "gyro_roll_dps_x10", "gyro_pitch_dps_x10", "gyro_yaw_dps_x10",
+    "pid_roll_us", "pid_pitch_us", "pid_yaw_us",
+    "motor_fl_us", "motor_fr_us", "motor_rr_us", "motor_rl_us",
+    "battery_decivolts", "flags",
+)
+BB_FLIGHT_GAP_MS = 1500  # a stored-sample time gap bigger than this means a new flight
+BB_FLIGHT_MODE_NAMES = {0: "RATE", 1: "ATTITUDE", 2: "ALTHOLD"}
+
+
+def _bb_parse_records(text: str) -> list:
+    blocks = {}
+    for line in text.splitlines():
+        m = BB_BLOCK_RE.match(line.strip())
+        if m is not None:
+            blocks[int(m.group(1))] = bytes.fromhex(m.group(2))
+
+    records = []
+    for block_idx in sorted(blocks):
+        data = blocks[block_idx]
+        for offset in range(0, len(data) - BB_RECORD_SIZE + 1, BB_RECORD_SIZE):
+            chunk = data[offset:offset + BB_RECORD_SIZE]
+            if chunk == bytes(BB_RECORD_SIZE):
+                continue  # zero-padded tail of a flight's last (partial) block
+            values = BB_RECORD_STRUCT.unpack(chunk)
+            records.append(dict(zip(BB_FIELD_NAMES, values)))
+    return records
+
+
+def _bb_segment_flights(records: list) -> list:
+    flights = []
+    start = 0
+    for i in range(1, len(records)):
+        dt = records[i]["time_ms"] - records[i - 1]["time_ms"]
+        if dt < 0 or dt > BB_FLIGHT_GAP_MS:
+            flights.append((start, i))
+            start = i
+    if records:
+        flights.append((start, len(records)))
+    return flights
 
 PID_LIMITS = {
     "roll_kp": (0.0, 4.0),
@@ -65,6 +133,8 @@ class Kh7GroundGui:
         self.serial_port = None
         self.tcp_socket = None
         self.tcp_rx_buffer = bytearray()
+        self.wifi_connecting = False
+        self.wifi_connect_queue = queue.Queue()
         self.motor_canvas = None
         self.pose_canvas = None
         self.rc_canvas = None
@@ -83,6 +153,9 @@ class Kh7GroundGui:
             "motor_2": [],
             "motor_3": [],
             "motor_4": [],
+            "baro_alt": [],
+            "baro_vz": [],
+            "mag_heading": [],
         }
 
         self.transport_var = tk.StringVar(value="USB")
@@ -115,6 +188,20 @@ class Kh7GroundGui:
         self.pitch_var = tk.StringVar(value="0.0")
         self.roll_var = tk.StringVar(value="0.0")
         self.yaw_var = tk.StringVar(value="0.0")
+        self.baro_alt_var = tk.StringVar(value="-")
+        self.baro_vz_var = tk.StringVar(value="-")
+        self.baro_health_var = tk.StringVar(value="-")
+        self.baro_init_var = tk.StringVar(value="Baro init: waiting for boot message")
+        self.gps_health_var = tk.StringVar(value="-")
+        self.gps_fix_var = tk.StringVar(value="-")
+        self.gps_sats_var = tk.StringVar(value="-")
+        self.gps_pos_var = tk.StringVar(value="GPS: waiting for data")
+        self.gps_init_var = tk.StringVar(value="GPS init: waiting for boot message")
+        self.mag_health_var = tk.StringVar(value="-")
+        self.mag_heading_var = tk.StringVar(value="-")
+        self.mag_init_var = tk.StringVar(value="Mag init: waiting for boot message")
+        self.mag_cal_status_var = tk.StringVar(value="Compass cal: not calibrated")
+        self.mag_cal_active = False
 
         self.rc_channels_us = [1500 for _ in range(16)]
         self.rc_channels_us[2] = 988
@@ -122,6 +209,24 @@ class Kh7GroundGui:
         self.rc_frame_count = 0
         self.rc_arm_switch = 0
         self.rc_armed = 0
+
+        self.bb_records = []
+        self.bb_flights = []
+        self.bb_selected_flight_records = []
+        self.bb_play_index = 0
+        self.bb_playing = False
+        self.bb_after_id = None
+        self.bb_ignore_scrub_event = False
+        self.bb_flight_combo = None
+        self.bb_scrub_scale = None
+        self.bb_speed_var = tk.StringVar(value="1x")
+        self.bb_progress_var = tk.StringVar(value="No log loaded")
+        self.bb_setpoint_roll_var = tk.StringVar(value="0.0")
+        self.bb_setpoint_pitch_var = tk.StringVar(value="0.0")
+        self.bb_setpoint_yaw_var = tk.StringVar(value="0.0")
+        self.bb_pid_roll_var = tk.StringVar(value="0")
+        self.bb_pid_pitch_var = tk.StringVar(value="0")
+        self.bb_pid_yaw_var = tk.StringVar(value="0")
 
         self.pid_vars = {
             "roll_kp": tk.StringVar(value="0.9000"),
@@ -272,11 +377,46 @@ class Kh7GroundGui:
         ttk.Label(top, textvariable=self.bridge_ip_var).pack(side=tk.LEFT, padx=(10, 0))
         ttk.Label(top, textvariable=self.event_var).pack(side=tk.RIGHT)
 
-        body = ttk.Frame(self.root, padding=(10, 0, 10, 10))
-        body.pack(fill=tk.BOTH, expand=True)
+        # Body is scrollable so every section (charts, playback, log) stays reachable
+        # even when the window is shorter than the total content height.
+        body_container = ttk.Frame(self.root)
+        body_container.pack(fill=tk.BOTH, expand=True)
 
-        telemetry = ttk.LabelFrame(body, text="Board Telemetry")
-        telemetry.pack(fill=tk.X, pady=(0, 10))
+        body_canvas = tk.Canvas(body_container, highlightthickness=0)
+        body_scroll = ttk.Scrollbar(body_container, orient=tk.VERTICAL, command=body_canvas.yview)
+        body_canvas.configure(yscrollcommand=body_scroll.set)
+        body_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        body_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        body = ttk.Frame(body_canvas, padding=(10, 0, 10, 10))
+        body_window = body_canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def _on_body_configure(_event=None) -> None:
+            body_canvas.configure(scrollregion=body_canvas.bbox("all"))
+
+        def _on_canvas_configure(event) -> None:
+            body_canvas.itemconfigure(body_window, width=event.width)
+
+        body.bind("<Configure>", _on_body_configure)
+        body_canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(event) -> None:
+            body_canvas.yview_scroll(-1 * int(event.delta / 120), "units")
+
+        def _bind_mousewheel(_event=None) -> None:
+            body_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        def _unbind_mousewheel(_event=None) -> None:
+            body_canvas.unbind_all("<MouseWheel>")
+
+        body_canvas.bind("<Enter>", _bind_mousewheel)
+        body_canvas.bind("<Leave>", _unbind_mousewheel)
+
+        telemetry_row = ttk.Frame(body)
+        telemetry_row.pack(fill=tk.X, pady=(0, 10))
+
+        telemetry = ttk.LabelFrame(telemetry_row, text="Board Telemetry")
+        telemetry.pack(side=tk.LEFT, fill=tk.BOTH, padx=(0, 8))
 
         self._metric_row(telemetry, 0, "Accel X (g)", self.ax_var, "Rate X (dps)", self.gx_var, "Pitch (deg)", self.pitch_var)
         self._metric_row(telemetry, 1, "Accel Y (g)", self.ay_var, "Rate Y (dps)", self.gy_var, "Roll (deg)", self.roll_var)
@@ -289,14 +429,52 @@ class Kh7GroundGui:
             font=("Segoe UI", 24, "bold"),
             anchor="e",
             justify=tk.RIGHT,
-        ).grid(row=0, column=6, rowspan=3, sticky="e", padx=(12, 14), pady=(4, 6))
+        ).grid(row=0, column=6, rowspan=2, sticky="e", padx=(12, 14), pady=(4, 6))
         ttk.Label(
             telemetry,
             textvariable=self.mode_var,
             font=("Segoe UI", 16, "bold"),
             anchor="e",
             justify=tk.RIGHT,
-        ).grid(row=3, column=6, sticky="e", padx=(12, 14), pady=(0, 8))
+        ).grid(row=2, column=6, sticky="e", padx=(12, 14), pady=(0, 8))
+
+        # Baro/GPS/Compass health placed beside (not below) Board Telemetry so this
+        # row stays as short as the 3-line IMU block instead of growing to 10 rows.
+        sensor_box = ttk.LabelFrame(telemetry_row, text="Sensor Health")
+        sensor_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        ttk.Label(sensor_box, text="Baro", font=("Segoe UI", 9, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", padx=(10, 4), pady=(4, 0))
+        ttk.Label(sensor_box, text="GPS", font=("Segoe UI", 9, "bold")).grid(row=0, column=2, columnspan=2, sticky="w", padx=(10, 4), pady=(4, 0))
+        ttk.Label(sensor_box, text="Compass", font=("Segoe UI", 9, "bold")).grid(row=0, column=4, columnspan=2, sticky="w", padx=(10, 4), pady=(4, 0))
+
+        self._sensor_metric(sensor_box, 1, 0, "Health", self.baro_health_var)
+        self._sensor_metric(sensor_box, 1, 2, "Health", self.gps_health_var)
+        self._sensor_metric(sensor_box, 1, 4, "Health", self.mag_health_var)
+
+        self._sensor_metric(sensor_box, 2, 0, "Alt (m)", self.baro_alt_var)
+        self._sensor_metric(sensor_box, 2, 2, "Fix", self.gps_fix_var)
+        self._sensor_metric(sensor_box, 2, 4, "Heading", self.mag_heading_var)
+
+        self._sensor_metric(sensor_box, 3, 0, "VZ (m/s)", self.baro_vz_var)
+        self._sensor_metric(sensor_box, 3, 2, "Sats", self.gps_sats_var)
+
+        ttk.Label(sensor_box, textvariable=self.baro_init_var, foreground="#9aa6b2").grid(
+            row=4, column=0, columnspan=2, sticky="w", padx=(10, 4), pady=(2, 4)
+        )
+        ttk.Label(sensor_box, textvariable=self.gps_pos_var, foreground="#9aa6b2").grid(
+            row=4, column=2, columnspan=2, sticky="w", padx=(10, 4), pady=(2, 4)
+        )
+        ttk.Label(sensor_box, textvariable=self.gps_init_var, foreground="#9aa6b2").grid(
+            row=5, column=2, columnspan=2, sticky="w", padx=(10, 4), pady=(0, 4)
+        )
+        ttk.Label(sensor_box, textvariable=self.mag_init_var, foreground="#9aa6b2").grid(
+            row=4, column=4, columnspan=2, sticky="w", padx=(10, 4), pady=(2, 4)
+        )
+        self.mag_cal_button = ttk.Button(sensor_box, text="Calibrate", command=self.mag_cal_toggle)
+        self.mag_cal_button.grid(row=5, column=4, columnspan=2, sticky="we", padx=(10, 4), pady=(2, 2))
+        ttk.Label(sensor_box, textvariable=self.mag_cal_status_var, foreground="#9aa6b2", wraplength=220).grid(
+            row=6, column=4, columnspan=2, sticky="w", padx=(10, 4), pady=(0, 4)
+        )
 
         mid = ttk.Frame(body)
         mid.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
@@ -465,6 +643,72 @@ class Kh7GroundGui:
             y_max=2012.0,
         )
 
+        self._create_strip_chart(
+            charts_box,
+            chart_key="baro",
+            title="Baro Altitude (m) / Climb Rate (m/s)",
+            series=[("baro_alt", "Alt", "#45d1ff"), ("baro_vz", "VZ", "#ffd166")],
+            y_min=-5.0,
+            y_max=5.0,
+        )
+
+        self._create_strip_chart(
+            charts_box,
+            chart_key="mag",
+            title="Compass Heading (deg, uncompensated)",
+            series=[("mag_heading", "Heading", "#c586ff")],
+            y_min=0.0,
+            y_max=360.0,
+        )
+
+        bb_box = ttk.LabelFrame(body, text="Blackbox Playback (SD log)")
+        bb_box.pack(fill=tk.X, pady=(0, 10))
+
+        bb_top = ttk.Frame(bb_box)
+        bb_top.pack(fill=tk.X, padx=8, pady=(8, 4))
+
+        ttk.Button(bb_top, text="Load Log...", command=self.bb_load_log).pack(side=tk.LEFT)
+
+        ttk.Label(bb_top, text="Flight:").pack(side=tk.LEFT, padx=(10, 4))
+        self.bb_flight_combo = ttk.Combobox(bb_top, state="readonly", width=28)
+        self.bb_flight_combo.pack(side=tk.LEFT)
+        self.bb_flight_combo.bind("<<ComboboxSelected>>", self.bb_on_flight_selected)
+
+        ttk.Label(bb_top, text="Speed:").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Combobox(
+            bb_top,
+            textvariable=self.bb_speed_var,
+            state="readonly",
+            width=5,
+            values=["0.25x", "0.5x", "1x", "2x", "4x", "8x"],
+        ).pack(side=tk.LEFT)
+
+        ttk.Button(bb_top, text="Play", command=self.bb_play).pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Button(bb_top, text="Pause", command=self.bb_pause).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bb_top, text="Stop", command=self.bb_stop).pack(side=tk.LEFT, padx=2)
+
+        bb_scrub_row = ttk.Frame(bb_box)
+        bb_scrub_row.pack(fill=tk.X, padx=8, pady=(0, 4))
+        self.bb_scrub_scale = ttk.Scale(bb_scrub_row, from_=0, to=0, orient=tk.HORIZONTAL, command=self._on_bb_scrub)
+        self.bb_scrub_scale.pack(fill=tk.X, expand=True, side=tk.LEFT)
+        ttk.Label(bb_scrub_row, textvariable=self.bb_progress_var, width=34, anchor="e").pack(side=tk.LEFT, padx=(8, 0))
+
+        bb_readout = ttk.Frame(bb_box)
+        bb_readout.pack(fill=tk.X, padx=8, pady=(0, 8))
+        ttk.Label(bb_readout, text="Setpoint R/P/Y (dps):").pack(side=tk.LEFT)
+        ttk.Label(bb_readout, textvariable=self.bb_setpoint_roll_var, width=7).pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Label(bb_readout, textvariable=self.bb_setpoint_pitch_var, width=7).pack(side=tk.LEFT, padx=2)
+        ttk.Label(bb_readout, textvariable=self.bb_setpoint_yaw_var, width=7).pack(side=tk.LEFT, padx=(2, 16))
+        ttk.Label(bb_readout, text="PID out R/P/Y (us):").pack(side=tk.LEFT)
+        ttk.Label(bb_readout, textvariable=self.bb_pid_roll_var, width=6).pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Label(bb_readout, textvariable=self.bb_pid_pitch_var, width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Label(bb_readout, textvariable=self.bb_pid_yaw_var, width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Label(
+            bb_readout,
+            text="(reuses the Gyro/Motor strip charts above; no accel/angle data in the SD log)",
+            foreground="#9aa6b2",
+        ).pack(side=tk.LEFT, padx=(16, 0))
+
         log_box = ttk.LabelFrame(body, text="Raw Link Log")
         log_box.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
 
@@ -493,6 +737,164 @@ class Kh7GroundGui:
 
         self.scale.set(self.pulse_var.get())
         self._on_transport_changed()
+
+    def bb_load_log(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Load blackbox raw dump (tools/sdlog_analyze.py --save-raw output)",
+            filetypes=[("Raw SDLOG dump", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "r", encoding="ascii", errors="replace") as f:
+                text = f.read()
+            records = _bb_parse_records(text)
+            flights = _bb_segment_flights(records)
+        except Exception as exc:
+            messagebox.showerror("Load failed", str(exc))
+            return
+
+        if not records or not flights:
+            messagebox.showerror("Load failed", "No SDLOG[...] records found in that file.")
+            return
+
+        self.bb_stop()
+        self.bb_records = records
+        self.bb_flights = flights
+
+        labels = []
+        for i, (start, end) in enumerate(flights):
+            sub = records[start:end]
+            duration_s = (sub[-1]["time_ms"] - sub[0]["time_ms"]) / 1000.0
+            labels.append(f"Flight {i} ({len(sub)} samples, {duration_s:.1f}s)")
+        self.bb_flight_combo["values"] = labels
+        self.bb_flight_combo.current(len(flights) - 1)
+        self.bb_select_flight(len(flights) - 1)
+        self.event_var.set(f"Loaded {len(flights)} flight(s) from {Path(path).name}")
+
+    def bb_on_flight_selected(self, _event=None) -> None:
+        idx = self.bb_flight_combo.current()
+        if idx >= 0:
+            self.bb_select_flight(idx)
+
+    def bb_select_flight(self, idx: int) -> None:
+        self.bb_stop()
+        start, end = self.bb_flights[idx]
+        self.bb_selected_flight_records = self.bb_records[start:end]
+        self.bb_play_index = 0
+        n = max(len(self.bb_selected_flight_records) - 1, 0)
+        self.bb_scrub_scale.configure(to=n)
+        self._bb_render_frame(0)
+
+    def _bb_set_scrub(self, index: int) -> None:
+        self.bb_ignore_scrub_event = True
+        try:
+            self.bb_scrub_scale.set(index)
+        finally:
+            self.bb_ignore_scrub_event = False
+
+    def bb_play(self) -> None:
+        if not self.bb_selected_flight_records:
+            messagebox.showerror("No flight", "Load a blackbox log and select a flight first.")
+            return
+
+        if self.bb_play_index >= len(self.bb_selected_flight_records) - 1:
+            self.bb_play_index = 0
+
+        self.bb_playing = True
+        self._bb_schedule_next()
+
+    def bb_pause(self) -> None:
+        self.bb_playing = False
+        if self.bb_after_id is not None:
+            self.root.after_cancel(self.bb_after_id)
+            self.bb_after_id = None
+
+    def bb_stop(self) -> None:
+        self.bb_pause()
+        self.bb_play_index = 0
+        if self.bb_selected_flight_records:
+            self._bb_render_frame(0)
+
+    def _bb_speed_multiplier(self) -> float:
+        try:
+            return max(float(self.bb_speed_var.get().rstrip("xX")), 0.05)
+        except ValueError:
+            return 1.0
+
+    def _bb_schedule_next(self) -> None:
+        if not self.bb_playing:
+            return
+
+        records = self.bb_selected_flight_records
+        self._bb_render_frame(self.bb_play_index)
+
+        if self.bb_play_index >= len(records) - 1:
+            self.bb_playing = False
+            self.event_var.set("Blackbox playback finished")
+            return
+
+        dt_ms = max(records[self.bb_play_index + 1]["time_ms"] - records[self.bb_play_index]["time_ms"], 0)
+        delay_ms = int(max(5, min(250, dt_ms / self._bb_speed_multiplier())))
+        self.bb_play_index += 1
+        self.bb_after_id = self.root.after(delay_ms, self._bb_schedule_next)
+
+    def _bb_render_frame(self, index: int) -> None:
+        records = self.bb_selected_flight_records
+        if not records or index >= len(records):
+            return
+        r = records[index]
+
+        self._bb_set_scrub(index)
+
+        t_s = (r["time_ms"] - records[0]["time_ms"]) / 1000.0
+        total_s = (records[-1]["time_ms"] - records[0]["time_ms"]) / 1000.0
+        self.bb_progress_var.set(f"{t_s:6.2f}s / {total_s:6.2f}s (sample {index + 1}/{len(records)})")
+
+        gx = r["gyro_roll_dps_x10"] / 10.0
+        gy = r["gyro_pitch_dps_x10"] / 10.0
+        gz = r["gyro_yaw_dps_x10"] / 10.0
+        self.gx_var.set(f"{gx:.1f}")
+        self.gy_var.set(f"{gy:.1f}")
+        self.gz_var.set(f"{gz:.1f}")
+        self._append_samples([("gyro_x", gx), ("gyro_y", gy), ("gyro_z", gz)])
+        self._redraw_strip_chart("gyro")
+
+        self.bb_setpoint_roll_var.set(f"{r['setpoint_roll_dps']:.1f}")
+        self.bb_setpoint_pitch_var.set(f"{r['setpoint_pitch_dps']:.1f}")
+        self.bb_setpoint_yaw_var.set(f"{r['setpoint_yaw_dps']:.1f}")
+        self.bb_pid_roll_var.set(str(r["pid_roll_us"]))
+        self.bb_pid_pitch_var.set(str(r["pid_pitch_us"]))
+        self.bb_pid_yaw_var.set(str(r["pid_yaw_us"]))
+
+        self.motor_outputs[1] = r["motor_fl_us"]
+        self.motor_outputs[2] = r["motor_fr_us"]
+        self.motor_outputs[3] = r["motor_rr_us"]
+        self.motor_outputs[4] = r["motor_rl_us"]
+        self._append_samples([
+            ("motor_1", float(self.motor_outputs[1])),
+            ("motor_2", float(self.motor_outputs[2])),
+            ("motor_3", float(self.motor_outputs[3])),
+            ("motor_4", float(self.motor_outputs[4])),
+        ])
+        self._refresh_motor_map()
+        self._redraw_strip_chart("motors")
+
+        battery_v = r["battery_decivolts"] / 10.0
+        armed = r["flags"] & 0x01
+        mode_name = BB_FLIGHT_MODE_NAMES.get((r["flags"] >> 1) & 0x03, "?")
+        self.battery_var.set(f"Battery: {battery_v:.2f} V (BB)")
+        self.mode_var.set(f"Mode: {mode_name} (BB {'ARMED' if armed else 'disarmed'})")
+
+    def _on_bb_scrub(self, value: str) -> None:
+        if self.bb_ignore_scrub_event or not self.bb_selected_flight_records:
+            return
+
+        self.bb_pause()
+        index = max(0, min(int(float(value)), len(self.bb_selected_flight_records) - 1))
+        self.bb_play_index = index
+        self._bb_render_frame(index)
 
     def clear_log(self) -> None:
         if self.log_text is None:
@@ -619,6 +1021,10 @@ class Kh7GroundGui:
         ttk.Label(parent, textvariable=v2, width=10).grid(row=row, column=3, sticky="w", padx=(0, 12), pady=4)
         ttk.Label(parent, text=l3).grid(row=row, column=4, sticky="w", padx=(0, 4), pady=4)
         ttk.Label(parent, textvariable=v3, width=10).grid(row=row, column=5, sticky="w", padx=(0, 10), pady=4)
+
+    def _sensor_metric(self, parent: ttk.LabelFrame, row: int, col: int, label: str, var: tk.StringVar) -> None:
+        ttk.Label(parent, text=label).grid(row=row, column=col, sticky="w", padx=(10, 4), pady=2)
+        ttk.Label(parent, textvariable=var, width=8).grid(row=row, column=col + 1, sticky="w", padx=(0, 8), pady=2)
 
     def _init_motor_map(self) -> None:
         self.motor_canvas.delete("all")
@@ -1135,6 +1541,8 @@ class Kh7GroundGui:
         self._redraw_strip_chart("accels")
         self._redraw_strip_chart("gyro")
         self._redraw_strip_chart("motors")
+        self._redraw_strip_chart("baro")
+        self._redraw_strip_chart("mag")
         try:
             self._draw_pose_canvas(float(self.yaw_var.get()), float(self.pitch_var.get()), float(self.roll_var.get()))
         except Exception:
@@ -1238,38 +1646,80 @@ class Kh7GroundGui:
         if self.tcp_socket is not None:
             return True
 
+        if self.wifi_connecting:
+            return False
+
+        # DNS resolution for hostnames like kh7bridge.local can take seconds
+        # (Windows mDNS lookups especially) and socket timeout= only bounds the
+        # connect() step, not getaddrinfo() - so this always runs off the main
+        # thread to avoid freezing the whole GUI (charts included) while waiting.
+        self.wifi_connecting = True
+        self.connected_var.set(f"Connecting to {host}:{port}...")
+
+        def _do_connect() -> None:
+            try:
+                sock = socket.create_connection((host, port), timeout=3.0)
+                self.wifi_connect_queue.put(("ok", sock, host, port))
+            except OSError as exc:
+                self.wifi_connect_queue.put(("error", exc, host, port))
+
+        threading.Thread(target=_do_connect, daemon=True).start()
+        self._poll_wifi_connect_result(show_errors)
+        return False
+
+    def _poll_wifi_connect_result(self, show_errors: bool) -> None:
         try:
-            sock = socket.create_connection((host, port), timeout=1.0)
-            sock.setblocking(False)
-            self.tcp_socket = sock
-            self.tcp_rx_buffer = bytearray()
-            peer_ip, peer_port = sock.getpeername()
-            self.connected_var.set(f"Connected Wi-Fi: {host}:{port}")
-            self.bridge_ip_var.set(f"Bridge IP: {peer_ip}:{peer_port}")
-            self.bridge_status_lines = []
-            self.bridge_status_var.set("Bridge status: waiting for bridge lines...")
-            self.event_var.set(f"Connected to {host}:{port}")
-            self._reset_pid_health()
-            self.pid_received_once = False
-            return True
-        except OSError as exc:
+            status, payload, host, port = self.wifi_connect_queue.get_nowait()
+        except queue.Empty:
+            self.root.after(100, lambda: self._poll_wifi_connect_result(show_errors))
+            return
+
+        self.wifi_connecting = False
+
+        if status == "error":
+            exc = payload
             self.connected_var.set(f"Waiting for {host}:{port}...")
             if show_errors:
                 messagebox.showerror("Wi-Fi connect failed", str(exc))
-            return False
+            return
+
+        sock = payload
+        # A stale/duplicate result: already connected another way, or the user
+        # switched transport away from Wi-Fi while this connect was in flight.
+        if self.tcp_socket is not None or self.transport_var.get() != "Wi-Fi":
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return
+
+        sock.setblocking(False)
+        self.tcp_socket = sock
+        self.tcp_rx_buffer = bytearray()
+        peer_ip, peer_port = sock.getpeername()
+        self.connected_var.set(f"Connected Wi-Fi: {host}:{port}")
+        self.bridge_ip_var.set(f"Bridge IP: {peer_ip}:{peer_port}")
+        self.bridge_status_lines = []
+        self.bridge_status_var.set("Bridge status: waiting for bridge lines...")
+        self.event_var.set(f"Connected to {host}:{port}")
+        self._reset_pid_health()
+        self.pid_received_once = False
+        self.start_pid_sync()
+        self.att_read()
 
     def connect(self, show_errors: bool = True) -> bool:
-        connected = False
         if self.transport_var.get() == "USB":
             connected = self._connect_usb(show_errors)
-        else:
-            connected = self._connect_wifi(show_errors)
+            if connected:
+                self.start_pid_sync()
+                self.att_read()
+            return connected
 
-        if connected:
-            self.start_pid_sync()
-            self.att_read()
+        if self.tcp_socket is not None:
+            return True
 
-        return connected
+        self._connect_wifi(show_errors)
+        return False
 
     def start_pid_sync(self) -> None:
         self.pid_received_once = False
@@ -1340,6 +1790,7 @@ class Kh7GroundGui:
         self.serial_port = None
         self.tcp_socket = None
         self.tcp_rx_buffer = bytearray()
+        self.wifi_connecting = False
         self.pid_received_once = False
         self.pid_sync_retries_left = 0
         self._cancel_att_verify()
@@ -1443,13 +1894,17 @@ class Kh7GroundGui:
             mode_name = m_mode.group(1)
             mode_ch6 = int(m_mode.group(2))
             self.mode_var.set(f"Mode: {mode_name} (ch6 {mode_ch6})")
-            if mode_name in ("RATE", "ATTITUDE") and mode_name != self.current_tuning_mode:
-                self.current_tuning_mode = mode_name
-                self._apply_right_panel_visibility()
-                if mode_name == "ATTITUDE":
-                    self.att_read()
-                else:
-                    self.pid_read()
+            if mode_name in ("RATE", "ATTITUDE", "ALTHOLD"):
+                # ALTHOLD reuses the same self-level angle gains as ATTITUDE, so
+                # it shares that tuning panel while still showing its own name above.
+                tuning_mode = "ATTITUDE" if mode_name == "ALTHOLD" else mode_name
+                if tuning_mode != self.current_tuning_mode:
+                    self.current_tuning_mode = tuning_mode
+                    self._apply_right_panel_visibility()
+                    if tuning_mode == "ATTITUDE":
+                        self.att_read()
+                    else:
+                        self.pid_read()
             self.event_var.set(line)
             return
 
@@ -1529,6 +1984,106 @@ class Kh7GroundGui:
         if m_vbat is not None:
             battery_mv = int(m_vbat.group(1))
             self.battery_var.set(f"Battery: {battery_mv / 1000.0:.2f} V")
+            return
+
+        m_baro = BARO_LINE_RE.search(line)
+        if m_baro is not None:
+            healthy = int(m_baro.group(1))
+            alt_m = int(m_baro.group(2)) / 100.0
+            vz_mps = int(m_baro.group(3)) / 100.0
+            self.baro_alt_var.set(f"{alt_m:.2f}")
+            self.baro_vz_var.set(f"{vz_mps:.2f}")
+            self.baro_health_var.set("OK" if healthy != 0 else "NOT READY")
+            self._append_samples([
+                ("baro_alt", alt_m),
+                ("baro_vz", vz_mps),
+            ])
+            self._redraw_strip_chart("baro")
+            return
+
+        m_baro_init = BARO_INIT_LINE_RE.search(line)
+        if m_baro_init is not None:
+            if m_baro_init.group(1) == "OK":
+                self.baro_init_var.set(f"Baro init: OK, detected at I2C addr 0x{m_baro_init.group(2)}")
+            else:
+                self.baro_init_var.set(f"Baro init: FAIL, no ACK/wrong chip (last chip_id read=0x{m_baro_init.group(4)})")
+            return
+
+        m_gps = GPS_LINE_RE.search(line)
+        if m_gps is not None:
+            configured = int(m_gps.group(1))
+            healthy = int(m_gps.group(2))
+            fix_type = int(m_gps.group(3))
+            num_sv = int(m_gps.group(4))
+            lat_deg = float(m_gps.group(5))
+            lon_deg = float(m_gps.group(6))
+            alt_m = float(m_gps.group(7))
+
+            fix_names = {0: "No fix", 1: "Dead reckoning", 2: "2D", 3: "3D", 4: "GNSS+DR", 5: "Time only"}
+            self.gps_fix_var.set(fix_names.get(fix_type, str(fix_type)))
+            self.gps_sats_var.set(str(num_sv))
+            if healthy != 0:
+                self.gps_health_var.set("OK")
+            elif configured != 0:
+                self.gps_health_var.set("NO COMMS")
+            else:
+                self.gps_health_var.set("NOT READY")
+            self.gps_pos_var.set(f"GPS: lat={lat_deg:.7f} lon={lon_deg:.7f} alt={alt_m:.2f} m")
+            # This periodic line's "configured" field is the LIVE config state, unlike
+            # the one-time GPS_INIT[...] boot message below - refresh it here so a
+            # later successful retry (or a retry the GUI simply missed) isn't left
+            # showing a stale FAIL from the very first boot-time attempt.
+            if configured != 0:
+                self.gps_init_var.set("GPS init: OK (UBX config ACKed)")
+            return
+
+        m_gps_init = GPS_INIT_LINE_RE.search(line)
+        if m_gps_init is not None:
+            if m_gps_init.group(1) == "OK":
+                self.gps_init_var.set("GPS init: OK (UBX config ACKed)")
+            else:
+                prt_ack = m_gps_init.group(3)
+                msg_ack = m_gps_init.group(4)
+                self.gps_init_var.set(
+                    f"GPS init: FAIL (prt_ack={prt_ack} msg_ack={msg_ack})"
+                )
+            return
+
+        m_mag = MAG_LINE_RE.search(line)
+        if m_mag is not None:
+            healthy = int(m_mag.group(1))
+            heading_deg = int(m_mag.group(2)) / 10.0
+            self.mag_health_var.set("OK" if healthy != 0 else "NOT READY")
+            self.mag_heading_var.set(f"{heading_deg:.1f}")
+            self._append_samples([("mag_heading", heading_deg)])
+            self._redraw_strip_chart("mag")
+            return
+
+        m_mag_init = MAG_INIT_LINE_RE.search(line)
+        if m_mag_init is not None:
+            if m_mag_init.group(1) == "OK":
+                self.mag_init_var.set(f"Mag init: OK, chip_id=0x{m_mag_init.group(2)}")
+            else:
+                self.mag_init_var.set(f"Mag init: FAIL, no ACK/wrong chip (last chip_id read=0x{m_mag_init.group(2)})")
+            return
+
+        if MAG_CAL_STARTED_RE.search(line) is not None:
+            self.mag_cal_status_var.set("Rotating... slowly spin 360 deg flat, then click Stop & Save")
+            return
+
+        m_mag_cal_ok = MAG_CAL_OK_RE.search(line)
+        if m_mag_cal_ok is not None:
+            ox, oy, sx, sy = m_mag_cal_ok.groups()
+            self.mag_cal_status_var.set(f"Calibrated OK (offset={ox},{oy} scale={sx},{sy})")
+            self.mag_cal_active = False
+            self.mag_cal_button.configure(text="Calibrate")
+            return
+
+        m_mag_cal_fail = MAG_CAL_FAIL_RE.search(line)
+        if m_mag_cal_fail is not None:
+            self.mag_cal_status_var.set(f"Calibration FAILED{m_mag_cal_fail.group(1)}")
+            self.mag_cal_active = False
+            self.mag_cal_button.configure(text="Calibrate")
             return
 
         m_imu = IMU_LINE_RE.search(line)
@@ -1772,6 +2327,18 @@ class Kh7GroundGui:
     def att_read(self) -> None:
         self.send_command("ATT GET")
 
+    def mag_cal_toggle(self) -> None:
+        if not self.mag_cal_active:
+            self.send_command("MAG CAL START")
+            self.mag_cal_active = True
+            self.mag_cal_button.configure(text="Stop & Save")
+            self.mag_cal_status_var.set("Cal starting...")
+        else:
+            self.send_command("MAG CAL STOP")
+            self.mag_cal_active = False
+            self.mag_cal_button.configure(text="Calibrate")
+            self.mag_cal_status_var.set("Stopping, computing...")
+
     def pid_apply(self) -> None:
         values = self._pid_values_from_ui()
         if values is None:
@@ -1836,6 +2403,7 @@ class Kh7GroundGui:
 
     def shutdown(self) -> None:
         self._save_ui_state()
+        self.bb_pause()
         self.disconnect()
 
 

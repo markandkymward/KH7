@@ -23,6 +23,7 @@ extern SPI_HandleTypeDef hspi1;
 
 static uint8_t g_sd_initialized = 0U;
 static uint8_t g_sd_high_capacity = 0U;
+static uint32_t g_sd_write_busy_start_ms = 0U;
 
 static void SD_GpioInit(void)
 {
@@ -283,15 +284,13 @@ SD_Status SD_ReadBlock(uint32_t block_addr, uint8_t *buf512)
   return SD_OK;
 }
 
-SD_Status SD_WriteBlock(uint32_t block_addr, const uint8_t *buf512)
+SD_Status SD_WriteBlockBegin(uint32_t block_addr, const uint8_t *buf512)
 {
   uint8_t r1;
   uint32_t addr;
   uint8_t token = 0xFEU;
   uint8_t crc[2] = { 0xFFU, 0xFFU };
   uint8_t resp = 0xFFU;
-  uint8_t busy = 0x00U;
-  uint32_t start_ms;
 
   if (g_sd_initialized == 0U)
   {
@@ -319,18 +318,46 @@ SD_Status SD_WriteBlock(uint32_t block_addr, const uint8_t *buf512)
     return SD_ERR_CMD;
   }
 
-  start_ms = HAL_GetTick();
+  /* CS stays asserted here - caller must poll SD_WriteBlockPoll() until done. */
+  g_sd_write_busy_start_ms = HAL_GetTick();
+  return SD_OK;
+}
+
+int8_t SD_WriteBlockPoll(void)
+{
+  uint8_t busy = 0x00U;
+
+  SD_SpiTxRx(NULL, &busy, 1U);
+  if (busy == 0xFFU)
+  {
+    SD_Deselect();
+    return 0;
+  }
+  if ((HAL_GetTick() - g_sd_write_busy_start_ms) >= SD_WRITE_TIMEOUT_MS)
+  {
+    SD_Deselect();
+    return 1;
+  }
+  return -1;
+}
+
+SD_Status SD_WriteBlock(uint32_t block_addr, const uint8_t *buf512)
+{
+  SD_Status st;
+  int8_t poll;
+
+  st = SD_WriteBlockBegin(block_addr, buf512);
+  if (st != SD_OK)
+  {
+    return st;
+  }
+
   do
   {
-    SD_SpiTxRx(NULL, &busy, 1U);
-    if (busy == 0xFFU)
-    {
-      break;
-    }
-  } while ((HAL_GetTick() - start_ms) < SD_WRITE_TIMEOUT_MS);
+    poll = SD_WriteBlockPoll();
+  } while (poll < 0);
 
-  SD_Deselect();
-  return (busy == 0xFFU) ? SD_OK : SD_ERR_TIMEOUT;
+  return (poll == 0) ? SD_OK : SD_ERR_TIMEOUT;
 }
 
 uint8_t SD_IsInitialized(void)

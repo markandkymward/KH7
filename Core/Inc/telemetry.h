@@ -39,6 +39,19 @@ void Telemetry_PrintRatePid(const App_RatePidGains_t *gains, const char *source)
 void Telemetry_PrintFlightMode(const char *mode_name, uint16_t mode_us);
 void Telemetry_PrintAngles(float pitch_deg, float roll_deg, float yaw_deg);
 void Telemetry_PrintBatteryState(float battery_voltage_v, uint32_t adc_raw);
+void Telemetry_PrintBaroState(float altitude_m, float climb_rate_mps, uint8_t healthy);
+void Telemetry_PrintGpsState(uint8_t configured,
+							 uint8_t healthy,
+							 uint8_t fix_type,
+							 uint8_t num_sv,
+							 float lat_deg,
+							 float lon_deg,
+							 float alt_m);
+void Telemetry_PrintMagState(uint8_t healthy,
+							 float x_g,
+							 float y_g,
+							 float z_g,
+							 float heading_deg);
 
 #ifdef __cplusplus
 }

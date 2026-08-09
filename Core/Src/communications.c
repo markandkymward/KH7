@@ -119,6 +119,10 @@ static uint8_t Communications_IsUart6AutoExecutableCommand(const char *line, siz
   if ((strcmp(normalized, "PID GET") == 0) ||
       (strcmp(normalized, "ATT GET") == 0) ||
       (strcmp(normalized, "ATT DEFAULT") == 0) ||
+      (strcmp(normalized, "ATT ZERO") == 0) ||
+      (strcmp(normalized, "MAG CAL START") == 0) ||
+      (strcmp(normalized, "MAG CAL STOP") == 0) ||
+      (strcmp(normalized, "SDLOG ERASE") == 0) ||
       (strcmp(normalized, "PID DEFAULT") == 0) ||
       (strcmp(normalized, "PID SAVE") == 0) ||
       (strcmp(normalized, "PID LOAD") == 0) ||

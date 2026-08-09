@@ -1,5 +1,6 @@
 #include "receiver.h"
 #include "communications.h"
+#include "gps.h"
 #include "app.h"
 
 #include "main.h"
@@ -12,6 +13,7 @@
 #define CRSF_FRAME_TYPE_RC_CHANNELS    0x16U
 #define CRSF_RC_PAYLOAD_SIZE           22U
 #define CRSF_LINK_TIMEOUT_MS           250U
+#define CRSF_ADDRESS_FLIGHT_CONTROLLER 0xC8U
 
 typedef struct
 {
@@ -116,6 +118,16 @@ static void Receiver_HandleByte(uint8_t byte)
 {
   if (g_parser.index == 0U)
   {
+    /* A dropped/corrupted byte anywhere upstream can desync this parser -
+     * without checking for the real frame-start address here, a single lost
+     * byte can leave it misaligned for multiple subsequent frames (each one
+     * only self-corrects by chance + a CRC failure), showing up as a
+     * "spotty" link that isn't actually an RF problem. Discard anything that
+     * isn't a real frame start and keep scanning for it. */
+    if (byte != CRSF_ADDRESS_FLIGHT_CONTROLLER)
+    {
+      return;
+    }
     g_parser.frame[g_parser.index++] = byte;
     return;
   }
@@ -203,6 +215,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     Communications_HandleUart6Byte(g_uart6_bridge_byte);
     (void)HAL_UART_Receive_IT(huart, &g_uart6_bridge_byte, 1U);
   }
+  else if (huart->Instance == USART3)
+  {
+    GPS_UartRxCpltCallback();
+  }
 }
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
@@ -217,5 +233,9 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   {
     (void)HAL_UART_AbortReceive(huart);
     (void)HAL_UART_Receive_IT(huart, &g_uart6_bridge_byte, 1U);
+  }
+  else if (huart->Instance == USART3)
+  {
+    GPS_UartErrorCallback();
   }
 }

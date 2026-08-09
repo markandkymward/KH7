@@ -7,6 +7,9 @@
 
 #include "attitude.h"
 #include "imu.h"
+#include "baro.h"
+#include "gps.h"
+#include "mag.h"
 #include "motors.h"
 #include "communications.h"
 #include "receiver.h"
@@ -21,6 +24,9 @@
 #define APP_ENABLE_ARM_RUNTIME_TELEMETRY 0U
 #define APP_ENABLE_RECEIVER_RUNTIME_TELEMETRY 0U
 #define APP_ENABLE_ANGLE_TELEMETRY 0U
+/* USB motor-test (bench, ground-only) mode always streams IMU state for motor_test_gui.py,
+ * independent of APP_ENABLE_IMU_RUNTIME_TELEMETRY which stays off for real armed flight. */
+#define APP_ENABLE_USB_TEST_IMU_TELEMETRY 1U
 #define APP_CH_ROLL_INDEX      0U
 #define APP_CH_PITCH_INDEX     1U
 #define APP_CH_THROTTLE_INDEX  2U
@@ -28,6 +34,12 @@
 #define APP_CH_ARM_INDEX       4U
 #define APP_CH_MODE_INDEX      5U
 #define APP_ARM_THRESHOLD_US   1500U
+/* A single corrupted/noisy CRSF frame can momentarily report the arm channel
+ * or link as bad for just one control-loop iteration - require the disarm
+ * condition to persist this long before actually disarming, so a real
+ * intentional disarm (held stick/switch, real link loss) is unaffected while
+ * a one-frame glitch is filtered out. */
+#define APP_DISARM_DEBOUNCE_MS 60U
 #define APP_THROTTLE_LOW_US    1100U
 #define APP_ARM_HOLD_MS        300U
 #define APP_BEEPER_TOGGLE_MS   150U
@@ -39,12 +51,82 @@
 #define APP_ARM_TELEMETRY_MS    150U
 #define APP_RX16_TELEMETRY_MS   120U
 #define APP_LOW_THROTTLE_MIX_DISABLE_US 40U
+/* Ease attitude/yaw correction in over this many ms after crossing the low-throttle
+ * gate, instead of releasing full authority in one step - smooths a liftoff bounce
+ * when the airframe was resting tilted (e.g. uneven ground) right before takeoff. */
+#define APP_LIFTOFF_RAMP_MS     250U
 #define APP_CONTROL_DEADBAND_US 20U
 #define APP_MOTOR_IDLE_US      1080U
+#define APP_BARO_UPDATE_MS     20U
+#define APP_BARO_RETRY_MS      1000U
+#define APP_GPS_RETRY_MS       3000U
+#define APP_MAG_UPDATE_MS      50U
+#define APP_MAG_RETRY_MS       1000U
+/* Subtracts a term proportional to baro-derived climb rate from throttle to damp
+ * Z-axis bounce/sensitivity. Conservative starting gain now that the SPA06 (SPL07-003)
+ * baro is confirmed detected/healthy on hardware; hard-clamped to +-APP_BARO_VZ_DAMP_LIMIT_US
+ * and only applied while Baro_IsHealthy() - re-tune upward only after a hover confirms the
+ * signal is low-noise/low-latency enough to not fight stick throttle inputs. */
+#define APP_BARO_VZ_DAMP_GAIN_US_PER_MPS 15.0f
+#define APP_BARO_VZ_DAMP_LIMIT_US        60U
+/* Ground effect/propwash makes baro pressure very noisy within about a meter of the
+ * ground, which otherwise makes the Vz damping term above rapidly flip sign/saturate
+ * right at liftoff (audible motor thrust jitter) - suppress it until climbed clear. */
+#define APP_BARO_VZ_DAMP_MIN_ALT_M       1.0f
+/* ALTHOLD reuses ATTITUDE-mode roll/pitch/yaw angle stabilization. The pilot's raw
+ * stick throttle is ALWAYS the primary/dominant throttle signal (exactly like
+ * ATTITUDE mode) - ALTHOLD only ever ADDS a small bounded trim on top of it while
+ * the stick sits near center, to hold the altitude captured the instant it
+ * re-centers. Away from center the trim is zeroed and the pilot has full, direct
+ * manual throttle authority. This bounded-trim design means a bad baro reading or a
+ * wound-up integral can only ever nudge the output by APP_ALTHOLD_TRIM_LIMIT_US - it
+ * can never freeze the motors at idle or run away independent of the stick. Falls
+ * back to plain manual throttle (like ATTITUDE mode) if the baro is unhealthy. */
+#define APP_ALTHOLD_THROTTLE_DEADBAND_US   40U
+/* The hold-throttle reference re-latches to wherever the stick has genuinely
+ * settled (within this small window) for this long - NOT just once at mode
+ * entry (which can freeze on an unrepresentative value, e.g. idle throttle
+ * before liftoff) and NOT every single non-holding iteration (which would
+ * re-latch mid-movement, since consecutive samples of a smoothly-moving stick
+ * are often within a small window of each other). */
+#define APP_ALTHOLD_STICK_STABLE_WINDOW_US 15U
+#define APP_ALTHOLD_STICK_SETTLE_MS        300U
+#define APP_ALTHOLD_MAX_CLIMB_MPS           2.0f
+#define APP_ALTHOLD_ALT_HOLD_KP_MPS_PER_M   0.8f
+#define APP_ALTHOLD_VZ_KP_US_PER_MPS        25.0f
+#define APP_ALTHOLD_VZ_KI_US_PER_MPS_S       8.0f
+#define APP_ALTHOLD_INTEGRAL_LIMIT_US      200U
+/* Smooths the final trim output itself (not the P/I gains) - climb-rate error is
+ * fed straight from the baro, and even with the baro's own onboard LPF, real
+ * sensor/vibration noise translated directly into trim was making the motors
+ * respond jerkily on the Z axis. A slow-ish cutoff is fine since altitude
+ * corrections are inherently a slow process. */
+#define APP_ALTHOLD_TRIM_LPF_HZ             1.5f
+#define APP_ALTHOLD_TRIM_LIMIT_US          250U
 #define APP_ROLL_SIGN          (1)
 #define APP_PITCH_SIGN         (-1)
 #define APP_YAW_SIGN           (1)
 #define APP_GYRO_YAW_SIGN      (-1)
+/* Slow, bounded drift correction only - nudges the gyro-integrated yaw toward the
+ * compass's own "rotation since boot" delta (NOT toward absolute magnetic north,
+ * so boot heading stays 0 like today). Deliberately NOT a full 9-DOF Mahony fusion
+ * (higher risk given this codebase's AHRS bug history) - just corrects long-term
+ * free-drift, same role as the existing gyro bias learning above.
+ * RE-ENABLED (2026-08-09) after the GPS/compass module was physically relocated
+ * further from motors/ESCs/power wiring to address the motor-current interference
+ * that caused this to be disabled earlier the same day (100+ deg apparent
+ * rotation while holding heading). Re-check compass-vs-yaw tracking error on the
+ * next flight before trusting this - if interference is still significant,
+ * disable again (set kp back to 0.0f) rather than re-tune the field-strength gate
+ * further blind. */
+#define APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG 0.05f
+#define APP_MAG_YAW_NUDGE_MAX_DPS        2.0f
+/* Motor/ESC current is a well-known source of magnetic interference that can
+ * swing the compass heading by 100+ degrees at flight throttle even though
+ * nothing physically rotated - trust the heading only while the total field
+ * STRENGTH still looks like the undisturbed reference sample; a real magnetic
+ * disturbance changes magnitude as well as direction, unlike a real yaw turn. */
+#define APP_MAG_TRUST_MAX_MAG_DEVIATION_FRAC 0.35f
 /* These express each filter's intended cutoff directly; the alpha applied each iteration is
  * derived from the actual measured dt_s (see App_LpfAlpha()) instead of assuming a fixed
  * APP_CONTROL_LOOP_MS sample time, since the real loop period varies well beyond 2ms under load. */
@@ -56,6 +138,8 @@
                                         * Lowered from ~29Hz: higher Kff was overshooting on fast
                                         * stick edges before this got smoothed out. */
 #define APP_MODE_SWITCH_THRESHOLD_US 1500U
+/* Ch6 3-position switch: <1500=RATE, 1500-1799=ATTITUDE, >=1800=ALTHOLD. */
+#define APP_ALTHOLD_SWITCH_THRESHOLD_US 1800U
 #define APP_ATTITUDE_MAX_ANGLE_DEG   35.0f
 #define APP_ATTITUDE_ANGLE_KP_DPS_PER_DEG 5.0f
 #define APP_ATTITUDE_KP_MIN_DPS_PER_DEG 0.2f
@@ -123,11 +207,13 @@
 static volatile uint8_t g_usb_motor_test_enabled = 0U;
 static volatile uint8_t g_usb_motor_test_motor_index = 1U;
 static volatile uint16_t g_usb_motor_test_pulse_us = 1100U;
+static volatile uint8_t g_attitude_zero_request = 0U;
 
 typedef enum
 {
   APP_FLIGHT_MODE_RATE = 0U,
   APP_FLIGHT_MODE_ATTITUDE = 1U,
+  APP_FLIGHT_MODE_ALTHOLD = 2U,
 } App_FlightMode_t;
 
 typedef enum
@@ -214,6 +300,15 @@ static volatile App_RatePidGains_t g_pid_command_gains;
 static volatile App_AttitudeGains_t g_attitude_command_gains;
 static volatile uint32_t g_pid_command_queued_count = 0U;
 static volatile uint32_t g_pid_command_handled_count = 0U;
+
+typedef enum
+{
+  APP_MAG_CAL_CMD_NONE = 0,
+  APP_MAG_CAL_CMD_START = 1,
+  APP_MAG_CAL_CMD_STOP = 2,
+} App_MagCalCommand_t;
+
+static volatile App_MagCalCommand_t g_mag_cal_command = APP_MAG_CAL_CMD_NONE;
 
 static uint8_t g_boot_log_pending = 1U;
 static uint8_t g_boot_pid_loaded = 0U;
@@ -351,15 +446,18 @@ static void App_ServiceSdCommands(void)
  * later with tools/sdlog_analyze.py. Block 0 is a small superblock holding
  * the next free data block, so each flight (and each reboot) appends after
  * the last one instead of overwriting it. Records are buffered one SD block
- * (16 records) at a time and flushed with a single SD_WriteBlock() call -
- * logging is decimated to APP_SDLOG_DECIMATION so that blocking SD write
- * (a few ms typical, occasionally longer on cheap cards) happens rarely
- * enough to keep control-loop jitter negligible. */
+ * (16 records) at a time; a full block is handed off to SD_WriteBlockBegin()
+ * and polled asynchronously via App_SdLogServiceWrite() (see below) so the
+ * card's internal flash-program time - measured up to ~65ms on this card,
+ * previously a real control-loop stall that showed up as uncommanded-looking
+ * attitude transients in flight logs - no longer blocks App_Update(). */
 #define APP_SDLOG_MAGIC 0x4B484C47UL /* "KHLG" */
 #define APP_SDLOG_DECIMATION 4U /* every 4th 2ms control tick -> 125Hz log rate */
 #define APP_SDLOG_FLAG_ARMED 0x01U
 #define APP_SDLOG_FLAG_MODE_SHIFT 1U
 #define APP_SDLOG_FLAG_MODE_MASK 0x06U
+#define APP_SDLOG_FLAG_LINK_ACTIVE 0x08U /* receiver_state.link_active, to tell a switch glitch apart from an RF link dropout */
+#define APP_SDLOG_FLAG_MAG_HEALTHY 0x10U
 
 /* Fixed 32-byte little-endian record (matches tools/sdlog_analyze.py's struct format). */
 typedef struct __attribute__((packed))
@@ -380,6 +478,17 @@ typedef struct __attribute__((packed))
   uint16_t motor_rl_us;
   uint8_t battery_decivolts;
   uint8_t flags;
+  int16_t pitch_deg_x10;
+  int16_t roll_deg_x10;
+  int16_t target_pitch_deg_x10;
+  int16_t target_roll_deg_x10;
+  int16_t baro_alt_cm;
+  int16_t baro_vz_cms;
+  int16_t throttle_cmd_us;
+  int16_t throttle_actual_us;
+  uint16_t arm_us;
+  int16_t yaw_deg_x10;
+  uint16_t mag_heading_x10;
 } App_SdLogRecord_t;
 
 #define APP_SDLOG_RECORDS_PER_BLOCK (SD_BLOCK_SIZE / sizeof(App_SdLogRecord_t))
@@ -387,9 +496,49 @@ typedef struct __attribute__((packed))
 static uint8_t g_sdlog_ready = 0U;      /* superblock loaded, card usable for logging */
 static uint8_t g_sdlog_active = 0U;     /* currently capturing a flight */
 static uint32_t g_sdlog_next_free_block = 1U;
+static uint32_t g_sdlog_last_flight_start_block = 1U; /* first block of the most recent flight, for SDLOG DUMP LAST */
 static uint32_t g_sdlog_flight_next_block = 0U;
 static uint8_t g_sdlog_block_buf[SD_BLOCK_SIZE];
 static uint16_t g_sdlog_buf_count = 0U;
+
+/* Second buffer + pending flag let a full block be handed off to the card
+ * asynchronously (see App_SdLogServiceWrite()) while new records keep
+ * accumulating in g_sdlog_block_buf, so the card's internal flash-program
+ * time (the slow/variable part, previously a multi-tens-of-ms control-loop
+ * stall) is polled a byte at a time from the main loop instead of blocking it. */
+static uint8_t g_sdlog_write_buf[SD_BLOCK_SIZE];
+static uint8_t g_sdlog_write_pending = 0U;
+
+static void App_SdLogServiceWrite(void)
+{
+  if ((g_sdlog_write_pending != 0U) && (SD_WriteBlockPoll() >= 0))
+  {
+    g_sdlog_write_pending = 0U;
+  }
+}
+
+static void App_SdLogAwaitWrite(void)
+{
+  while (g_sdlog_write_pending != 0U)
+  {
+    App_SdLogServiceWrite();
+  }
+}
+
+static void App_SdLogFlushBufferAsync(void)
+{
+  /* Overrun guard: a block fills roughly every several hundred ms of flight
+   * time, far longer than one SD write takes, so this should never actually
+   * wait - it exists only as a correctness fallback. */
+  App_SdLogAwaitWrite();
+
+  memcpy(g_sdlog_write_buf, g_sdlog_block_buf, sizeof(g_sdlog_write_buf));
+  if (SD_WriteBlockBegin(g_sdlog_flight_next_block, g_sdlog_write_buf) == SD_OK)
+  {
+    g_sdlog_write_pending = 1U;
+  }
+  g_sdlog_flight_next_block++;
+}
 
 static void App_SdLogSaveSuperblock(void)
 {
@@ -398,6 +547,7 @@ static void App_SdLogSaveSuperblock(void)
 
   memcpy(&buf[0], &magic, sizeof(magic));
   memcpy(&buf[4], &g_sdlog_next_free_block, sizeof(g_sdlog_next_free_block));
+  memcpy(&buf[8], &g_sdlog_last_flight_start_block, sizeof(g_sdlog_last_flight_start_block));
   (void)SD_WriteBlock(0U, buf);
 }
 
@@ -408,6 +558,7 @@ static void App_SdLogLoadSuperblock(void)
 
   g_sdlog_ready = 0U;
   g_sdlog_next_free_block = 1U;
+  g_sdlog_last_flight_start_block = 1U;
 
   if (SD_ReadBlock(0U, buf) != SD_OK)
   {
@@ -421,6 +572,13 @@ static void App_SdLogLoadSuperblock(void)
     if (g_sdlog_next_free_block < 1U)
     {
       g_sdlog_next_free_block = 1U;
+    }
+    /* Older superblocks (written before SDLOG DUMP LAST existed) don't have this
+     * field - it reads back as 0 from the zero-filled buffer, handled below. */
+    memcpy(&g_sdlog_last_flight_start_block, &buf[8], sizeof(g_sdlog_last_flight_start_block));
+    if ((g_sdlog_last_flight_start_block < 1U) || (g_sdlog_last_flight_start_block >= g_sdlog_next_free_block))
+    {
+      g_sdlog_last_flight_start_block = 1U;
     }
   }
   else
@@ -437,6 +595,7 @@ static void App_SdLogArmStart(void)
   if (g_sdlog_ready != 0U)
   {
     g_sdlog_flight_next_block = g_sdlog_next_free_block;
+    g_sdlog_last_flight_start_block = g_sdlog_next_free_block;
     g_sdlog_buf_count = 0U;
     g_sdlog_active = 1U;
   }
@@ -444,6 +603,9 @@ static void App_SdLogArmStart(void)
 
 static void App_SdLogFlushFlight(void)
 {
+  /* Disarm already stops motor output, so blocking here doesn't cost control timing. */
+  App_SdLogAwaitWrite();
+
   if (g_sdlog_buf_count > 0U)
   {
     memset(&g_sdlog_block_buf[g_sdlog_buf_count * sizeof(App_SdLogRecord_t)],
@@ -470,8 +632,7 @@ static void App_SdLogAppendRecord(const App_SdLogRecord_t *rec)
 
   if (g_sdlog_buf_count >= APP_SDLOG_RECORDS_PER_BLOCK)
   {
-    (void)SD_WriteBlock(g_sdlog_flight_next_block, g_sdlog_block_buf);
-    g_sdlog_flight_next_block++;
+    App_SdLogFlushBufferAsync();
     g_sdlog_buf_count = 0U;
   }
 }
@@ -480,7 +641,9 @@ typedef enum
 {
   APP_SDLOGCMD_NONE = 0,
   APP_SDLOGCMD_STATUS,
-  APP_SDLOGCMD_DUMP
+  APP_SDLOGCMD_DUMP,
+  APP_SDLOGCMD_DUMP_LAST,
+  APP_SDLOGCMD_ERASE
 } App_SdLogCmd_t;
 
 #define APP_SDLOG_DUMP_BLOCKS_PER_CALL 4U
@@ -500,11 +663,23 @@ void App_RequestSdLogDump(void)
   g_sdlog_cmd_pending = APP_SDLOGCMD_DUMP;
 }
 
+void App_RequestSdLogDumpLast(void)
+{
+  g_sdlog_cmd_pending = APP_SDLOGCMD_DUMP_LAST;
+}
+
+void App_RequestSdLogErase(void)
+{
+  g_sdlog_cmd_pending = APP_SDLOGCMD_ERASE;
+}
+
 static void App_ServiceSdLog(void)
 {
   App_SdLogCmd_t cmd = g_sdlog_cmd_pending;
   uint8_t buf[SD_BLOCK_SIZE];
   uint32_t i;
+
+  App_SdLogServiceWrite();
 
   if (cmd != APP_SDLOGCMD_NONE)
   {
@@ -517,7 +692,27 @@ static void App_ServiceSdLog(void)
              (unsigned long)g_sdlog_next_free_block,
              (unsigned int)sizeof(App_SdLogRecord_t));
     }
-    else if (cmd == APP_SDLOGCMD_DUMP)
+    else if (cmd == APP_SDLOGCMD_ERASE)
+    {
+      /* Not a real physical erase (12000+ blocks would take forever) - just rewinds
+       * the superblock's write pointer to block 1 so the next flight starts
+       * overwriting from the beginning, same effect for SDLOG DUMP's purposes. */
+      if (g_glog_armed_state != 0U)
+      {
+        printf("SDLOG_ERASE[FAIL armed]\r\n");
+      }
+      else
+      {
+        g_sdlog_next_free_block = 1U;
+        g_sdlog_last_flight_start_block = 1U;
+        g_sdlog_active = 0U;
+        g_sdlog_buf_count = 0U;
+        g_sdlog_write_pending = 0U;
+        App_SdLogSaveSuperblock();
+        printf("SDLOG_ERASE[OK]\r\n");
+      }
+    }
+    else if ((cmd == APP_SDLOGCMD_DUMP) || (cmd == APP_SDLOGCMD_DUMP_LAST))
     {
       if (g_glog_armed_state != 0U)
       {
@@ -529,10 +724,14 @@ static void App_ServiceSdLog(void)
       }
       else
       {
-        g_sdlog_dump_block = 1U;
+        /* DUMP LAST starts at the most recent flight's first block instead of
+         * block 1, so pulling recent data doesn't re-stream the entire card's
+         * history every time (that grows every arm and never gets shorter). */
+        g_sdlog_dump_block = (cmd == APP_SDLOGCMD_DUMP_LAST) ? g_sdlog_last_flight_start_block : 1U;
         g_sdlog_dump_end_block = g_sdlog_next_free_block - 1U;
         g_sdlog_dump_active = 1U;
-        printf("SDLOG_DUMP[START first=1 last=%lu record_bytes=%u]\r\n",
+        printf("SDLOG_DUMP[START first=%lu last=%lu record_bytes=%u]\r\n",
+               (unsigned long)g_sdlog_dump_block,
                (unsigned long)g_sdlog_dump_end_block,
                (unsigned int)sizeof(App_SdLogRecord_t));
       }
@@ -681,6 +880,11 @@ static uint8_t App_UpdateGyroBias(float ax_g,
 
 static App_FlightMode_t App_SelectFlightMode(uint16_t mode_us)
 {
+  if (mode_us >= APP_ALTHOLD_SWITCH_THRESHOLD_US)
+  {
+    return APP_FLIGHT_MODE_ALTHOLD;
+  }
+
   if (mode_us < APP_MODE_SWITCH_THRESHOLD_US)
   {
     return APP_FLIGHT_MODE_RATE;
@@ -693,6 +897,8 @@ static const char *App_FlightModeName(App_FlightMode_t mode)
 {
   switch (mode)
   {
+    case APP_FLIGHT_MODE_ALTHOLD:
+      return "ALTHOLD";
     case APP_FLIGHT_MODE_ATTITUDE:
       return "ATTITUDE";
     case APP_FLIGHT_MODE_RATE:
@@ -1387,6 +1593,27 @@ void App_RequestAttitudeDefaults(void)
   __enable_irq();
 }
 
+void App_RequestAttitudeZero(void)
+{
+  __disable_irq();
+  g_attitude_zero_request = 1U;
+  __enable_irq();
+}
+
+void App_RequestMagCalStart(void)
+{
+  __disable_irq();
+  g_mag_cal_command = APP_MAG_CAL_CMD_START;
+  __enable_irq();
+}
+
+void App_RequestMagCalStop(void)
+{
+  __disable_irq();
+  g_mag_cal_command = APP_MAG_CAL_CMD_STOP;
+  __enable_irq();
+}
+
 void App_GetPidCommandDebug(uint32_t *queued_count,
 							uint32_t *handled_count,
 							uint32_t *pending_cmd)
@@ -1477,6 +1704,17 @@ static void App_ProcessPendingPidCommand(void)
   g_pid_command_handled_count++;
   __enable_irq();
 
+  /* HAL_FLASHEx_Erase() blocks the whole control loop for ~1-2s (STM32H7 sector erase) -
+   * refuse any command that reaches App_SaveRatePidGains() while armed, mirroring the
+   * existing SDLOG DUMP "BUSY armed" guard, so tuning saves never freeze the aircraft mid-flight. */
+  if ((g_glog_armed_state != 0U) &&
+      ((cmd == APP_PID_CMD_SET_AND_SAVE) || (cmd == APP_PID_CMD_SAVE) ||
+       (cmd == APP_PID_CMD_ATT_SET_AND_SAVE) || (cmd == APP_PID_CMD_ATT_DEFAULT)))
+  {
+    printf("PID_SAVE[FAIL armed]\r\n");
+    return;
+  }
+
   switch (cmd)
   {
     case APP_PID_CMD_SET_AND_SAVE:
@@ -1553,6 +1791,47 @@ static void App_ProcessPendingPidCommand(void)
   }
 }
 
+static void App_ProcessPendingMagCalCommand(void)
+{
+  App_MagCalCommand_t cmd;
+
+  __disable_irq();
+  cmd = g_mag_cal_command;
+  g_mag_cal_command = APP_MAG_CAL_CMD_NONE;
+  __enable_irq();
+
+  if (cmd == APP_MAG_CAL_CMD_NONE)
+  {
+    return;
+  }
+
+  if (cmd == APP_MAG_CAL_CMD_START)
+  {
+    Mag_CalStart();
+    printf("MAG_CAL[STARTED]\r\n");
+    return;
+  }
+
+  /* Mag_CalStop() calls HAL_FLASHEx_Erase() (~1-2s block) on success - refuse
+   * while armed, mirroring the PID-save armed guard above. */
+  if (g_glog_armed_state != 0U)
+  {
+    printf("MAG_CAL[FAIL armed]\r\n");
+    return;
+  }
+
+  if (Mag_CalStop() != 0U)
+  {
+    printf("MAG_CAL[OK ox=%.4f oy=%.4f sx=%.4f sy=%.4f]\r\n",
+           (double)Mag_GetCalOffsetX(), (double)Mag_GetCalOffsetY(),
+           (double)Mag_GetCalScaleX(), (double)Mag_GetCalScaleY());
+  }
+  else
+  {
+    printf("MAG_CAL[FAIL not_started_or_range_too_small]\r\n");
+  }
+}
+
 void App_SetUsbMotorTest(uint8_t enabled, uint8_t motor_index, uint16_t pulse_us)
 {
   if (motor_index < 1U)
@@ -1612,6 +1891,33 @@ void App_Init(void)
   }
 
   (void)IMU_DetectAndInit();
+  if (Baro_Init() == HAL_OK)
+  {
+    printf("BARO_INIT[OK addr=0x%02X]\r\n", (unsigned int)Baro_GetDetectedAddr7());
+  }
+  else
+  {
+    printf("BARO_INIT[FAIL chip_id=0x%02X]\r\n", (unsigned int)Baro_GetLastChipId());
+  }
+
+  if (GPS_Init() == HAL_OK)
+  {
+    printf("GPS_INIT[OK]\r\n");
+  }
+  else
+  {
+    printf("GPS_INIT[FAIL prt_ack=%u msg_ack=%u]\r\n", (unsigned int)GPS_GetLastPrtAcked(),
+           (unsigned int)GPS_GetLastMsgAcked());
+  }
+
+  if (Mag_Init() == HAL_OK)
+  {
+    printf("MAG_INIT[OK chip_id=0x%02X]\r\n", (unsigned int)Mag_GetLastChipId());
+  }
+  else
+  {
+    printf("MAG_INIT[FAIL chip_id=0x%02X]\r\n", (unsigned int)Mag_GetLastChipId());
+  }
 
   if (SD_Init() == SD_OK)
   {
@@ -1636,9 +1942,7 @@ void App_Update(void)
   static uint32_t last_receiver_telemetry_ms = 0U;
   static uint32_t last_rx16_telemetry_ms = 0U;
   static uint32_t last_mode_telemetry_ms = 0U;
-#if APP_ENABLE_IMU_RUNTIME_TELEMETRY
   static uint32_t last_imu_telemetry_ms = 0U;
-#endif
 #if APP_ENABLE_ARM_RUNTIME_TELEMETRY
   static uint32_t last_arm_telemetry_ms = 0U;
 #endif
@@ -1648,6 +1952,8 @@ void App_Update(void)
   static uint8_t motors_armed = 0U;
   static uint8_t trim_captured = 0U;
   static uint32_t arm_hold_start_ms = 0U;
+  static uint8_t disarm_condition_active = 0U;
+  static uint32_t disarm_condition_start_ms = 0U;
   static uint8_t startup_safety_checked = 0U;
   static uint8_t startup_arm_blocked = 0U;
   static uint8_t beeper_on = 0U;
@@ -1688,10 +1994,31 @@ void App_Update(void)
   static uint32_t startup_zero_avg_sample_count = 0U;
   static uint8_t startup_beep_active = 0U;
   static uint32_t startup_beep_start_ms = 0U;
+  static uint8_t mag_yaw_ref_captured = 0U;
+  static float mag_heading_at_ref_deg = 0.0f;
+  static float mag_ref_field_g = 0.0f;
+  static float mag_yaw_nudge_dps = 0.0f;
   static float battery_voltage_filtered_v = 0.0f;
   static uint8_t battery_voltage_valid = 0U;
   static uint32_t battery_adc_raw = 0U;
   static uint32_t last_battery_sample_ms = 0U;
+  static uint32_t last_baro_sample_ms = 0U;
+  static uint32_t last_baro_retry_ms = 0U;
+  static uint32_t last_gps_retry_ms = 0U;
+  static uint32_t last_mag_sample_ms = 0U;
+  static uint32_t last_mag_retry_ms = 0U;
+  static uint8_t liftoff_ramp_active = 0U;
+  static uint32_t liftoff_ramp_start_ms = 0U;
+  static uint8_t althold_holding = 0U;
+  static float althold_target_alt_m = 0.0f;
+  static float althold_integral_us = 0.0f;
+  static uint16_t althold_center_throttle_us = APP_PWM_MID_US;
+  static uint16_t althold_settle_ref_us = APP_PWM_MID_US;
+  static uint32_t althold_settle_start_ms = 0U;
+  static float althold_trim_filtered_us = 0.0f;
+  int32_t althold_trim_us;
+  uint32_t liftoff_ramp_elapsed_ms;
+  float liftoff_ramp_factor;
   IMU_RawData_t imu_raw;
   uint8_t motor_test_step;
   uint32_t now_ms;
@@ -1746,6 +2073,12 @@ void App_Update(void)
   int32_t pitch_term;
   int32_t yaw_term;
   int32_t throttle_term;
+  int32_t baro_damp_term_us;
+  int32_t throttle_offset_us;
+  int32_t althold_throttle_us;
+  float climb_rate_setpoint_mps;
+  float climb_rate_error_mps;
+  uint8_t baro_healthy_now;
   int32_t m_front_left;
   int32_t m_front_right;
   int32_t m_rear_right;
@@ -1790,9 +2123,57 @@ void App_Update(void)
   Communications_ServiceEscPassthrough();
   Communications_ServiceUart6Commands();
   App_ProcessPendingPidCommand();
+  App_ProcessPendingMagCalCommand();
   App_ServiceGyroLogDump();
   App_ServiceSdCommands();
   App_ServiceSdLog();
+
+  if ((now_ms - last_baro_sample_ms) >= APP_BARO_UPDATE_MS)
+  {
+    if ((Baro_IsInitialized() == 0U) && ((now_ms - last_baro_retry_ms) >= APP_BARO_RETRY_MS))
+    {
+      if (Baro_Init() == HAL_OK)
+      {
+        printf("BARO_INIT[OK addr=0x%02X]\r\n", (unsigned int)Baro_GetDetectedAddr7());
+      }
+      else
+      {
+        printf("BARO_INIT[FAIL chip_id=0x%02X]\r\n", (unsigned int)Baro_GetLastChipId());
+      }
+      last_baro_retry_ms = now_ms;
+    }
+    (void)Baro_Update();
+    last_baro_sample_ms = now_ms;
+  }
+
+  /* GPS_Init() blocks waiting for UBX ACKs (up to ~1s worst case) - only retry
+   * while disarmed, matching the SD/PID-save armed-guard pattern above. */
+  if ((GPS_IsConfigured() == 0U) && (g_glog_armed_state == 0U) &&
+      ((now_ms - last_gps_retry_ms) >= APP_GPS_RETRY_MS))
+  {
+    if (GPS_Init() == HAL_OK)
+    {
+      printf("GPS_INIT[OK]\r\n");
+    }
+    else
+    {
+      printf("GPS_INIT[FAIL prt_ack=%u msg_ack=%u]\r\n", (unsigned int)GPS_GetLastPrtAcked(),
+             (unsigned int)GPS_GetLastMsgAcked());
+    }
+    last_gps_retry_ms = now_ms;
+  }
+
+  if ((now_ms - last_mag_sample_ms) >= APP_MAG_UPDATE_MS)
+  {
+    if ((Mag_IsInitialized() == 0U) && ((now_ms - last_mag_retry_ms) >= APP_MAG_RETRY_MS))
+    {
+      printf("MAG_INIT[%s chip_id=0x%02X]\r\n", (Mag_Init() == HAL_OK) ? "OK" : "FAIL",
+             (unsigned int)Mag_GetLastChipId());
+      last_mag_retry_ms = now_ms;
+    }
+    (void)Mag_Update();
+    last_mag_sample_ms = now_ms;
+  }
 
   if (usb_motor_test_enabled != 0U)
   {
@@ -1900,6 +2281,7 @@ void App_Update(void)
       gx_dps -= g_roll_gyro_bias_dps;
       gy_dps -= g_pitch_gyro_bias_dps;
       gz_dps -= g_yaw_gyro_bias_dps;
+      gz_dps += mag_yaw_nudge_dps;
 
       gyro_lpf_alpha = App_LpfAlpha(((float)APP_CONTROL_LOOP_MS) * 0.001f, APP_GYRO_RATE_LPF_HZ);
       filtered_gyro_roll_rate_dps += gyro_lpf_alpha * (gx_dps - filtered_gyro_roll_rate_dps);
@@ -1918,6 +2300,21 @@ void App_Update(void)
                          az_g,
                          ((float)APP_CONTROL_LOOP_MS) * 0.001f);
       Attitude_GetBoardAnglesDeg(&pitch_deg, &roll_deg, &yaw_deg);
+
+      if (g_attitude_zero_request != 0U)
+      {
+        __disable_irq();
+        g_attitude_zero_request = 0U;
+        __enable_irq();
+        startup_roll_offset_deg = roll_deg;
+        startup_pitch_offset_deg = pitch_deg;
+        startup_yaw_offset_deg = yaw_deg;
+        attitude_zero_captured = 1U;
+        startup_beep_active = 1U;
+        startup_beep_start_ms = now_ms;
+        HAL_GPIO_WritePin(BEEPER_GPIO_Port, BEEPER_Pin, GPIO_PIN_SET);
+        printf("ATT_ZERO[OK]\r\n");
+      }
 
       if (attitude_zero_captured == 0U)
       {
@@ -1945,7 +2342,42 @@ void App_Update(void)
       pitch_deg = Attitude_WrapAngle180(pitch_deg - startup_pitch_offset_deg);
       yaw_deg = Attitude_WrapAngle180(yaw_deg - startup_yaw_offset_deg);
 
-#if APP_ENABLE_IMU_RUNTIME_TELEMETRY
+      /* Compute the next iteration's slow yaw drift-correction nudge here (see
+       * APP_MAG_YAW_NUDGE_* above) - compares the compass's own rotation-since-ref
+       * against the AHRS's rotation-since-boot, so boot heading stays 0 as today. */
+      if ((attitude_zero_captured != 0U) && (Mag_IsHealthy() != 0U))
+      {
+        float mag_field_now_g = sqrtf((Mag_GetXGauss() * Mag_GetXGauss()) +
+                                       (Mag_GetYGauss() * Mag_GetYGauss()) +
+                                       (Mag_GetZGauss() * Mag_GetZGauss()));
+
+        if (mag_yaw_ref_captured == 0U)
+        {
+          mag_heading_at_ref_deg = Mag_GetHeadingDeg();
+          mag_ref_field_g = mag_field_now_g;
+          mag_yaw_ref_captured = 1U;
+          mag_yaw_nudge_dps = 0.0f;
+        }
+        else if ((mag_ref_field_g > 0.01f) &&
+                 (fabsf(mag_field_now_g - mag_ref_field_g) / mag_ref_field_g > APP_MAG_TRUST_MAX_MAG_DEVIATION_FRAC))
+        {
+          mag_yaw_nudge_dps = 0.0f; /* field strength shifted too much - likely motor/ESC current interference */
+        }
+        else
+        {
+          float mag_delta_deg = Attitude_WrapAngle180(Mag_GetHeadingDeg() - mag_heading_at_ref_deg);
+          float yaw_error_deg = Attitude_WrapAngle180(mag_delta_deg - yaw_deg);
+
+          mag_yaw_nudge_dps = App_ClampFloat(yaw_error_deg * APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG,
+                                              -APP_MAG_YAW_NUDGE_MAX_DPS, APP_MAG_YAW_NUDGE_MAX_DPS);
+        }
+      }
+      else
+      {
+        mag_yaw_nudge_dps = 0.0f;
+      }
+
+#if APP_ENABLE_USB_TEST_IMU_TELEMETRY
       if ((now_ms - last_imu_telemetry_ms) >= APP_IMU_TELEMETRY_MS)
       {
         Telemetry_PrintImuState(ax_g,
@@ -1961,13 +2393,18 @@ void App_Update(void)
         {
           Telemetry_PrintBatteryState(battery_voltage_filtered_v, battery_adc_raw);
         }
+        Telemetry_PrintBaroState(Baro_GetAltitudeM(), Baro_GetClimbRateMps(), Baro_IsHealthy());
+        Telemetry_PrintGpsState(GPS_IsConfigured(), GPS_IsHealthy(), GPS_GetFixType(), GPS_GetNumSatellites(),
+                               GPS_GetLatitudeDeg(), GPS_GetLongitudeDeg(), GPS_GetAltitudeM());
+        Telemetry_PrintMagState(Mag_IsHealthy(), Mag_GetXGauss(), Mag_GetYGauss(), Mag_GetZGauss(),
+                               Mag_GetHeadingDeg());
         last_imu_telemetry_ms = now_ms;
       }
 #endif
     }
     else if ((now_ms - last_imu_error_ms) >= 1000U)
     {
-#if APP_ENABLE_IMU_RUNTIME_TELEMETRY
+#if APP_ENABLE_USB_TEST_IMU_TELEMETRY
       Telemetry_PrintImuReadFailed(IMU_GetType(), IMU_GetWhoAmI());
 #endif
       last_imu_error_ms = now_ms;
@@ -2060,6 +2497,20 @@ void App_Update(void)
 
       if ((receiver_state.link_active == 0U) || (arm_switch_high == 0U))
       {
+        if (disarm_condition_active == 0U)
+        {
+          disarm_condition_active = 1U;
+          disarm_condition_start_ms = now_ms;
+        }
+      }
+      else
+      {
+        disarm_condition_active = 0U;
+      }
+
+      if ((disarm_condition_active != 0U) &&
+          ((now_ms - disarm_condition_start_ms) >= APP_DISARM_DEBOUNCE_MS))
+      {
         if ((motors_armed != 0U) && (g_sdlog_active != 0U))
         {
           App_SdLogFlushFlight();
@@ -2121,7 +2572,7 @@ void App_Update(void)
           trim_captured = 1U;
         }
 
-        if (flight_mode == APP_FLIGHT_MODE_ATTITUDE)
+        if ((flight_mode == APP_FLIGHT_MODE_ATTITUDE) || (flight_mode == APP_FLIGHT_MODE_ALTHOLD))
         {
           target_roll_deg = ((float)APP_ROLL_SIGN) * App_StickOffsetUsToAngleDeg((int32_t)roll_us - (int32_t)roll_center_us,
                                                                                   active_attitude_gains.max_angle_deg);
@@ -2247,7 +2698,107 @@ void App_Update(void)
         roll_term = App_ClampControlTerm((int32_t)roll_term_f, APP_RATE_TERM_LIMIT_US);
         pitch_term = App_ClampControlTerm((int32_t)pitch_term_f, APP_RATE_TERM_LIMIT_US);
         yaw_term = App_ClampControlTerm((int32_t)yaw_term_f, APP_RATE_TERM_LIMIT_US);
-        throttle_term = (int32_t)throttle_us;
+        baro_healthy_now = Baro_IsHealthy();
+        althold_trim_us = 0;
+        if ((flight_mode == APP_FLIGHT_MODE_ALTHOLD) && (baro_healthy_now != 0U) &&
+            (Baro_GetAltitudeM() >= APP_BARO_VZ_DAMP_MIN_ALT_M))
+        {
+          /* Also gated on altitude (same APP_BARO_VZ_DAMP_MIN_ALT_M ground-effect
+           * threshold already used for baro Vz damping above) - without this, a
+           * brief natural pause in the pilot's throttle push during liftoff/climb-
+           * out (routine - throttle is rarely pushed in one perfectly smooth
+           * motion) could satisfy the settle timer and latch a hold target while
+           * altitude/climb-rate readings are still ground-effect-noisy, producing
+           * a jumpy unwanted correction right at liftoff instead of a clean climb. */
+          /* Re-latch the hover-throttle reference to wherever the stick has
+           * genuinely SETTLED (stayed within a small window for a while), not
+           * a fixed APP_PWM_MID_US=1500 (real hover throttle is wherever this
+           * aircraft's thrust/weight puts it, observed ~1200-1270us here,
+           * nowhere near mid-stick) and not just once at mode entry (which can
+           * freeze on an unrepresentative value like idle throttle before
+           * liftoff, and then never update again once the stick moves outside
+           * the deadband of that bad reference). */
+          throttle_offset_us = (int32_t)throttle_us - (int32_t)althold_settle_ref_us;
+          if ((throttle_offset_us > (int32_t)APP_ALTHOLD_STICK_STABLE_WINDOW_US) ||
+              (throttle_offset_us < -(int32_t)APP_ALTHOLD_STICK_STABLE_WINDOW_US))
+          {
+            althold_settle_ref_us = (uint16_t)throttle_us;
+            althold_settle_start_ms = now_ms;
+          }
+          else if ((now_ms - althold_settle_start_ms) >= APP_ALTHOLD_STICK_SETTLE_MS)
+          {
+            althold_center_throttle_us = althold_settle_ref_us;
+          }
+
+          throttle_offset_us = (int32_t)throttle_us - (int32_t)althold_center_throttle_us;
+          if ((throttle_offset_us > -(int32_t)APP_ALTHOLD_THROTTLE_DEADBAND_US) &&
+              (throttle_offset_us < (int32_t)APP_ALTHOLD_THROTTLE_DEADBAND_US))
+          {
+            if (althold_holding == 0U)
+            {
+              althold_target_alt_m = Baro_GetAltitudeM();
+              althold_integral_us = 0.0f;
+              althold_holding = 1U;
+            }
+
+            climb_rate_setpoint_mps = App_ClampFloat(APP_ALTHOLD_ALT_HOLD_KP_MPS_PER_M *
+                                                      (althold_target_alt_m - Baro_GetAltitudeM()),
+                                                      -APP_ALTHOLD_MAX_CLIMB_MPS,
+                                                      APP_ALTHOLD_MAX_CLIMB_MPS);
+            climb_rate_error_mps = climb_rate_setpoint_mps - Baro_GetClimbRateMps();
+            althold_integral_us = App_ClampFloat(althold_integral_us +
+                                                 (climb_rate_error_mps * APP_ALTHOLD_VZ_KI_US_PER_MPS_S * dt_s),
+                                                 -(float)APP_ALTHOLD_INTEGRAL_LIMIT_US,
+                                                 (float)APP_ALTHOLD_INTEGRAL_LIMIT_US);
+
+            althold_trim_us = App_ClampInt32((int32_t)((climb_rate_error_mps * APP_ALTHOLD_VZ_KP_US_PER_MPS) +
+                                                        althold_integral_us),
+                                             -(int32_t)APP_ALTHOLD_TRIM_LIMIT_US,
+                                             (int32_t)APP_ALTHOLD_TRIM_LIMIT_US);
+          }
+          else
+          {
+            /* Pilot is actively commanding a climb/descend - give full manual
+             * authority over raw throttle_us, no hold trim fighting the stick.
+             * The settle-tracking above will re-latch althold_center_throttle_us
+             * once the stick genuinely stops here, so hold resumes at the new
+             * altitude without needing to return to the old reference. */
+            althold_holding = 0U;
+            althold_integral_us = 0.0f;
+          }
+        }
+        else
+        {
+          althold_holding = 0U;
+          althold_integral_us = 0.0f;
+          althold_settle_ref_us = (uint16_t)throttle_us;
+          althold_settle_start_ms = now_ms;
+        }
+        /* Smooth the trim itself (not just the gains feeding it) - noisy baro
+         * climb-rate readings were translating directly into jerky per-iteration
+         * motor changes on the Z axis. Filters toward 0 the same way when not
+         * holding, so re-engaging/disengaging the hold is a smooth ramp too. */
+        {
+          float althold_trim_lpf_alpha = App_LpfAlpha(dt_s, APP_ALTHOLD_TRIM_LPF_HZ);
+          althold_trim_filtered_us += althold_trim_lpf_alpha *
+                                      ((float)althold_trim_us - althold_trim_filtered_us);
+        }
+        althold_trim_us = (int32_t)althold_trim_filtered_us;
+        /* ALTHOLD never overrides the pilot's raw throttle - it only ever adds a
+         * small bounded trim on top, so a bad baro reading/integral can nudge but
+         * never freeze or run away with the actual output. */
+        althold_throttle_us = (int32_t)throttle_us + althold_trim_us;
+
+        baro_damp_term_us = 0;
+        if ((APP_BARO_VZ_DAMP_GAIN_US_PER_MPS != 0.0f) && (baro_healthy_now != 0U) &&
+            (Baro_GetAltitudeM() >= APP_BARO_VZ_DAMP_MIN_ALT_M))
+        {
+          baro_damp_term_us = (int32_t)(-APP_BARO_VZ_DAMP_GAIN_US_PER_MPS * Baro_GetClimbRateMps());
+          baro_damp_term_us = App_ClampInt32(baro_damp_term_us,
+                                            -((int32_t)APP_BARO_VZ_DAMP_LIMIT_US),
+                                            (int32_t)APP_BARO_VZ_DAMP_LIMIT_US);
+        }
+        throttle_term = althold_throttle_us + baro_damp_term_us;
         if (throttle_term < (int32_t)APP_MOTOR_IDLE_US)
         {
           throttle_term = APP_MOTOR_IDLE_US;
@@ -2267,6 +2818,23 @@ void App_Update(void)
           pitch_integral_dps_s = 0.0f;
           yaw_integral_dps_s = 0.0f;
           pid_state_initialized = 0U;
+          liftoff_ramp_active = 1U;
+          liftoff_ramp_start_ms = now_ms;
+        }
+        else if (liftoff_ramp_active != 0U)
+        {
+          liftoff_ramp_elapsed_ms = now_ms - liftoff_ramp_start_ms;
+          if (liftoff_ramp_elapsed_ms >= APP_LIFTOFF_RAMP_MS)
+          {
+            liftoff_ramp_active = 0U;
+          }
+          else
+          {
+            liftoff_ramp_factor = (float)liftoff_ramp_elapsed_ms / (float)APP_LIFTOFF_RAMP_MS;
+            roll_term = (int32_t)((float)roll_term * liftoff_ramp_factor);
+            pitch_term = (int32_t)((float)pitch_term * liftoff_ramp_factor);
+            yaw_term = (int32_t)((float)yaw_term * liftoff_ramp_factor);
+          }
         }
 
         m_front_left = throttle_term + pitch_term + roll_term - yaw_term;
@@ -2364,7 +2932,29 @@ void App_Update(void)
           sdlog_rec.motor_rl_us = s4_us;
           sdlog_rec.battery_decivolts = (uint8_t)App_ClampFloat(battery_voltage_filtered_v * 10.0f, 0.0f, 255.0f);
           sdlog_rec.flags = (uint8_t)(APP_SDLOG_FLAG_ARMED |
-                                      (((uint8_t)flight_mode << APP_SDLOG_FLAG_MODE_SHIFT) & APP_SDLOG_FLAG_MODE_MASK));
+                                      (((uint8_t)flight_mode << APP_SDLOG_FLAG_MODE_SHIFT) & APP_SDLOG_FLAG_MODE_MASK) |
+                                      ((receiver_state.link_active != 0U) ? APP_SDLOG_FLAG_LINK_ACTIVE : 0U) |
+                                      ((Mag_IsHealthy() != 0U) ? APP_SDLOG_FLAG_MAG_HEALTHY : 0U));
+          sdlog_rec.pitch_deg_x10 = (int16_t)(pitch_deg * 10.0f);
+          sdlog_rec.roll_deg_x10 = (int16_t)(roll_deg * 10.0f);
+          /* target_roll/pitch_deg are only meaningful (set this iteration) in ATTITUDE/ALTHOLD mode. */
+          if ((flight_mode == APP_FLIGHT_MODE_ATTITUDE) || (flight_mode == APP_FLIGHT_MODE_ALTHOLD))
+          {
+            sdlog_rec.target_pitch_deg_x10 = (int16_t)(target_pitch_deg * 10.0f);
+            sdlog_rec.target_roll_deg_x10 = (int16_t)(target_roll_deg * 10.0f);
+          }
+          else
+          {
+            sdlog_rec.target_pitch_deg_x10 = 0;
+            sdlog_rec.target_roll_deg_x10 = 0;
+          }
+          sdlog_rec.baro_alt_cm = (int16_t)(Baro_GetAltitudeM() * 100.0f);
+          sdlog_rec.baro_vz_cms = (int16_t)(Baro_GetClimbRateMps() * 100.0f);
+          sdlog_rec.throttle_cmd_us = (int16_t)throttle_us;
+          sdlog_rec.throttle_actual_us = (int16_t)throttle_term;
+          sdlog_rec.arm_us = arm_us;
+          sdlog_rec.yaw_deg_x10 = (int16_t)(yaw_deg * 10.0f);
+          sdlog_rec.mag_heading_x10 = (uint16_t)(Mag_GetHeadingDeg() * 10.0f);
           App_SdLogAppendRecord(&sdlog_rec);
         }
       }
@@ -2435,6 +3025,7 @@ void App_Update(void)
     gx_dps -= g_roll_gyro_bias_dps;
     gy_dps -= g_pitch_gyro_bias_dps;
     gz_dps -= g_yaw_gyro_bias_dps;
+    gz_dps += mag_yaw_nudge_dps;
 
     gyro_lpf_alpha = App_LpfAlpha(dt_s, APP_GYRO_RATE_LPF_HZ);
     filtered_gyro_roll_rate_dps += gyro_lpf_alpha * (gx_dps - filtered_gyro_roll_rate_dps);
@@ -2468,6 +3059,21 @@ void App_Update(void)
                        dt_s);
     Attitude_GetBoardAnglesDeg(&pitch_deg, &roll_deg, &yaw_deg);
 
+    if (g_attitude_zero_request != 0U)
+    {
+      __disable_irq();
+      g_attitude_zero_request = 0U;
+      __enable_irq();
+      startup_roll_offset_deg = roll_deg;
+      startup_pitch_offset_deg = pitch_deg;
+      startup_yaw_offset_deg = yaw_deg;
+      attitude_zero_captured = 1U;
+      startup_beep_active = 1U;
+      startup_beep_start_ms = now_ms;
+      HAL_GPIO_WritePin(BEEPER_GPIO_Port, BEEPER_Pin, GPIO_PIN_SET);
+      printf("ATT_ZERO[OK]\r\n");
+    }
+
     if (attitude_zero_captured == 0U)
     {
       if (now_ms >= (APP_ATTITUDE_ZERO_SETTLE_MS - APP_ATTITUDE_ZERO_AVG_MS))
@@ -2494,8 +3100,45 @@ void App_Update(void)
     pitch_deg = Attitude_WrapAngle180(pitch_deg - startup_pitch_offset_deg);
     yaw_deg = Attitude_WrapAngle180(yaw_deg - startup_yaw_offset_deg);
 
-#if APP_ENABLE_IMU_RUNTIME_TELEMETRY
-    if ((now_ms - last_imu_telemetry_ms) >= APP_IMU_TELEMETRY_MS)
+    /* Compute the next iteration's slow yaw drift-correction nudge here (see
+     * APP_MAG_YAW_NUDGE_* above) - compares the compass's own rotation-since-ref
+     * against the AHRS's rotation-since-boot, so boot heading stays 0 as today. */
+    if ((attitude_zero_captured != 0U) && (Mag_IsHealthy() != 0U))
+    {
+      float mag_field_now_g = sqrtf((Mag_GetXGauss() * Mag_GetXGauss()) +
+                                     (Mag_GetYGauss() * Mag_GetYGauss()) +
+                                     (Mag_GetZGauss() * Mag_GetZGauss()));
+
+      if (mag_yaw_ref_captured == 0U)
+      {
+        mag_heading_at_ref_deg = Mag_GetHeadingDeg();
+        mag_ref_field_g = mag_field_now_g;
+        mag_yaw_ref_captured = 1U;
+        mag_yaw_nudge_dps = 0.0f;
+      }
+      else if ((mag_ref_field_g > 0.01f) &&
+               (fabsf(mag_field_now_g - mag_ref_field_g) / mag_ref_field_g > APP_MAG_TRUST_MAX_MAG_DEVIATION_FRAC))
+      {
+        mag_yaw_nudge_dps = 0.0f; /* field strength shifted too much - likely motor/ESC current interference */
+      }
+      else
+      {
+        float mag_delta_deg = Attitude_WrapAngle180(Mag_GetHeadingDeg() - mag_heading_at_ref_deg);
+        float yaw_error_deg = Attitude_WrapAngle180(mag_delta_deg - yaw_deg);
+
+        mag_yaw_nudge_dps = App_ClampFloat(yaw_error_deg * APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG,
+                                            -APP_MAG_YAW_NUDGE_MAX_DPS, APP_MAG_YAW_NUDGE_MAX_DPS);
+      }
+    }
+    else
+    {
+      mag_yaw_nudge_dps = 0.0f;
+    }
+
+    /* Stream IMU state whenever disarmed (ground/bench monitoring) even though
+     * APP_ENABLE_IMU_RUNTIME_TELEMETRY stays off for real armed flight. */
+    if ((APP_ENABLE_IMU_RUNTIME_TELEMETRY || (motors_armed == 0U)) &&
+        ((now_ms - last_imu_telemetry_ms) >= APP_IMU_TELEMETRY_MS))
     {
       Telemetry_PrintImuState(ax_g,
                               ay_g,
@@ -2510,18 +3153,20 @@ void App_Update(void)
       {
         Telemetry_PrintBatteryState(battery_voltage_filtered_v, battery_adc_raw);
       }
+      Telemetry_PrintBaroState(Baro_GetAltitudeM(), Baro_GetClimbRateMps(), Baro_IsHealthy());
+      Telemetry_PrintGpsState(GPS_IsConfigured(), GPS_IsHealthy(), GPS_GetFixType(), GPS_GetNumSatellites(),
+                             GPS_GetLatitudeDeg(), GPS_GetLongitudeDeg(), GPS_GetAltitudeM());
+      Telemetry_PrintMagState(Mag_IsHealthy(), Mag_GetXGauss(), Mag_GetYGauss(), Mag_GetZGauss(),
+                             Mag_GetHeadingDeg());
       last_imu_telemetry_ms = now_ms;
     }
-#endif
 #if APP_ENABLE_ANGLE_TELEMETRY
     Telemetry_PrintAngles(pitch_deg, roll_deg, yaw_deg);
 #endif
   }
-  else
+  else if (APP_ENABLE_IMU_RUNTIME_TELEMETRY || (motors_armed == 0U))
   {
-#if APP_ENABLE_IMU_RUNTIME_TELEMETRY
     Telemetry_PrintImuReadFailed(IMU_GetType(), IMU_GetWhoAmI());
-#endif
   }
 
   HAL_Delay(APP_CONTROL_LOOP_MS);

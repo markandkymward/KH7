@@ -32,8 +32,11 @@ set(MX_Application_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/main.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/app.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/attitude.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/baro.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/communications.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/gps.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/imu.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/mag.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/motors.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/receiver.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/sdcard.c

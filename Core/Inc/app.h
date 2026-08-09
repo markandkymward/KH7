@@ -46,6 +46,9 @@ uint8_t App_SetAttitudeGains(const App_AttitudeGains_t *gains);
 void App_ResetAttitudeDefaults(void);
 uint8_t App_RequestAttitudeSetAndSave(const App_AttitudeGains_t *gains);
 void App_RequestAttitudeDefaults(void);
+void App_RequestAttitudeZero(void);
+void App_RequestMagCalStart(void);
+void App_RequestMagCalStop(void);
 void App_GetPidCommandDebug(uint32_t *queued_count,
 							uint32_t *handled_count,
 							uint32_t *pending_cmd);
@@ -59,6 +62,8 @@ void App_RequestSdReadBlock(uint32_t block);
 void App_RequestSdWriteBlock(uint32_t block);
 void App_RequestSdLogStatus(void);
 void App_RequestSdLogDump(void);
+void App_RequestSdLogDumpLast(void);
+void App_RequestSdLogErase(void);
 
 #ifdef __cplusplus
 }

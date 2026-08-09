@@ -6,23 +6,30 @@ motor outputs, battery, flight mode) at ~125Hz to the SD card for every arm-
 to-disarm cycle, appending after previous flights so nothing is overwritten.
 This tool pulls the whole log over serial ("SDLOG DUMP"), splits it back into
 individual flights, and renders a troubleshooting dashboard per flight:
-  - setpoint vs. gyro (tracking) and PID output, per axis (roll/pitch/yaw)
-  - all four motor outputs and battery voltage over time
+  - setpoint vs. gyro (tracking), per axis (roll/pitch/yaw), and PID output (all axes, one graph)
+  - all four motor outputs, and baro altitude/climb rate, over time
   - gyro noise/vibration spectrum (FFT), per axis
 
 Usage:
-    python tools/sdlog_analyze.py --list                  # list flights on the card
-    python tools/sdlog_analyze.py                         # analyze the most recent flight
-    python tools/sdlog_analyze.py --flight 0               # analyze a specific flight
-    python tools/sdlog_analyze.py --all                    # one dashboard PNG per flight
+    python tools/sdlog_analyze.py --list                  # list flights on the card (full history)
+    python tools/sdlog_analyze.py                         # pull + analyze just the most recent flight (WiFi)
+    python tools/sdlog_analyze.py --usb                     # pull over USB serial instead of WiFi
+    python tools/sdlog_analyze.py --full-dump --flight 0   # pull the whole card to see an older flight
+    python tools/sdlog_analyze.py --full-dump --all       # one dashboard PNG per flight on the card
     python tools/sdlog_analyze.py --save-raw log.txt        # archive the raw dump for later
+    python tools/sdlog_analyze.py --save-raw               # same, auto-named sdlog_raw_<timestamp>.txt
     python tools/sdlog_analyze.py --raw-in log.txt          # re-analyze a saved dump, no board needed
 
-Board must be disarmed - "SDLOG DUMP" is refused while armed (motors spinning).
+Board must be disarmed - "SDLOG DUMP"/"SDLOG DUMP LAST" is refused while armed (motors spinning).
+By default only the latest flight is pulled (fast) over the ESP32 WiFi bridge (kh7bridge.local);
+pass --usb for wired serial, or --full-dump to stream the entire card history instead (slow -
+it grows every arm and is never trimmed).
 """
 import argparse
+import datetime
 import os
 import re
+import socket
 import struct
 import sys
 import time
@@ -42,8 +49,8 @@ BLOCK_RE = re.compile(r"SDLOG\[(\d+)\]=([0-9A-Fa-f]+)")
 # predictable place regardless of the caller's current working directory.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-RECORD_STRUCT = struct.Struct("<I9hHHHHBB")
-RECORD_SIZE = RECORD_STRUCT.size  # 32 bytes, matches App_SdLogRecord_t in Core/Src/app.c
+RECORD_STRUCT = struct.Struct("<I9hHHHHBBhhhhhhhhHhH")
+RECORD_SIZE = RECORD_STRUCT.size  # 54 bytes, matches App_SdLogRecord_t in Core/Src/app.c
 FIELD_NAMES = (
     "time_ms",
     "setpoint_roll_dps", "setpoint_pitch_dps", "setpoint_yaw_dps",
@@ -51,23 +58,81 @@ FIELD_NAMES = (
     "pid_roll_us", "pid_pitch_us", "pid_yaw_us",
     "motor_fl_us", "motor_fr_us", "motor_rr_us", "motor_rl_us",
     "battery_decivolts", "flags",
+    "pitch_deg_x10", "roll_deg_x10",
+    "target_pitch_deg_x10", "target_roll_deg_x10",
+    "baro_alt_cm", "baro_vz_cms",
+    "throttle_cmd_us", "throttle_actual_us",
+    "arm_us",
+    "yaw_deg_x10", "mag_heading_x10",
 )
-FLIGHT_MODE_NAMES = {0: "RATE", 1: "ATTITUDE"}
+APP_SDLOG_FLAG_LINK_ACTIVE = 0x08  # bit set when receiver_state.link_active was true
+APP_SDLOG_FLAG_MAG_HEALTHY = 0x10  # bit set when Mag_IsHealthy() was true
+FLIGHT_MODE_NAMES = {0: "RATE", 1: "ATTITUDE", 2: "ALTHOLD"}
 FLIGHT_GAP_MS = 1500  # a stored-sample time gap bigger than this means a new flight
 PID_TERM_LIMIT_US = 320  # APP_RATE_TERM_LIMIT_US in Core/Src/app.c - used for saturation %
+NOMINAL_BATTERY_V = 11.1  # APP_VOLTAGE_COMP_REFERENCE_V in Core/Src/app.c - 3S nominal pack voltage
 LANDING_CLIP_S = 1.0  # trailing seconds always trimmed - landing/disarm produces a large
                       # non-representative tracking-error/PID spike right before the log ends
 
 
+class _TcpLineSource:
+    """Wraps the ESP32 WiFi bridge's raw TCP socket (see
+    tools/esp32_s3_uart6_wifi_bridge) with the same readline()/write()/
+    reset_input_buffer() surface collect_raw() already uses for pyserial, so
+    the dump loop below doesn't need to care which transport it's using.
+    """
+
+    def __init__(self, host: str, tcp_port: int, timeout_s: float = 1.0):
+        self._sock = socket.create_connection((host, tcp_port), timeout=5.0)
+        self._sock.settimeout(timeout_s)
+        self._buf = bytearray()
+
+    def reset_input_buffer(self) -> None:
+        self._buf.clear()
+
+    def write(self, data: bytes) -> None:
+        self._sock.sendall(data)
+
+    def readline(self) -> bytes:
+        while b"\n" not in self._buf:
+            try:
+                chunk = self._sock.recv(4096)
+            except socket.timeout:
+                return b""
+            if not chunk:
+                return b""
+            self._buf.extend(chunk)
+        idx = self._buf.index(b"\n") + 1
+        line = bytes(self._buf[:idx])
+        del self._buf[:idx]
+        return line
+
+    def close(self) -> None:
+        self._sock.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+
 def collect_raw(port: str, baud: int, idle_timeout_s: float, max_timeout_s: float,
-                 save_raw_path: Optional[str]) -> str:
-    with serial.Serial(port, baud, timeout=1.0) as ser:
+                 save_raw_path: Optional[str], full: bool = False,
+                 host: Optional[str] = None, tcp_port: int = 3333) -> str:
+    conn = _TcpLineSource(host, tcp_port) if host else serial.Serial(port, baud, timeout=1.0)
+    with conn as ser:
         ser.reset_input_buffer()
-        ser.write(b"SDLOG DUMP\r\n")
+        # LAST only streams the most recent flight (fast) - the card's full history
+        # only grows over time and is rarely what you actually want to re-pull.
+        ser.write(b"SDLOG DUMP\r\n" if full else b"SDLOG DUMP LAST\r\n")
 
         lines: List[str] = []
         started = False
+        total_blocks = None
+        blocks_done = 0
         last_progress = time.time()
+        last_report = time.time()
         deadline = time.time() + max_timeout_s
 
         while time.time() < deadline:
@@ -87,15 +152,26 @@ def collect_raw(port: str, baud: int, idle_timeout_s: float, max_timeout_s: floa
             if DUMP_EMPTY_RE.match(line):
                 raise RuntimeError("No flights logged on the SD card yet.")
 
-            if DUMP_START_RE.match(line):
+            start_match = DUMP_START_RE.match(line)
+            if start_match:
                 started = True
                 last_progress = time.time()
+                total_blocks = int(start_match.group(2)) - int(start_match.group(1)) + 1
                 print(line)
                 continue
 
             if BLOCK_RE.match(line) or DUMP_ERR_RE.match(line):
                 lines.append(line)
                 last_progress = time.time()
+                blocks_done += 1
+                # Progress is the only sign of life during a multi-minute dump - without it,
+                # a slow-but-healthy transfer is indistinguishable from a hung one.
+                if (time.time() - last_report) > 2.0:
+                    last_report = time.time()
+                    if total_blocks:
+                        print(f"  ...{blocks_done}/{total_blocks} blocks", file=sys.stderr)
+                    else:
+                        print(f"  ...{blocks_done} blocks", file=sys.stderr)
                 continue
 
             if DUMP_END_RE.match(line):
@@ -117,11 +193,15 @@ def collect_raw(port: str, baud: int, idle_timeout_s: float, max_timeout_s: floa
 def parse_records(text: str) -> List[dict]:
     blocks = {}
     err_blocks = []
+    bad_blocks = []
     for line in text.splitlines():
         m = BLOCK_RE.match(line)
         if m:
             block_idx = int(m.group(1))
-            blocks[block_idx] = bytes.fromhex(m.group(2))
+            try:
+                blocks[block_idx] = bytes.fromhex(m.group(2))
+            except ValueError:
+                bad_blocks.append(block_idx)
             continue
         m = DUMP_ERR_RE.match(line)
         if m:
@@ -129,6 +209,9 @@ def parse_records(text: str) -> List[dict]:
 
     if err_blocks:
         print(f"Warning: {len(err_blocks)} block(s) failed to read: {err_blocks}", file=sys.stderr)
+    if bad_blocks:
+        print(f"Warning: {len(bad_blocks)} block(s) had corrupt/truncated hex and were skipped: {bad_blocks}",
+              file=sys.stderr)
     if not blocks:
         raise RuntimeError("No SDLOG[...] block lines found in the dump.")
 
@@ -174,6 +257,14 @@ def _flight_arrays(sub: List[dict]) -> dict:
     a["t_s"] = (a["time_ms"] - a["time_ms"][0]) / 1000.0
     for axis in ("roll", "pitch", "yaw"):
         a[f"gyro_{axis}_dps"] = a[f"gyro_{axis}_dps_x10"] / 10.0
+    a["pitch_deg"] = a["pitch_deg_x10"] / 10.0
+    a["roll_deg"] = a["roll_deg_x10"] / 10.0
+    a["yaw_deg"] = a["yaw_deg_x10"] / 10.0
+    a["mag_heading_deg"] = a["mag_heading_x10"] / 10.0
+    a["target_pitch_deg"] = a["target_pitch_deg_x10"] / 10.0
+    a["target_roll_deg"] = a["target_roll_deg_x10"] / 10.0
+    a["baro_alt_m"] = a["baro_alt_cm"] / 100.0
+    a["baro_vz_mps"] = a["baro_vz_cms"] / 100.0
     a["battery_v"] = a["battery_decivolts"] / 10.0
     dt = np.diff(a["time_ms"])
     dt = dt[dt > 0]
@@ -213,10 +304,77 @@ def print_summary(a: dict) -> None:
 
     print(f"\nbattery: start={a['battery_v'][0]:.2f}V end={a['battery_v'][-1]:.2f}V "
           f"min={a['battery_v'].min():.2f}V sag={a['battery_v'][0] - a['battery_v'].min():.2f}V")
+    print(f"attitude estimate: pitch min={a['pitch_deg'].min():.1f} max={a['pitch_deg'].max():.1f}deg  "
+          f"roll min={a['roll_deg'].min():.1f} max={a['roll_deg'].max():.1f}deg")
+
+    mode_bits = ((a["flags"].astype(int) >> 1) & 0x03)
+    in_attitude = (mode_bits == 1) | (mode_bits == 2)
+    if np.any(in_attitude):
+        print(f"\nATTITUDE/ALTHOLD mode angle tracking ({int(in_attitude.sum())} samples):")
+        for axis in ("roll", "pitch"):
+            cmd = a[f"target_{axis}_deg"][in_attitude]
+            act = a[f"{axis}_deg"][in_attitude]
+            err = cmd - act
+            print(f"  {axis:5s} commanded min={cmd.min():6.1f} max={cmd.max():6.1f}deg  "
+                  f"actual min={act.min():6.1f} max={act.max():6.1f}deg  "
+                  f"err rms={np.sqrt(np.mean(err ** 2)):5.2f} peak={np.max(np.abs(err)):5.2f}deg")
+
     for motor, label in (("motor_fl_us", "FL"), ("motor_fr_us", "FR"),
                          ("motor_rr_us", "RR"), ("motor_rl_us", "RL")):
         print(f"motor {label}: min={a[motor].min():.0f} max={a[motor].max():.0f} "
               f"mean={a[motor].mean():.0f}us")
+
+    if np.any(a["baro_alt_m"] != 0.0) or np.any(a["baro_vz_mps"] != 0.0):
+        vz = a["baro_vz_mps"]
+        print(f"\nbaro: alt min={a['baro_alt_m'].min():.2f} max={a['baro_alt_m'].max():.2f}m  "
+              f"climb rate min={vz.min():.2f} max={vz.max():.2f} rms={np.sqrt(np.mean(vz ** 2)):.2f}m/s")
+
+    link_active = (a["flags"].astype(int) & APP_SDLOG_FLAG_LINK_ACTIVE) != 0
+    link_drops = int(np.sum(~link_active))
+    print(f"\narm channel: min={a['arm_us'].min():.0f} max={a['arm_us'].max():.0f}us  "
+          f"link_active samples={int(link_active.sum())}/{n} (drops={link_drops})")
+
+    setpoint_yaw = a["setpoint_yaw_dps"]
+    yaw_stick_centered = np.abs(setpoint_yaw) < 5.0  # near-zero yaw stick -> pilot holding heading
+    print(f"yaw stick: rms={np.sqrt(np.mean(setpoint_yaw ** 2)):.1f} max={np.max(np.abs(setpoint_yaw)):.1f}dps  "
+          f"centered(<5dps)={100.0 * np.mean(yaw_stick_centered):.0f}% of flight")
+
+    mag_healthy = (a["flags"].astype(int) & APP_SDLOG_FLAG_MAG_HEALTHY) != 0
+    if np.any(mag_healthy):
+        # Both are wrapped/relative signals - compare ROTATION SINCE THE FIRST HEALTHY
+        # SAMPLE (not absolute heading vs absolute yaw, which aren't on the same
+        # reference/zero) to see whether the compass-nudge is keeping AHRS yaw from
+        # drifting away from what the compass independently says it should be.
+        # Both mag_heading_deg and yaw_deg are wrapped to a fixed range by the
+        # firmware, so a plain difference produces a spurious ~360deg jump every
+        # time either one crosses its wrap boundary - unwrap first so a real
+        # multi-turn rotation (or none at all) doesn't look like a huge divergence.
+        first_idx = int(np.argmax(mag_healthy))
+        mag_unwrapped = np.unwrap(a["mag_heading_deg"], period=360.0)
+        yaw_unwrapped = np.unwrap(a["yaw_deg"], period=360.0)
+        mag_delta = mag_unwrapped - mag_unwrapped[first_idx]
+        yaw_delta = yaw_unwrapped - yaw_unwrapped[first_idx]
+        err_all = mag_delta - yaw_delta
+        err = err_all[mag_healthy]
+        print(f"compass vs yaw drift: mag_delta rms={np.sqrt(np.mean(mag_delta[mag_healthy] ** 2)):.1f}deg  "
+              f"yaw_delta rms={np.sqrt(np.mean(yaw_delta[mag_healthy] ** 2)):.1f}deg  "
+              f"tracking err rms={np.sqrt(np.mean(err ** 2)):.1f} peak={np.max(np.abs(err)):.1f}deg  "
+              f"mag_healthy={int(mag_healthy.sum())}/{n}")
+
+        # Split by whether the pilot was actively commanding yaw at the time -
+        # a drift/error while the stick is centered (trying to hold heading) is a
+        # real AHRS/compass-tracking concern; error while actively yawing is more
+        # likely just the compass-nudge's slow gain lagging a real, intended turn.
+        mask_centered = mag_healthy & yaw_stick_centered
+        mask_active = mag_healthy & ~yaw_stick_centered
+        if np.any(mask_centered):
+            err_c = err_all[mask_centered]
+            print(f"  while holding heading (stick centered, {int(mask_centered.sum())} samples): "
+                  f"tracking err rms={np.sqrt(np.mean(err_c ** 2)):.1f} peak={np.max(np.abs(err_c)):.1f}deg")
+        if np.any(mask_active):
+            err_a = err_all[mask_active]
+            print(f"  while commanding yaw (stick active, {int(mask_active.sum())} samples): "
+                  f"tracking err rms={np.sqrt(np.mean(err_a ** 2)):.1f} peak={np.max(np.abs(err_a)):.1f}deg")
 
 
 _PYPLOT_CACHE: dict = {}
@@ -246,8 +404,8 @@ def plot_dashboard(a: dict, out_path: str):
     plt, interactive = _get_pyplot()
 
     t = a["t_s"]
-    fig = plt.figure(figsize=(16, 18))
-    gs = fig.add_gridspec(5, 6, hspace=0.4, wspace=0.5)
+    fig = plt.figure(figsize=(16, 21))
+    gs = fig.add_gridspec(6, 6, hspace=0.4, wspace=0.5)
 
     track_axes = {}
     for row, axis in enumerate(("roll", "pitch", "yaw")):
@@ -258,11 +416,11 @@ def plot_dashboard(a: dict, out_path: str):
         ax_track.legend(loc="upper right", fontsize=7)
         track_axes.setdefault("roll", ax_track)
 
-        ax_pid = fig.add_subplot(gs[row, 3:6], sharex=track_axes["roll"])
-        ax_pid.plot(t, a[f"pid_{axis}_us"], color="tab:red", linewidth=0.8)
-        ax_pid.axhline(PID_TERM_LIMIT_US, color="gray", linestyle="--", linewidth=0.6)
-        ax_pid.axhline(-PID_TERM_LIMIT_US, color="gray", linestyle="--", linewidth=0.6)
-        ax_pid.set_ylabel(f"{axis} PID\nus")
+    ax_throttle = fig.add_subplot(gs[0:3, 3:6], sharex=track_axes["roll"])
+    ax_throttle.plot(t, a["throttle_cmd_us"], label="commanded", linewidth=0.8)
+    ax_throttle.plot(t, a["throttle_actual_us"], label="actual", linewidth=0.8, alpha=0.85)
+    ax_throttle.set_ylabel("throttle\nus")
+    ax_throttle.legend(loc="upper right", fontsize=8)
 
     ax_motors = fig.add_subplot(gs[3, 0:3], sharex=track_axes["roll"])
     for motor, label in (("motor_fl_us", "FL"), ("motor_fr_us", "FR"),
@@ -271,13 +429,28 @@ def plot_dashboard(a: dict, out_path: str):
     ax_motors.set_ylabel("motors\nus")
     ax_motors.legend(loc="upper right", fontsize=7, ncol=4)
 
-    ax_batt = fig.add_subplot(gs[3, 3:6], sharex=track_axes["roll"])
-    ax_batt.plot(t, a["battery_v"], color="tab:green", linewidth=0.8)
-    ax_batt.set_ylabel("battery\nV")
+    ax_baro = fig.add_subplot(gs[3, 3:6], sharex=track_axes["roll"])
+    ax_baro.plot(t, a["baro_alt_m"], color="tab:blue", linewidth=0.8, label="altitude")
+    ax_baro.set_ylabel("baro alt\nm")
+    ax_baro_vz = ax_baro.twinx()
+    ax_baro_vz.plot(t, a["baro_vz_mps"], color="tab:orange", linewidth=0.7, alpha=0.8, label="climb rate")
+    ax_baro_vz.set_ylabel("climb rate\nm/s")
+    lines1, labels1 = ax_baro.get_legend_handles_labels()
+    lines2, labels2 = ax_baro_vz.get_legend_handles_labels()
+    ax_baro.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=7)
+
+    angle_axes = []
+    for col, axis in enumerate(("roll", "pitch")):
+        ax_angle = fig.add_subplot(gs[4, col * 3:col * 3 + 3], sharex=track_axes["roll"])
+        ax_angle.plot(t, a[f"target_{axis}_deg"], label="commanded", linewidth=0.8)
+        ax_angle.plot(t, a[f"{axis}_deg"], label="actual", linewidth=0.8, alpha=0.85)
+        ax_angle.set_ylabel(f"{axis} angle\ndeg")
+        ax_angle.legend(loc="upper right", fontsize=7)
+        angle_axes.append(ax_angle)
 
     freqs = np.fft.rfftfreq(len(t), d=1.0 / a["fs_hz"])
     for col, axis in enumerate(("roll", "pitch", "yaw")):
-        ax_fft = fig.add_subplot(gs[4, col * 2:col * 2 + 2])
+        ax_fft = fig.add_subplot(gs[5, col * 2:col * 2 + 2])
         sig = a[f"gyro_{axis}_dps"] - a[f"gyro_{axis}_dps"].mean()
         spectrum = np.abs(np.fft.rfft(sig)) / max(len(t), 1)
         ax_fft.plot(freqs, spectrum, linewidth=0.8)
@@ -285,12 +458,13 @@ def plot_dashboard(a: dict, out_path: str):
         ax_fft.set_xlabel("Hz")
         ax_fft.set_title(f"{axis} vibration", fontsize=9)
 
-    ax_yaw_pid = fig.axes[5]
-    ax_yaw_pid.set_xlabel("time (s)")
     ax_motors.set_xlabel("time (s)")
-    ax_batt.set_xlabel("time (s)")
+    ax_baro.set_xlabel("time (s)")
+    for ax_angle in angle_axes:
+        ax_angle.set_xlabel("time (s)")
 
-    fig.suptitle(f"KH7 SD flight log - {t[-1]:.1f}s, ~{a['fs_hz']:.0f}Hz", fontsize=13)
+    fig.suptitle(f"KH7 SD flight log - {t[-1]:.1f}s, ~{a['fs_hz']:.0f}Hz  |  nominal battery: {NOMINAL_BATTERY_V:.1f}V",
+                 fontsize=24)
     fig.savefig(out_path, dpi=130)
     print(f"Saved dashboard: {os.path.abspath(out_path)}")
     return fig, interactive
@@ -299,15 +473,24 @@ def plot_dashboard(a: dict, out_path: str):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--port", default="COM6")
+    parser.add_argument("--port", default="COM6", help="serial port, only used with --usb")
     parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument("--host", default="kh7bridge.local",
+                        help="ESP32 WiFi bridge hostname/IP - this is the default transport; "
+                             "use --usb to pull over USB serial (--port) instead")
+    parser.add_argument("--tcp-port", type=int, default=3333, help="WiFi bridge TCP port")
+    parser.add_argument("--usb", action="store_true",
+                         help="pull over USB serial (--port) instead of the WiFi bridge")
     parser.add_argument("--out", default="sdlog", help="output PNG prefix")
     parser.add_argument("--flight", type=int, default=-1,
                          help="flight index to analyze (default: most recent, -1)")
     parser.add_argument("--all", action="store_true", help="render every flight, not just one")
+    parser.add_argument("--full-dump", action="store_true",
+                         help="pull the whole card history instead of just the latest flight")
     parser.add_argument("--list", action="store_true", help="list flights and exit, no plots")
     parser.add_argument("--raw-in", help="parse a previously saved raw dump instead of the board")
-    parser.add_argument("--save-raw", help="save the raw dump text to this file")
+    parser.add_argument("--save-raw", nargs="?", const="",
+                         help="save the raw dump text to this file (default: auto-named sdlog_raw_<timestamp>.txt)")
     parser.add_argument("--idle-timeout", type=float, default=8.0)
     parser.add_argument("--max-timeout", type=float, default=900.0)
     parser.add_argument("--no-open", action="store_true", help="don't display the plot window(s)")
@@ -317,7 +500,16 @@ def main() -> None:
         with open(args.raw_in, "r", encoding="ascii") as f:
             text = f.read()
     else:
-        text = collect_raw(args.port, args.baud, args.idle_timeout, args.max_timeout, args.save_raw)
+        # Anything other than "just the latest flight" (listing, --all, or an
+        # explicit older --flight index) needs the full card history to satisfy.
+        need_full = args.full_dump or args.list or args.all or (args.flight >= 0)
+        host = None if args.usb else args.host
+        save_raw_path = args.save_raw
+        if save_raw_path == "":
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_raw_path = f"sdlog_raw_{stamp}.txt"
+        text = collect_raw(args.port, args.baud, args.idle_timeout, args.max_timeout, save_raw_path,
+                            full=need_full, host=host, tcp_port=args.tcp_port)
 
     records = parse_records(text)
     flights = segment_flights(records)

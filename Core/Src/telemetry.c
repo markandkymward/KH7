@@ -277,3 +277,59 @@ void Telemetry_PrintBatteryState(float battery_voltage_v, uint32_t adc_raw)
          (long)battery_mv,
          (unsigned long)adc_raw);
 }
+
+void Telemetry_PrintBaroState(float altitude_m, float climb_rate_mps, uint8_t healthy)
+{
+  int32_t alt_cm;
+  int32_t vz_cms;
+
+  alt_cm = (int32_t)(altitude_m * 100.0f);
+  vz_cms = (int32_t)(climb_rate_mps * 100.0f);
+
+  printf("BARO[healthy cm cm_s]=[%u %ld %ld]\r\n",
+         (unsigned int)healthy,
+         (long)alt_cm,
+         (long)vz_cms);
+}
+
+void Telemetry_PrintGpsState(uint8_t configured,
+                             uint8_t healthy,
+                             uint8_t fix_type,
+                             uint8_t num_sv,
+                             float lat_deg,
+                             float lon_deg,
+                             float alt_m)
+{
+  printf("GPS[cfg healthy fix sats]=[%u %u %u %u] lla=[%.7f %.7f %.2f]\r\n",
+         (unsigned int)configured,
+         (unsigned int)healthy,
+         (unsigned int)fix_type,
+         (unsigned int)num_sv,
+         (double)lat_deg,
+         (double)lon_deg,
+         (double)alt_m);
+}
+
+void Telemetry_PrintMagState(uint8_t healthy,
+                             float x_g,
+                             float y_g,
+                             float z_g,
+                             float heading_deg)
+{
+  int32_t x_mg;
+  int32_t y_mg;
+  int32_t z_mg;
+  int32_t hdg_d10;
+
+  x_mg = (int32_t)(x_g * 1000.0f);
+  y_mg = (int32_t)(y_g * 1000.0f);
+  z_mg = (int32_t)(z_g * 1000.0f);
+  hdg_d10 = (int32_t)(heading_deg * 10.0f);
+
+  printf("MAG[healthy heading_x10 mg]=[%u %ld %ld %ld %ld]\r\n",
+         (unsigned int)healthy,
+         (long)hdg_d10,
+         (long)x_mg,
+         (long)y_mg,
+         (long)z_mg);
+}

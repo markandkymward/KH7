@@ -12,3 +12,21 @@ build/
 *.log
 .DS_Store
 Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+
+# Ad-hoc flight-log pulls/analysis artifacts (raw dumps, generated dashboards,
+# and one-off inspection script output captures) - not source, safe to regenerate.
+sdlog_raw*.txt
+tools/sdlog_raw*.txt
+tools/sdlog_pull_latest.txt
+tools/sdlog_2*.png
+tools/_zoom_*.png
+tools/_*_out*.txt
+tools/_sdlog_pull_*.txt
+tools/_reachability*.txt
+tools/_verify_wrap_fix.txt
+tools/_yawstick_analysis.txt
+gaps*_out.txt
