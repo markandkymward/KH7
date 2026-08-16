@@ -23,7 +23,7 @@ static const uint16_t BRIDGE_PORT = 3333;
 static const uint32_t WIFI_RETRY_MS = 4000;
 static const uint32_t BRIDGE_RETRY_MS = 3000;
 static const uint32_t BRIDGE_DATA_TIMEOUT_MS = 2000;
-static const uint32_t UI_REFRESH_MS = 200;
+static const uint32_t UI_REFRESH_MS = 150; // ~6.7Hz - within the requested 5-10Hz visual refresh band
 static const uint32_t STALE_MS = 3000; // no telemetry line of a given kind for this long -> greyed out
 static const size_t BRIDGE_READ_CHUNK_BYTES = 256;
 static const size_t BRIDGE_POLL_BUDGET_BYTES = 2048;
@@ -91,6 +91,8 @@ static WiFiClient tcp;
 static bool mdns_started = false;
 
 // ---- Parsed telemetry state (mirrors Core/Src/telemetry.c line formats) ----
+// UNCHANGED from the original implementation - this is the parsing/comms/nav "logic"
+// half of the file. Only the UI/rendering half below was redesigned.
 struct NavTelemetry
 {
   // NAV[...]
@@ -159,6 +161,9 @@ static uint32_t g_uiFrames = 0;
 static uint32_t g_navHzX10 = 0;
 static uint32_t g_uiHzX10 = 0;
 static uint32_t g_lastBridgeByteMs = 0;
+// Display-only instrumentation (not nav/control logic): total complete lines received,
+// for the bottom diagnostics row's "PKT" counter.
+static uint32_t g_totalLines = 0;
 static SemaphoreHandle_t g_telMutex = nullptr;
 static volatile bool g_wifiConnected = false;
 static volatile bool g_bridgeConnected = false;
@@ -272,6 +277,8 @@ static void ensureBridge()
 }
 
 // ---- Line parsing (sscanf mirrors the exact printf formats in Core/Src/telemetry.c) ----
+// UNCHANGED parsing logic - only the g_totalLines instrumentation bump was added, in
+// pollBridge() below, not here.
 static void processLine(const char *line)
 {
   uint32_t now = millis();
@@ -488,6 +495,7 @@ static void pollBridge()
         if (g_lineLen > 0)
         {
           processLine(g_lineBuf);
+          g_totalLines++;
         }
         g_lineLen = 0;
       }
@@ -534,14 +542,31 @@ static void bridgeTask(void *parameter)
   }
 }
 
-// ---- UI ----
-// Layout rule that fixed the field-unit alignment bugs: every row is drawn as ONE
-// combined "label: value" string from a single field slot - never a separately-drawn
-// static label next to an independently-cleared value box. Mixing those let a value's
-// fillRect erase part of an adjacent label/title (exactly what happened to the title
-// row before this fix). Row widths below are sized with margin verified against the
-// longest realistic string at that text size, so text can never overflow into another
-// row's box either.
+// =====================================================================================
+// ---- UI (redesigned 2026-08-16: sprite-based field display, replaces the old
+// direct-fillRect-per-field renderer; switched to portrait 2026-08-16) ----
+//
+// Static content (borders, section headers, field labels, units) is drawn ONCE to the
+// physical panel by drawStaticLayout(). Every value that changes at telemetry rate lives
+// in a small LGFX_Sprite (LovyanGFX's off-screen canvas - this project uses LovyanGFX,
+// NOT TFT_eSPI, so TFT_eSprite doesn't apply here) sized to just its own region and
+// pushed to a FIXED rectangle that never overlaps a static label's rectangle - unlike the
+// old fillRect-per-field approach, a pushSprite() can't bleed into an adjacent label
+// regardless of how the value's string length changes between frames, so the old
+// "erased part of the neighboring label" failure mode this file used to guard against
+// with a comment is structurally not possible here.
+//
+// This board is a CLASSIC ESP32 (see the pinout comment at the top of this file) with no
+// PSRAM, so every sprite here uses 4-bit (16-color) depth: the whole UI only ever needs
+// ~6 flat colors (black bg, white, cyan, green, red, yellow), well within a 16-entry
+// palette, and this cuts sprite RAM to a quarter of naive 16-bit color - see the RAM
+// budget in initDisplaySprites().
+//
+// Portrait note: the panel is natively 320x480 (see LGFX::_panel_instance.config() above -
+// memory/panel width=320, height=480), so portrait just needs setRotation(0) in setup()
+// instead of the old setRotation(1) landscape rotation - no panel config changes needed.
+// =====================================================================================
+
 #define COLOR_BG TFT_BLACK
 #define COLOR_LABEL 0x7BEF // light grey
 #define COLOR_HEADER TFT_CYAN
@@ -550,85 +575,16 @@ static void bridgeTask(void *parameter)
 #define COLOR_WARN TFT_YELLOW
 #define COLOR_STALE 0x4208 // dark grey, for values that haven't updated recently
 #define COLOR_TEXT TFT_WHITE
+#define COLOR_DATA_LABEL TFT_ORANGE // static field labels across all data panels (GPS, Position, Velocity, NAV BRAKE)
 
-enum FieldId
-{
-  F_CONN = 0,
-  F_GPS_VALID,
-  F_GPS_REASON,
-  F_GPS_STATS,
-  F_POS,
-  F_VEL_RAW,
-  F_VEL_FILT,
-  F_BRK_STATE,
-  F_BRK_LIMITS,
-  F_BRK_DESVEL,
-  F_BRK_ACCEL,
-  F_BRK_ANG,
-  F_STATUS_ROW,
-  F_LOST,
-  F_COUNT
-};
+// Mirrors Core/Src/app.c's APP_NAV_BRAKE_MAX_VEL_MPS - NOT telemetered by the firmware,
+// so this is a static display-only reference value, not a live/recomputed limit. Update
+// this if that firmware constant changes.
+#define NAVBRAKE_MAX_VEL_MPS_DISPLAY_ONLY 1.5f
 
-struct FieldLayout
-{
-  int16_t x, y, w, h;
-  uint8_t textSize;
-};
-
-// Landscape 480x320 after setRotation(1). Widths include margin over the longest
-// realistic value at that text size (verified by hand: size1 ~6px/char, size2 ~12px/char,
-// size3 ~18px/char) so text never runs past its own box into the next row.
-static const FieldLayout LAYOUT[F_COUNT] = {
-    /*F_CONN      */ {8, 30, 460, 18, 2},
-    /*F_GPS_VALID */ {8, 58, 320, 28, 3},
-    /*F_GPS_REASON*/ {8, 96, 470, 14, 1},
-    /*F_GPS_STATS */ {8, 110, 470, 14, 1},
-    /*F_POS       */ {8, 132, 460, 18, 2},
-    /*F_VEL_RAW   */ {8, 154, 460, 18, 2},
-    /*F_VEL_FILT  */ {8, 176, 460, 18, 2},
-    /*F_BRK_STATE */ {8, 204, 460, 18, 2},
-    /*F_BRK_LIMITS*/ {8, 226, 470, 14, 1},
-    /*F_BRK_DESVEL*/ {8, 240, 470, 14, 1},
-    /*F_BRK_ACCEL */ {8, 254, 470, 14, 1},
-    /*F_BRK_ANG   */ {8, 268, 470, 14, 1},
-    /*F_STATUS_ROW*/ {8, 288, 470, 14, 1},
-    /*F_LOST      */ {4, 302, 472, 14, 1},
-};
-
-static char g_fieldCache[F_COUNT][80];
-
-static void setField(FieldId id, const char *text, uint16_t color)
-{
-  const FieldLayout &l = LAYOUT[id];
-  if (strncmp(g_fieldCache[id], text, sizeof(g_fieldCache[id])) == 0)
-  {
-    return;
-  }
-  strncpy(g_fieldCache[id], text, sizeof(g_fieldCache[id]) - 1);
-  g_fieldCache[id][sizeof(g_fieldCache[id]) - 1] = '\0';
-
-  lcd.fillRect(l.x, l.y, l.w, l.h, COLOR_BG);
-  lcd.setTextColor(color, COLOR_BG);
-  lcd.setTextSize(l.textSize);
-  lcd.setCursor(l.x, l.y);
-  lcd.print(text);
-}
-
-static void drawStaticLabels()
-{
-  lcd.fillScreen(COLOR_BG);
-  lcd.setTextColor(COLOR_HEADER, COLOR_BG);
-  lcd.setTextSize(2);
-  lcd.setCursor(8, 4);
-  lcd.print("KH7 GPS FIELD TESTER");
-
-  lcd.drawFastHLine(0, 24, 480, COLOR_LABEL);
-  lcd.drawFastHLine(0, 52, 480, COLOR_LABEL);
-  lcd.drawFastHLine(0, 126, 480, COLOR_LABEL);
-  lcd.drawFastHLine(0, 198, 480, COLOR_LABEL);
-  lcd.drawFastHLine(0, 282, 480, COLOR_LABEL);
-}
+// Set once verified against real hardware (see the "no gate values showing" debug pass) -
+// leave on for now since it's cheap and useful; harmless to leave enabled permanently.
+#define GATE_DEBUG_SERIAL 1
 
 static const char *fixTypeName(unsigned fix)
 {
@@ -667,94 +623,505 @@ static uint16_t staleColor(uint32_t lastMs, uint16_t freshColor)
   return freshColor;
 }
 
-static void refreshUi()
+// ---- Layout (portrait 320x480 after setRotation(0)) ----
+// Row y-coordinates, top to bottom. Position and Velocity are stacked vertically here
+// (they were side-by-side in the old landscape layout) since 320px is too narrow for
+// two side-by-side panels with room to breathe.
+#define ROW_TITLE_Y      2
+#define HLINE1_Y         22
+#define ROW_GPS_Y        28   // GPS status block start (2 lines)
+#define HLINE2_Y         76
+#define POS_TITLE_Y      82
+#define POS_LABEL_X      6
+#define POS_VALUE_X      60
+#define POS_ROW0_Y       (POS_TITLE_Y + 22) // N
+#define POS_ROW1_Y       (POS_TITLE_Y + 44) // E
+#define POS_ROW2_Y       (POS_TITLE_Y + 66) // ALT
+#define VEL_TITLE_Y      178
+#define VEL_LABEL_X      6
+#define VEL_VALUE_X      90
+#define VEL_ROW0_Y       (VEL_TITLE_Y + 22) // RAW N
+#define VEL_ROW1_Y       (VEL_TITLE_Y + 42) // RAW E
+#define VEL_ROW2_Y       (VEL_TITLE_Y + 62) // FILT N
+#define VEL_ROW3_Y       (VEL_TITLE_Y + 82) // FILT E
+#define HLINE3_Y         284
+#define NAVBRK_TITLE_Y   290
+#define NAVBRK_ROW1_Y    310  // Requested: / Active:
+#define NAVBRK_GATE_Y    332  // Gates: ...
+#define NAVBRK_ROW3_Y    354  // Speed: / Threshold:
+#define HLINE4_Y         378
+#define DIAG_ROW1_Y      384  // PKT / AGE / ERR
+#define DIAG_ROW2_Y      406  // GPS UART RX Hz / DROP
+#define SCREEN_W         320
+
+// ---- Sprites (created once in initDisplaySprites(), reused for the life of the app) ----
+static LGFX_Sprite spriteHz(&lcd);          // top-right Hz readout
+static LGFX_Sprite spriteGpsStatus(&lcd);   // 2 lines: GPS fix/sat/hAcc + UART/NAV status
+static LGFX_Sprite spritePosValues(&lcd);   // 3 lines: N / E / ALT (numbers only)
+static LGFX_Sprite spriteVelValues(&lcd);   // 4 lines: raw N/E, filt N/E (numbers only)
+static LGFX_Sprite spriteReqActive(&lcd);   // "YES/NO" x2 on the Requested/Active row
+static LGFX_Sprite spriteGates(&lcd);       // the whole "Gates: ..." row (own change-detect)
+static LGFX_Sprite spriteSpeedThresh(&lcd); // Speed/Threshold numeric values
+static LGFX_Sprite spriteDiag(&lcd);        // 2 lines: bottom diagnostics
+static LGFX_Sprite spriteModeTitle(&lcd);   // dynamic mode name, replaces the old static "NAV BRAKE" title
+
+static bool g_spriteOk[9] = {false, false, false, false, false, false, false, false, false};
+enum SpriteIdx
 {
-  char buf[80];
+  SPR_HZ = 0, SPR_GPS_STATUS, SPR_POS, SPR_VEL, SPR_REQ_ACTIVE, SPR_GATES, SPR_SPEED_THRESH, SPR_DIAG,
+  SPR_MODE_TITLE
+};
+
+// Change-detection caches for the sprites the spec asks to only redraw on change
+// (GPS fix/sat, gate flags, NAV BRAKE Requested/Active). Deliberately simple string
+// compares, same pattern the old setField() used - "do not make this unnecessarily
+// complicated" per the redesign brief.
+static char g_cacheGpsStatus[64] = "";
+static char g_cacheGates[48] = "";
+static char g_cacheReqActive[24] = "";
+static char g_cacheModeTitle[24] = "";
+
+static bool createSpriteChecked(LGFX_Sprite &spr, int16_t w, int16_t h, bool *okFlag, const char *name)
+{
+  // 16-bit RGB565 - true color, no palette. Switched from 4-bit palette mode
+  // (2026-08-16) after COLOR_GOOD (green) rendered as invisible black-on-black
+  // specifically on the gates row and on the Position panel once a GPS fix was
+  // attained - both are exactly the two places that switch to COLOR_GOOD - consistent
+  // with that one color failing to resolve correctly in the 16-entry palette. 16bpp
+  // costs ~4x the RAM but eliminates the whole class of palette-mapping bugs outright;
+  // per spec, status-color correctness takes priority over the memory savings.
+  spr.setColorDepth(16);
+  void *buf = spr.createSprite(w, h);
+  *okFlag = (buf != nullptr);
+  if (!*okFlag)
+  {
+    // MEMORY SAFETY: report, don't crash. That panel's updateXSprite() below checks
+    // g_spriteOk[] and simply skips drawing (leaves that region blank) rather than
+    // dereferencing a failed allocation.
+    Serial.printf("[DISPLAY] WARNING: sprite '%s' (%dx%d, 16bpp) failed to allocate - that panel will stay blank\n",
+                  name, (int)w, (int)h);
+  }
+  return *okFlag;
+}
+
+static void initDisplaySprites()
+{
+  // Approximate RAM budget at 16bpp (2 bytes/px), portrait sprites (trimmed to fit
+  // actual content, not left at the earlier 4bpp-era margins): Hz ~3.2KB,
+  // GpsStatus ~27KB, Pos ~23.4KB, Vel ~29.7KB, ReqActive ~8.4KB, Gates ~10.5KB,
+  // SpeedThresh ~8.4KB, Diag ~29.5KB - total ~140KB. A classic ESP32 has 520KB SRAM;
+  // with WiFi active (no BT) this leaves comfortable headroom.
+  createSpriteChecked(spriteHz, 90, 18, &g_spriteOk[SPR_HZ], "hz");
+  createSpriteChecked(spriteGpsStatus, 312, 44, &g_spriteOk[SPR_GPS_STATUS], "gpsStatus");
+  createSpriteChecked(spritePosValues, 200, 60, &g_spriteOk[SPR_POS], "posValues");
+  createSpriteChecked(spriteVelValues, 190, 80, &g_spriteOk[SPR_VEL], "velValues");
+  createSpriteChecked(spriteReqActive, 240, 18, &g_spriteOk[SPR_REQ_ACTIVE], "reqActive");
+  createSpriteChecked(spriteGates, 300, 18, &g_spriteOk[SPR_GATES], "gates");
+  createSpriteChecked(spriteSpeedThresh, 240, 18, &g_spriteOk[SPR_SPEED_THRESH], "speedThresh");
+  createSpriteChecked(spriteDiag, 260, 58, &g_spriteOk[SPR_DIAG], "diag"); // 3 lines incl. aircraft VBAT
+  createSpriteChecked(spriteModeTitle, 160, 20, &g_spriteOk[SPR_MODE_TITLE], "modeTitle");
+}
+
+// ---- Static layout: borders, headers, field labels. Drawn once, never redrawn per
+// telemetry update (per the "no full-screen refreshes on every update" requirement). ----
+static void drawStaticLayout()
+{
+  lcd.fillScreen(COLOR_BG);
+
+  lcd.setTextColor(COLOR_HEADER, COLOR_BG);
+  lcd.setTextSize(2);
+  lcd.setCursor(6, ROW_TITLE_Y);
+  lcd.print("K7H FIELD TESTER");
+
+  lcd.drawFastHLine(0, HLINE1_Y, SCREEN_W, COLOR_LABEL);
+  lcd.drawFastHLine(0, HLINE2_Y, SCREEN_W, COLOR_LABEL);
+  lcd.drawFastHLine(0, HLINE3_Y, SCREEN_W, COLOR_LABEL);
+  lcd.drawFastHLine(0, HLINE4_Y, SCREEN_W, COLOR_LABEL);
+
+  // POSITION panel (static labels) - orange: this whole panel is raw GPS data (lat/lon/alt).
+  lcd.setTextColor(COLOR_DATA_LABEL, COLOR_BG);
+  lcd.setTextSize(1);
+  lcd.setCursor(POS_LABEL_X, POS_TITLE_Y);
+  lcd.print("POSITION");
+  lcd.setCursor(POS_LABEL_X, POS_ROW0_Y);
+  lcd.print("N");
+  lcd.setCursor(POS_LABEL_X, POS_ROW1_Y);
+  lcd.print("E");
+  lcd.setCursor(POS_LABEL_X, POS_ROW2_Y);
+  lcd.print("ALT");
+
+  // VELOCITY panel (static labels)
+  lcd.setTextColor(COLOR_DATA_LABEL, COLOR_BG);
+  lcd.setCursor(VEL_LABEL_X, VEL_TITLE_Y);
+  lcd.print("VELOCITY");
+  lcd.setTextColor(COLOR_DATA_LABEL, COLOR_BG);
+  lcd.setCursor(VEL_LABEL_X, VEL_ROW0_Y);
+  lcd.print("RAW N");
+  lcd.setCursor(VEL_LABEL_X, VEL_ROW1_Y);
+  lcd.print("RAW E");
+  lcd.setCursor(VEL_LABEL_X, VEL_ROW2_Y);
+  lcd.print("FILT N");
+  lcd.setCursor(VEL_LABEL_X, VEL_ROW3_Y);
+  lcd.print("FILT E");
+
+  // NAV BRAKE panel - the title itself is now dynamic (see updateModeTitleSprite()),
+  // showing the flight controller's actual current mode (MODE[...] telemetry) rather
+  // than a fixed "NAV BRAKE" label, since this whole panel's data is only live while
+  // that mode is actually selected - static labels below only.
+  lcd.setTextColor(COLOR_DATA_LABEL, COLOR_BG);
+  lcd.setCursor(6, NAVBRK_ROW1_Y);
+  lcd.print("Requested:");
+  lcd.setCursor(180, NAVBRK_ROW1_Y);
+  lcd.print("Active:");
+  lcd.setCursor(6, NAVBRK_GATE_Y);
+  lcd.print("Gates:");
+  lcd.setCursor(6, NAVBRK_ROW3_Y);
+  lcd.print("Speed:");
+  lcd.setCursor(6, NAVBRK_ROW3_Y + 18);
+  lcd.print("Threshold:");
+}
+
+// ---- Dynamic region updates: each fills its sprite off-screen, then pushes it in one
+// operation (per the "clear -> draw -> push" pattern requested). ----
+
+static void updateHzSprite(uint32_t uiHzX10)
+{
+  if (!g_spriteOk[SPR_HZ]) return;
+  spriteHz.fillSprite(COLOR_BG);
+  spriteHz.setTextColor(COLOR_TEXT, COLOR_BG);
+  spriteHz.setTextSize(2);
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%lu.%luHz", (unsigned long)(uiHzX10 / 10U), (unsigned long)(uiHzX10 % 10U));
+  spriteHz.setTextDatum(lgfx::top_right);
+  spriteHz.drawString(buf, spriteHz.width() - 2, 1);
+  spriteHz.pushSprite(SCREEN_W - spriteHz.width() - 4, ROW_TITLE_Y);
+}
+
+// True once a 3D (or better - GNSS+DR) fix is attained and the sample is still fresh -
+// drives the "all GPS values go green on 3D fix" request across the status row and the
+// Position panel (both are genuinely GPS-derived values).
+static bool gps3dFixGood(const NavTelemetry &tel, bool navFresh)
+{
+  return navFresh && (tel.navFix >= 3);
+}
+
+static void updateGpsStatusSprite(const NavTelemetry &tel, bool wifiOk, bool bridgeOk)
+{
+  if (!g_spriteOk[SPR_GPS_STATUS]) return;
+
+  bool navFresh = (tel.navMs != 0) && ((millis() - tel.navMs) < STALE_MS);
+  bool fixGood = gps3dFixGood(tel, navFresh);
+  uint16_t fixColor = !navFresh ? COLOR_STALE : (fixGood ? COLOR_GOOD : (tel.navFix > 0 ? COLOR_WARN : COLOR_BAD));
+  uint16_t linkColor = (wifiOk && bridgeOk) ? COLOR_GOOD : COLOR_BAD;
+  uint16_t navActiveColor = !navFresh ? COLOR_STALE : (tel.navValid ? COLOR_GOOD : COLOR_BAD);
+  // The GPS status line's text itself (not just the dot) turns green once a 3D+ fix is
+  // attained, per request - falls back to plain white/stale otherwise.
+  uint16_t gpsTextColor = fixGood ? COLOR_GOOD : staleColor(tel.navMs, COLOR_TEXT);
+
+  char cacheKey[64];
+  snprintf(cacheKey, sizeof(cacheKey), "%u|%u|%ld|%d|%d|%u", tel.navFix, tel.navSats, tel.navHaccCm,
+           wifiOk && bridgeOk, tel.navValid, navFresh);
+  if (strncmp(cacheKey, g_cacheGpsStatus, sizeof(cacheKey)) == 0)
+  {
+    return; // GPS fix/sat and link/nav state unchanged - skip the redraw (per spec)
+  }
+  strncpy(g_cacheGpsStatus, cacheKey, sizeof(g_cacheGpsStatus) - 1);
+  g_cacheGpsStatus[sizeof(g_cacheGpsStatus) - 1] = '\0';
+
+  spriteGpsStatus.fillSprite(COLOR_BG);
+  spriteGpsStatus.setTextSize(1);
+  spriteGpsStatus.setTextDatum(lgfx::top_left);
+
+  // Fixed pixel slots (labels orange, values follow gpsTextColor) - same
+  // known-working pattern as the gates row, not accumulated textWidth() sums.
+  spriteGpsStatus.fillCircle(4, 5, 4, fixColor);
+  char buf[24];
+  spriteGpsStatus.setTextColor(COLOR_DATA_LABEL, COLOR_BG);
+  spriteGpsStatus.drawString("GPS", 14, 0);
+  spriteGpsStatus.setTextColor(gpsTextColor, COLOR_BG);
+  spriteGpsStatus.drawString(fixTypeName(tel.navFix), 38, 0);
+  spriteGpsStatus.setTextColor(COLOR_DATA_LABEL, COLOR_BG);
+  spriteGpsStatus.drawString("SAT", 98, 0);
+  spriteGpsStatus.setTextColor(gpsTextColor, COLOR_BG);
+  snprintf(buf, sizeof(buf), "%u", tel.navSats);
+  spriteGpsStatus.drawString(buf, 122, 0);
+  spriteGpsStatus.setTextColor(COLOR_DATA_LABEL, COLOR_BG);
+  spriteGpsStatus.drawString("hAcc", 142, 0);
+  spriteGpsStatus.setTextColor(gpsTextColor, COLOR_BG);
+  snprintf(buf, sizeof(buf), "%.1fm", tel.navHaccCm / 100.0f);
+  spriteGpsStatus.drawString(buf, 172, 0);
+
+  spriteGpsStatus.fillCircle(4, 27, 4, linkColor);
+  spriteGpsStatus.setTextColor(COLOR_TEXT, COLOR_BG);
+  spriteGpsStatus.setCursor(14, 22);
+  spriteGpsStatus.print(wifiOk && bridgeOk ? "UART OK" : "UART --");
+
+  spriteGpsStatus.fillCircle(160, 27, 4, navActiveColor);
+  spriteGpsStatus.setCursor(170, 22);
+  spriteGpsStatus.print(navFresh ? (tel.navValid ? "NAV ACTIVE" : "NAV INVALID") : "NAV WAIT");
+
+  spriteGpsStatus.pushSprite(4, ROW_GPS_Y);
+}
+
+static void updatePosVelSprites(const NavTelemetry &tel)
+{
+  bool navFresh = (tel.navMs != 0) && ((millis() - tel.navMs) < STALE_MS);
+  bool fixGood = gps3dFixGood(tel, navFresh);
+
+  // High-rate numeric telemetry - update every refresh cycle, no change-gating
+  // (per spec: "velocity may still update at the normal display rate").
+  if (g_spriteOk[SPR_POS])
+  {
+    spritePosValues.fillSprite(COLOR_BG);
+    spritePosValues.setTextSize(1);
+    // POSITION is raw GPS lat/lon/alt - genuinely "GPS values", so it follows the same
+    // green-on-3D-fix rule as the status row above.
+    uint16_t c = fixGood ? COLOR_GOOD : staleColor(tel.navposMs, COLOR_TEXT);
+    spritePosValues.setTextColor(c, COLOR_BG);
+    spritePosValues.setTextDatum(lgfx::top_right);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%.6f", tel.gpsLat);
+    spritePosValues.drawString(buf, spritePosValues.width(), 0);
+    snprintf(buf, sizeof(buf), "%.6f", tel.gpsLon);
+    spritePosValues.drawString(buf, spritePosValues.width(), 20);
+    snprintf(buf, sizeof(buf), "%.1f m", tel.gpsAlt);
+    spritePosValues.drawString(buf, spritePosValues.width(), 40);
+    spritePosValues.pushSprite(POS_VALUE_X, POS_ROW0_Y - 2);
+  }
+
+  if (g_spriteOk[SPR_VEL])
+  {
+    spriteVelValues.fillSprite(COLOR_BG);
+    spriteVelValues.setTextSize(1);
+    uint16_t c = staleColor(tel.navposMs, COLOR_TEXT);
+    spriteVelValues.setTextColor(c, COLOR_BG);
+    spriteVelValues.setTextDatum(lgfx::top_right);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%.2f m/s", tel.velRawN);
+    spriteVelValues.drawString(buf, spriteVelValues.width(), 0);
+    snprintf(buf, sizeof(buf), "%.2f m/s", tel.velRawE);
+    spriteVelValues.drawString(buf, spriteVelValues.width(), 20);
+    snprintf(buf, sizeof(buf), "%.2f m/s", tel.velFiltN);
+    spriteVelValues.drawString(buf, spriteVelValues.width(), 40);
+    snprintf(buf, sizeof(buf), "%.2f m/s", tel.velFiltE);
+    spriteVelValues.drawString(buf, spriteVelValues.width(), 60);
+    spriteVelValues.pushSprite(VEL_VALUE_X, VEL_ROW0_Y - 2);
+  }
+}
+
+static void updateModeTitleSprite(const NavTelemetry &tel)
+{
+  if (!g_spriteOk[SPR_MODE_TITLE]) return;
+
+  bool modeFresh = (tel.modeMs != 0) && ((millis() - tel.modeMs) < STALE_MS);
+  char cacheKey[24];
+  snprintf(cacheKey, sizeof(cacheKey), "%s|%d", tel.modeName, modeFresh);
+  if (strncmp(cacheKey, g_cacheModeTitle, sizeof(cacheKey)) == 0)
+  {
+    return; // mode name unchanged - skip the redraw
+  }
+  strncpy(g_cacheModeTitle, cacheKey, sizeof(g_cacheModeTitle) - 1);
+  g_cacheModeTitle[sizeof(g_cacheModeTitle) - 1] = '\0';
+
+  // Green specifically in NAVBRAKE - that's the one mode where this whole panel's data
+  // (Requested/Active/Gates/Speed) is actually live; any other mode it's necessarily
+  // stale/inactive by firmware design (GPS/Nav_Update() only run in NAVBRAKE), so this
+  // is the one place that distinction needs to be obvious at a glance.
+  bool isNavBrake = modeFresh && (strncmp(tel.modeName, "NAVBRAKE", sizeof(tel.modeName)) == 0);
+  uint16_t c = !modeFresh ? COLOR_STALE : (isNavBrake ? COLOR_GOOD : COLOR_HEADER);
+
+  spriteModeTitle.fillSprite(COLOR_BG);
+  spriteModeTitle.setTextSize(1);
+  spriteModeTitle.setTextColor(c, COLOR_BG);
+  spriteModeTitle.setCursor(0, 0);
+  spriteModeTitle.print(modeFresh ? tel.modeName : "MODE ?");
+
+  spriteModeTitle.pushSprite(6, NAVBRK_TITLE_Y);
+}
+
+static void updateReqActiveSprite(const NavTelemetry &tel)
+{
+  if (!g_spriteOk[SPR_REQ_ACTIVE]) return;
+
+  bool brkFresh = (tel.navbrkMs != 0) && ((millis() - tel.navbrkMs) < STALE_MS);
+  char cacheKey[24];
+  snprintf(cacheKey, sizeof(cacheKey), "%u|%u|%d", tel.brkReq, tel.brkAct, brkFresh);
+  if (strncmp(cacheKey, g_cacheReqActive, sizeof(cacheKey)) == 0)
+  {
+    return; // NAV BRAKE Requested/Active unchanged - skip (per spec)
+  }
+  strncpy(g_cacheReqActive, cacheKey, sizeof(g_cacheReqActive) - 1);
+  g_cacheReqActive[sizeof(g_cacheReqActive) - 1] = '\0';
+
+  spriteReqActive.fillSprite(COLOR_BG);
+  spriteReqActive.setTextSize(1);
+
+  uint16_t reqColor = !brkFresh ? COLOR_STALE : (tel.brkReq ? COLOR_GOOD : COLOR_TEXT);
+  uint16_t actColor = !brkFresh ? COLOR_STALE : (tel.brkAct ? COLOR_GOOD : COLOR_TEXT);
+  spriteReqActive.setTextColor(reqColor, COLOR_BG);
+  spriteReqActive.setCursor(0, 0);
+  spriteReqActive.print(tel.brkReq ? "YES" : "NO ");
+
+  spriteReqActive.setTextColor(actColor, COLOR_BG);
+  spriteReqActive.setCursor(174, 0); // aligns after the static "Active:" label at x=180
+  spriteReqActive.print(tel.brkAct ? "YES" : "NO ");
+
+  spriteReqActive.pushSprite(70, NAVBRK_ROW1_Y); // aligns after the static "Requested:" label
+}
+
+static void updateGateSprite(const NavTelemetry &tel)
+{
+  if (!g_spriteOk[SPR_GATES]) return;
+
+  bool gateFresh = (tel.navgateMs != 0) && ((millis() - tel.navgateMs) < STALE_MS);
+  char cacheKey[16];
+  snprintf(cacheKey, sizeof(cacheKey), "%u%u%u%u%u%d", tel.gateNav, tel.gateRef, tel.gateAtt,
+           tel.gateBaro, tel.gateLink, gateFresh);
+  if (strncmp(cacheKey, g_cacheGates, sizeof(cacheKey)) == 0)
+  {
+    return; // gate flags unchanged - skip the redraw (per spec)
+  }
+  strncpy(g_cacheGates, cacheKey, sizeof(g_cacheGates) - 1);
+  g_cacheGates[sizeof(g_cacheGates) - 1] = '\0';
+
+#if GATE_DEBUG_SERIAL
+  Serial.printf("[GATES] fresh=%d nav=%u ref=%u att=%u baro=%u link=%u (navgateMs age=%lums)\n",
+                gateFresh, tel.gateNav, tel.gateRef, tel.gateAtt, tel.gateBaro, tel.gateLink,
+                tel.navgateMs == 0 ? 0UL : (unsigned long)(millis() - tel.navgateMs));
+#endif
+
+  spriteGates.fillSprite(COLOR_BG);
+  spriteGates.setTextSize(1);
+
+  // Slash formatting, real gate booleans only - never recomputed here.
+  struct GateItem { const char *label; unsigned value; };
+  const GateItem gates[5] = {
+      {"Nav", tel.gateNav}, {"Ref", tel.gateRef}, {"Att", tel.gateAtt},
+      {"Baro", tel.gateBaro}, {"Link", tel.gateLink}};
+
+  // Fixed pixel slots (not accumulated textWidth() sums) - one drawString() per gate for
+  // the label, one for "/value" combined. This is the same drawString()-at-a-known-offset
+  // pattern already working in updatePosVelSprites()/updateHzSprite(), deliberately
+  // avoiding the multi-segment setCursor()+print()+textWidth() accumulation this row used
+  // before, which was the one thing structurally different about this sprite vs. every
+  // other one in this file.
+  // Slot pitch tightened from 60 to 48px (~2 chars less gap) per request, label-to-value
+  // offset trimmed from 34 to 28 to match.
+  static const int16_t GATE_SLOT_X[5] = {0, 48, 96, 144, 192};
+  spriteGates.setTextDatum(lgfx::top_left);
+  for (int i = 0; i < 5; i++)
+  {
+    uint16_t valColor = !gateFresh ? COLOR_STALE : (gates[i].value ? COLOR_GOOD : COLOR_BAD);
+    char valBuf[4];
+    snprintf(valBuf, sizeof(valBuf), "/%u", gates[i].value ? 1U : 0U);
+
+    spriteGates.setTextColor(COLOR_DATA_LABEL, COLOR_BG);
+    spriteGates.drawString(gates[i].label, GATE_SLOT_X[i], 0);
+    spriteGates.setTextColor(valColor, COLOR_BG);
+    spriteGates.drawString(valBuf, GATE_SLOT_X[i] + 28, 0);
+  }
+
+  spriteGates.pushSprite(58, NAVBRK_GATE_Y); // aligns after the static "Gates:" label
+}
+
+static void updateSpeedThreshSprite(const NavTelemetry &tel)
+{
+  if (!g_spriteOk[SPR_SPEED_THRESH]) return;
+
+  // Display-only horizontal speed, computed from the existing filtered N/E velocity -
+  // NAVBRAKE's own filtering/control logic is untouched, this is purely a UI convenience
+  // (explicitly permitted: "may be calculated for DISPLAY ONLY from filtered N/E").
+  float speed = sqrtf((tel.velFiltN * tel.velFiltN) + (tel.velFiltE * tel.velFiltE));
+
+  spriteSpeedThresh.fillSprite(COLOR_BG);
+  spriteSpeedThresh.setTextSize(1);
+  spriteSpeedThresh.setTextColor(staleColor(tel.navposMs, COLOR_TEXT), COLOR_BG);
+  spriteSpeedThresh.setCursor(0, 0);
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%.2f m/s", speed);
+  spriteSpeedThresh.print(buf);
+
+  // Threshold is a static reference value (see NAVBRAKE_MAX_VEL_MPS_DISPLAY_ONLY), so it
+  // doesn't need to be part of the change-gated content - stacked below Speed, aligned
+  // after the static "Threshold:" label one row down.
+  spriteSpeedThresh.setTextColor(COLOR_LABEL, COLOR_BG);
+  spriteSpeedThresh.setCursor(0, 18);
+  snprintf(buf, sizeof(buf), "%.2f m/s", (double)NAVBRAKE_MAX_VEL_MPS_DISPLAY_ONLY);
+  spriteSpeedThresh.print(buf);
+
+  spriteSpeedThresh.pushSprite(70, NAVBRK_ROW3_Y); // aligns after the static "Speed:" label
+}
+
+static void updateDiagSprite(const NavTelemetry &tel, uint32_t navHzX10, uint32_t totalLines)
+{
+  if (!g_spriteOk[SPR_DIAG]) return;
+
+  spriteDiag.fillSprite(COLOR_BG);
+  spriteDiag.setTextSize(1);
+  spriteDiag.setTextColor(COLOR_LABEL, COLOR_BG);
+
+  char buf[64];
+  spriteDiag.setCursor(0, 0);
+  snprintf(buf, sizeof(buf), "PKT %lu  AGE %lums  ERR %lu",
+           (unsigned long)totalLines, tel.navAgeMs, tel.navRej);
+  spriteDiag.print(buf);
+
+  spriteDiag.setCursor(0, 20);
+  snprintf(buf, sizeof(buf), "RX %lu.%luHz  DROP %lu",
+           (unsigned long)(navHzX10 / 10U), (unsigned long)(navHzX10 % 10U), tel.navDrop);
+  spriteDiag.print(buf);
+
+  // Aircraft battery, from the flight controller's own VBAT[...] telemetry (real data,
+  // already parsed - just never displayed before). No "tester battery" line: this board
+  // (Makerfabs ESP32 TFT Touch w/ Camera v1.2) is USB-only powered per its own schematic -
+  // no battery connector or voltage-divider circuit exists on it to read.
+  bool vbatFresh = (tel.vbatMs != 0) && ((millis() - tel.vbatMs) < STALE_MS);
+  spriteDiag.setTextColor(vbatFresh ? COLOR_TEXT : COLOR_STALE, COLOR_BG);
+  spriteDiag.setCursor(0, 40);
+  snprintf(buf, sizeof(buf), "Aircraft VBAT %.2fV", tel.vbatMv / 1000.0f);
+  spriteDiag.print(buf);
+
+  spriteDiag.pushSprite(4, DIAG_ROW1_Y);
+}
+
+static void updateDisplay()
+{
+  char buf[24];
   NavTelemetry tel;
+  bool wifiOk, bridgeOk;
+  uint32_t navHzX10, uiHzX10, totalLines;
 
   {
     TelemetryLock lock(g_telMutex);
     tel = g_tel;
+    navHzX10 = g_navHzX10;
+    uiHzX10 = g_uiHzX10;
+    totalLines = g_totalLines;
   }
+  wifiOk = g_wifiConnected;
+  bridgeOk = g_bridgeConnected;
+  (void)buf;
 
   lcd.startWrite();
-
-  bool wifiOk = g_wifiConnected;
-  bool bridgeOk = g_bridgeConnected;
-  snprintf(buf, sizeof(buf), "W:%s B:%s GPS:%lu.%lu UI:%lu.%luHz",
-           wifiOk ? "OK" : "--", bridgeOk ? "OK" : "--",
-           (unsigned long)(g_navHzX10 / 10U), (unsigned long)(g_navHzX10 % 10U),
-           (unsigned long)(g_uiHzX10 / 10U), (unsigned long)(g_uiHzX10 % 10U));
-  setField(F_CONN, buf, (wifiOk && bridgeOk) ? COLOR_GOOD : COLOR_BAD);
-
-  bool navFresh = (tel.navMs != 0) && ((millis() - tel.navMs) < STALE_MS);
-  uint16_t validColor = !navFresh ? COLOR_STALE : (tel.navValid ? COLOR_GOOD : COLOR_BAD);
-  snprintf(buf, sizeof(buf), "GPS: %s", (navFresh && tel.navValid) ? "VALID" : (navFresh ? "INVALID" : "NO DATA"));
-  setField(F_GPS_VALID, buf, validColor);
-
-  snprintf(buf, sizeof(buf), "reason:%s ref:%s cv:%lu ci:%lu drop:%lu",
-           reasonName(tel.navReason), tel.navRef ? "yes" : "no",
-           tel.navCv, tel.navCi, tel.navDrop);
-  setField(F_GPS_REASON, buf, staleColor(tel.navMs, COLOR_TEXT));
-
-  snprintf(buf, sizeof(buf), "fix:%s sats:%u hAcc:%.1fm age:%lums upd:%lums",
-           fixTypeName(tel.navFix), tel.navSats, tel.navHaccCm / 100.0f, tel.navAgeMs, tel.navUpdMs);
-  setField(F_GPS_STATS, buf, staleColor(tel.navMs, COLOR_TEXT));
-
-  snprintf(buf, sizeof(buf), "Pos N/E: %.1f / %.1f m", tel.posN, tel.posE);
-  setField(F_POS, buf, staleColor(tel.navposMs, COLOR_TEXT));
-
-  snprintf(buf, sizeof(buf), "Vel raw N/E: %.2f / %.2f m/s", tel.velRawN, tel.velRawE);
-  setField(F_VEL_RAW, buf, staleColor(tel.navposMs, COLOR_TEXT));
-
-  snprintf(buf, sizeof(buf), "Vel filt N/E: %.2f / %.2f m/s", tel.velFiltN, tel.velFiltE);
-  setField(F_VEL_FILT, buf, staleColor(tel.navposMs, COLOR_TEXT));
-
-  snprintf(buf, sizeof(buf), "NAVBRAKE req:%s active:%s", tel.brkReq ? "YES" : "no", tel.brkAct ? "YES" : "no");
-  setField(F_BRK_STATE, buf, staleColor(tel.navbrkMs, tel.brkAct ? COLOR_GOOD : COLOR_TEXT));
-
-  snprintf(buf, sizeof(buf), "gate N/R/A/B/L:%u/%u/%u/%u/%u latch:%u lim T/A:%u/%u",
-           tel.gateNav, tel.gateRef, tel.gateAtt, tel.gateBaro, tel.gateLink, tel.gateLatch,
-           tel.brkTiltLim, tel.brkAccelLim);
-  setField(F_BRK_LIMITS, buf, staleColor(tel.navgateMs,
-           (tel.gateLatch || !tel.gateNav || !tel.gateRef || !tel.gateAtt || !tel.gateBaro || !tel.gateLink)
-               ? COLOR_WARN : COLOR_TEXT));
-
-  snprintf(buf, sizeof(buf), "des N/E:%.2f/%.2f  err N/E:%.2f/%.2f",
-           tel.brkDesN, tel.brkDesE, tel.brkErrN, tel.brkErrE);
-  setField(F_BRK_DESVEL, buf, staleColor(tel.navbrkMs, COLOR_TEXT));
-
-  snprintf(buf, sizeof(buf), "accel N/E/fwd/right:%.2f/%.2f/%.2f/%.2f m/s2",
-           tel.brkAccelN, tel.brkAccelE, tel.brkAccelFwd, tel.brkAccelRight);
-  setField(F_BRK_ACCEL, buf, staleColor(tel.navbrkMs, COLOR_TEXT));
-
-  snprintf(buf, sizeof(buf), "ang cmd R/P:%.1f/%.1f deg", tel.brkAngRoll, tel.brkAngPitch);
-  setField(F_BRK_ANG, buf, staleColor(tel.navbrkMs, COLOR_TEXT));
-
-  bool armFresh = (tel.armMs != 0) && ((millis() - tel.armMs) < STALE_MS);
-  snprintf(buf, sizeof(buf), "Mode:%s Armed:%s V:%.2f Alt:%.1fm dis:%s Tel:%s",
-           tel.modeMs ? tel.modeName : "-", armFresh ? (tel.armA ? "YES" : "no") : "?",
-           tel.vbatMv / 1000.0f, tel.baroCm / 100.0f, tel.lastDisarmReason,
-           tel.telArmEnabled ? "ON" : "off");
-  setField(F_STATUS_ROW, buf, !armFresh ? COLOR_STALE : (tel.armA ? COLOR_WARN : COLOR_TEXT));
-
-  if (tel.lostMs != 0)
-  {
-    snprintf(buf, sizeof(buf), "Last NAV_LOST: %s (%lus ago)", tel.lostReason, (millis() - tel.lostMs) / 1000UL);
-    setField(F_LOST, buf, COLOR_WARN);
-  }
-
+  updateHzSprite(uiHzX10);
+  updateGpsStatusSprite(tel, wifiOk, bridgeOk);
+  updatePosVelSprites(tel);
+  updateModeTitleSprite(tel);
+  updateReqActiveSprite(tel);
+  updateGateSprite(tel);
+  updateSpeedThreshSprite(tel);
+  updateDiagSprite(tel, navHzX10, totalLines);
   lcd.endWrite();
 }
-
 
 void setup()
 {
   Serial.begin(115200);
 
   lcd.init();
-  lcd.setRotation(1);
-  drawStaticLabels();
+  lcd.setRotation(0); // portrait - panel is natively 320x480, see the Layout comment above
+  initDisplaySprites();
+  drawStaticLayout();
 
   g_telMutex = xSemaphoreCreateMutex();
   g_cmdMutex = xSemaphoreCreateMutex();
@@ -800,10 +1167,12 @@ void loop()
     lastRateMs = now;
   }
 
+  // Non-blocking display pacing (no delay()) - decoupled from GPS/UART/bridge timing,
+  // which all run on bridgeTask (core 0) regardless of display refresh rate.
   if ((now - lastUi) >= UI_REFRESH_MS)
   {
     lastUi = now;
     g_uiFrames++;
-    refreshUi();
+    updateDisplay();
   }
 }
