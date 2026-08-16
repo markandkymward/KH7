@@ -935,17 +935,16 @@ static void App_ServiceSdLog(void)
   {
     uint16_t b;
 
-    /* KNOWN ISSUE (found 2026-08-15, over the ESP32 WiFi bridge, not yet root-caused):
-     * a SDLOG DUMP block's hex output can come back with other telemetry lines
-     * (RX16/ARM/GPS/MODE/etc.) spliced into the MIDDLE of a block's 1024 hex
-     * characters, with no line break - i.e. some other UART6 producer is winning a
-     * race against this 512-call printf("%02X", ...) loop rather than being
-     * serialized after it. Same-session pulls over USB (COM6) of the identical
-     * block range (first=14 last=55) came back with all 42 blocks at the full,
-     * clean 512 bytes each - so this is USB-avoidable in practice, but the
-     * underlying race (likely an ISR-context print - CRSF/GPS UART RX callbacks -
-     * interleaving with this loop's UART6 TX enqueue) is still unfixed. Prefer
-     * --usb for tools/sdlog_analyze.py until this is actually fixed. */
+    /* Historical note (2026-08-15): a SDLOG DUMP block's hex output used to come
+     * back over the WiFi bridge with other telemetry lines spliced into the
+     * MIDDLE of a block's 1024 hex characters. Root-caused and fixed in
+     * Communications_QueuePush()/Pop() (communications.c) - the UART6 TX ring
+     * buffer's head/tail read-modify-write wasn't atomic against
+     * HAL_UART_TxCpltCallback re-kicking the same queue from ISR context, so
+     * under this loop's sustained back-to-back byte pushes the drain side could
+     * desync and start reading stale bytes from an earlier message still sitting
+     * in the reused buffer array. Never reproduced over USB because USB CDC
+     * bypasses this queue entirely (see Communications_FlushUsbTxBuffer()). */
     if (SD_ReadBlock(g_sdlog_dump_block, buf) == SD_OK)
     {
       printf("SDLOG[%lu]=", (unsigned long)g_sdlog_dump_block);

@@ -53,22 +53,48 @@ static uint16_t Communications_QueueNext(uint16_t index, uint16_t size)
   return (uint16_t)((index + 1U) % size);
 }
 
+/* Every caller of these two functions shares one of a handful of ring buffers
+ * (UART6 TX queue, ESC-passthrough queues) between main-loop code and an ISR
+ * (HAL_UART_TxCpltCallback re-kicks the UART6 TX queue after every byte). The
+ * read-modify-write of head/tail must be atomic w.r.t. that ISR: without the
+ * critical section here, a push/pop on one side that gets preempted mid-update
+ * by a pop/push on the other can desync the indices - not a crash, but a
+ * ring buffer that starts draining from a stale offset, i.e. it silently
+ * starts transmitting whatever old bytes are still sitting at that offset
+ * from a previous, already-sent message instead of the current one. Found
+ * 2026-08-15: exactly this desync was splicing old telemetry-line bytes into
+ * the middle of SDLOG DUMP hex blocks under the sustained back-to-back TX
+ * traffic a multi-thousand-byte dump produces (never reproduced over USB,
+ * which doesn't go through this queue at all - see App_ServiceSdLog()). */
 static uint8_t Communications_QueuePush(volatile uint16_t *head,
                                         volatile uint16_t *tail,
                                         uint8_t *buffer,
                                         uint16_t size,
                                         uint8_t value)
 {
-  uint16_t next = Communications_QueueNext(*head, size);
+  uint16_t next;
+  uint8_t pushed;
+  uint32_t primask = __get_PRIMASK();
 
+  /* Save/restore PRIMASK rather than a bare disable/enable pair, so this stays
+   * correct when called from inside Communications_Uart6TxKick()'s own critical
+   * section - a bare __enable_irq() here would re-enable interrupts in the
+   * middle of that caller's section instead of just restoring its own. */
+  __disable_irq();
+  next = Communications_QueueNext(*head, size);
   if (next == *tail)
   {
-    return 0U;
+    pushed = 0U;
   }
+  else
+  {
+    buffer[*head] = value;
+    *head = next;
+    pushed = 1U;
+  }
+  __set_PRIMASK(primask);
 
-  buffer[*head] = value;
-  *head = next;
-  return 1U;
+  return pushed;
 }
 
 static uint8_t Communications_QueuePop(volatile uint16_t *head,
@@ -77,14 +103,23 @@ static uint8_t Communications_QueuePop(volatile uint16_t *head,
                                        uint16_t size,
                                        uint8_t *value)
 {
+  uint8_t popped;
+  uint32_t primask = __get_PRIMASK();
+
+  __disable_irq();
   if (*tail == *head)
   {
-    return 0U;
+    popped = 0U;
   }
+  else
+  {
+    *value = buffer[*tail];
+    *tail = Communications_QueueNext(*tail, size);
+    popped = 1U;
+  }
+  __set_PRIMASK(primask);
 
-  *value = buffer[*tail];
-  *tail = Communications_QueueNext(*tail, size);
-  return 1U;
+  return popped;
 }
 
 static uint8_t Communications_IsUart6AutoExecutableCommand(const char *line, size_t len)
@@ -160,21 +195,28 @@ static uint8_t Communications_IsUsbTxBusy(void)
 
 static void Communications_Uart6TxKick(void)
 {
-  /* Called from both the main loop and the TX-complete ISR - guard the busy
-   * check-and-set so the two can never both start a transmit at once. */
+  /* Called from both the main loop (after every push) and the TX-complete ISR
+   * (after every byte) - the whole check/pop/transmit sequence has to be one
+   * critical section, not just the busy check, otherwise the main-loop call can
+   * be preempted between "claim busy" and "actually start the HAL transmit" by
+   * the ISR's own kick, which claims busy again and starts ITS transmit; the
+   * original (resumed) call then starts a second HAL_UART_Transmit_IT while one
+   * is already in flight, and its failure path clears g_uart6_tx_busy out from
+   * under the transmit that's genuinely still running. */
   __disable_irq();
+
   if (g_uart6_tx_busy != 0U)
   {
     __enable_irq();
     return;
   }
   g_uart6_tx_busy = 1U;
-  __enable_irq();
 
   if (Communications_QueuePop(&g_uart6_tx_queue_head, &g_uart6_tx_queue_tail,
                               g_uart6_tx_queue, COMM_UART6_TX_QUEUE_SIZE, &g_uart6_tx_byte) == 0U)
   {
     g_uart6_tx_busy = 0U;
+    __enable_irq();
     return;
   }
 
@@ -182,6 +224,7 @@ static void Communications_Uart6TxKick(void)
   {
     g_uart6_tx_busy = 0U;
   }
+  __enable_irq();
 }
 
 static void Communications_FlushUsbTxBuffer(void)
