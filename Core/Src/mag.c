@@ -374,19 +374,62 @@ float Mag_GetZGauss(void)
   return g_z_g;
 }
 
-float Mag_GetHeadingDeg(void)
+/* Chip's raw Z axis was never referenced before this (only X/Y, for the flat
+ * formula) - flip to -1.0f if bench validation (see below) shows heading
+ * swinging the wrong way specifically when tilting rather than yawing. */
+#define MAG_Z_SIGN 1.0f
+
+float Mag_GetHeadingDeg(float roll_deg, float pitch_deg)
 {
   float heading_deg;
   float cal_x;
   float cal_y;
+  float mz;
+  float roll_rad;
+  float pitch_rad;
+  float sin_roll;
+  float cos_roll;
+  float sin_pitch;
+  float cos_pitch;
+  float xh;
+  float yh;
 
   cal_x = (g_x_g - g_offset_x) * g_scale_x;
   cal_y = (g_y_g - g_offset_y) * g_scale_y;
+  mz = MAG_Z_SIGN * g_z_g; /* not hard/soft-iron calibrated - MAG_CAL only sweeps level */
 
-  /* Swapping the atan2 args (vs. atan2(y,x)) both rotates 90deg and mirrors the
-   * rotation sense in one step - matches this board's physical chip mounting
-   * (reported as "90 CW and inverted" relative to true heading). */
-  heading_deg = atan2f(cal_x, cal_y) * (180.0f / 3.14159265f);
+  /* Standard tilt-compensated heading (e.g. NXP AN4248), in body FRD axes
+   * (mx=forward, my=right, mz=down), roll/pitch in the standard aviation
+   * sign convention this project already uses elsewhere (+roll=right down,
+   * +pitch=nose up - see Attitude_GetBoardAnglesDeg()):
+   *   Xh = mx*cos(pitch) + my*sin(roll)*sin(pitch) + mz*cos(roll)*sin(pitch)
+   *   Yh = my*cos(roll) - mz*sin(roll)
+   *   heading = atan2(Yh, Xh)
+   *
+   * mx/my aren't cal_x/cal_y directly - this board's chip is mounted rotated
+   * ("90 CW and inverted" per the flat-formula's history: atan2(cal_x,cal_y)
+   * instead of the naive atan2(y,x)). Matching that already-validated flat
+   * formula against the standard bearing formula atan2(my,mx) at roll=pitch=0
+   * algebraically forces mx=cal_y, my=cal_x exactly (both are already
+   * hard/soft-iron corrected) - substituted directly below, so this
+   * reduces to the exact old formula at zero tilt. mz's sign is the one
+   * unverified assumption (see MAG_Z_SIGN) - it only scales the sin(roll)/
+   * sin(pitch) terms, so it's zero-impact at zero tilt and small-impact at
+   * small tilt, but do verify: with yaw held fixed, tilt the board by hand
+   * in roll and then pitch and confirm the printed heading stays
+   * approximately constant rather than swinging - if it swings consistently
+   * the wrong way for one axis, MAG_Z_SIGN needs flipping. */
+  roll_rad = roll_deg * (3.14159265f / 180.0f);
+  pitch_rad = pitch_deg * (3.14159265f / 180.0f);
+  sin_roll = sinf(roll_rad);
+  cos_roll = cosf(roll_rad);
+  sin_pitch = sinf(pitch_rad);
+  cos_pitch = cosf(pitch_rad);
+
+  xh = (cal_y * cos_pitch) + (cal_x * sin_roll * sin_pitch) + (mz * cos_roll * sin_pitch);
+  yh = (cal_x * cos_roll) - (mz * sin_roll);
+
+  heading_deg = atan2f(yh, xh) * (180.0f / 3.14159265f);
   if (heading_deg < 0.0f)
   {
     heading_deg += 360.0f;

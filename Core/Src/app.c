@@ -2306,6 +2306,13 @@ void App_Update(void)
   float pitch_deg;
   float roll_deg;
   float yaw_deg;
+  /* Raw (pre attitude-zero-offset) tilt for Mag_GetHeadingDeg() - captured right
+   * after Attitude_GetBoardAnglesDeg() below, before pitch_deg/roll_deg get the
+   * startup-offset subtracted out for control-loop use. Tilt compensation needs
+   * the board's true physical tilt relative to gravity, not a value zeroed to
+   * whatever attitude it happened to be at when the pilot last zeroed it. */
+  float mag_tilt_roll_deg = 0.0f;
+  float mag_tilt_pitch_deg = 0.0f;
   float battery_voltage_v;
   App_FlightMode_t flight_mode;
   uint16_t mode_us;
@@ -2609,6 +2616,8 @@ void App_Update(void)
                          az_g,
                          ((float)APP_CONTROL_LOOP_MS) * 0.001f);
       Attitude_GetBoardAnglesDeg(&pitch_deg, &roll_deg, &yaw_deg);
+      mag_tilt_roll_deg = roll_deg;
+      mag_tilt_pitch_deg = pitch_deg;
 
       if (g_attitude_zero_request != 0U)
       {
@@ -2662,7 +2671,7 @@ void App_Update(void)
 
         if (mag_yaw_ref_captured == 0U)
         {
-          mag_heading_at_ref_deg = Mag_GetHeadingDeg();
+          mag_heading_at_ref_deg = Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg);
           mag_ref_field_g = mag_field_now_g;
           mag_yaw_ref_captured = 1U;
           mag_yaw_nudge_dps = 0.0f;
@@ -2674,7 +2683,7 @@ void App_Update(void)
         }
         else
         {
-          float mag_delta_deg = Attitude_WrapAngle180(Mag_GetHeadingDeg() - mag_heading_at_ref_deg);
+          float mag_delta_deg = Attitude_WrapAngle180(Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg) - mag_heading_at_ref_deg);
           float yaw_error_deg = Attitude_WrapAngle180(mag_delta_deg - yaw_deg);
 
           mag_yaw_nudge_dps = App_ClampFloat(yaw_error_deg * APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG,
@@ -2706,7 +2715,7 @@ void App_Update(void)
         Telemetry_PrintGpsState(GPS_IsConfigured(), GPS_IsHealthy(), GPS_GetFixType(), GPS_GetNumSatellites(),
                                GPS_GetLatitudeDeg(), GPS_GetLongitudeDeg(), GPS_GetAltitudeM());
         Telemetry_PrintMagState(Mag_IsHealthy(), Mag_GetXGauss(), Mag_GetYGauss(), Mag_GetZGauss(),
-                               Mag_GetHeadingDeg());
+                               Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg));
         Telemetry_PrintNavState(nav_state.valid, nav_state.reference_valid, (uint8_t)nav_state.invalid_reason,
                                nav_state.fix_type, nav_state.num_sv, nav_state.h_acc_m,
                                nav_state.age_ms, nav_state.update_period_ms,
@@ -3456,7 +3465,7 @@ void App_Update(void)
           sdlog_rec.throttle_actual_us = (int16_t)throttle_term;
           sdlog_rec.arm_us = arm_us;
           sdlog_rec.yaw_deg_x10 = (int16_t)(yaw_deg * 10.0f);
-          sdlog_rec.mag_heading_x10 = (uint16_t)(Mag_GetHeadingDeg() * 10.0f);
+          sdlog_rec.mag_heading_x10 = (uint16_t)(Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg) * 10.0f);
 
           sdlog_rec.nav_flags = (uint8_t)((nav_brake_requested != 0U ? APP_SDLOG_NAV_FLAG_REQUESTED : 0U) |
                                           (nav_brake_active != 0U ? APP_SDLOG_NAV_FLAG_ACTIVE : 0U) |
@@ -3601,6 +3610,8 @@ void App_Update(void)
                        az_g,
                        dt_s);
     Attitude_GetBoardAnglesDeg(&pitch_deg, &roll_deg, &yaw_deg);
+    mag_tilt_roll_deg = roll_deg;
+    mag_tilt_pitch_deg = pitch_deg;
 
     if (g_attitude_zero_request != 0U)
     {
@@ -3654,7 +3665,7 @@ void App_Update(void)
 
       if (mag_yaw_ref_captured == 0U)
       {
-        mag_heading_at_ref_deg = Mag_GetHeadingDeg();
+        mag_heading_at_ref_deg = Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg);
         mag_ref_field_g = mag_field_now_g;
         mag_yaw_ref_captured = 1U;
         mag_yaw_nudge_dps = 0.0f;
@@ -3666,7 +3677,7 @@ void App_Update(void)
       }
       else
       {
-        float mag_delta_deg = Attitude_WrapAngle180(Mag_GetHeadingDeg() - mag_heading_at_ref_deg);
+        float mag_delta_deg = Attitude_WrapAngle180(Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg) - mag_heading_at_ref_deg);
         float yaw_error_deg = Attitude_WrapAngle180(mag_delta_deg - yaw_deg);
 
         mag_yaw_nudge_dps = App_ClampFloat(yaw_error_deg * APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG,
@@ -3699,7 +3710,7 @@ void App_Update(void)
       Telemetry_PrintGpsState(GPS_IsConfigured(), GPS_IsHealthy(), GPS_GetFixType(), GPS_GetNumSatellites(),
                              GPS_GetLatitudeDeg(), GPS_GetLongitudeDeg(), GPS_GetAltitudeM());
       Telemetry_PrintMagState(Mag_IsHealthy(), Mag_GetXGauss(), Mag_GetYGauss(), Mag_GetZGauss(),
-                             Mag_GetHeadingDeg());
+                             Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg));
       Telemetry_PrintNavState(nav_state.valid, nav_state.reference_valid, (uint8_t)nav_state.invalid_reason,
                              nav_state.fix_type, nav_state.num_sv, nav_state.h_acc_m,
                              nav_state.age_ms, nav_state.update_period_ms,
