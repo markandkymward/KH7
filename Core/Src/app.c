@@ -127,7 +127,17 @@
  * independent of, and not fixed by, the pitch-sign fix. This is the same
  * motor-current magnetic interference already called out near
  * APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG below - do not trust NAVBRAKE until that's
- * actually resolved, not just mitigated. */
+ * actually resolved, not just mitigated.
+ *
+ * FOLLOW-UP (2026-08-16, real flight, 190 samples/6.24s): tracking error is not
+ * just ambient motor-current interference - it's substantially worse specifically
+ * while the pilot is actively commanding yaw. While holding heading (stick
+ * centered, 164 samples): rms 6.4deg peak 22.3deg. While commanding yaw (stick
+ * active, 26 samples): rms 21.9deg peak 32.4deg. So active rotation itself
+ * degrades compass/gyro agreement well beyond the hover-only baseline - likely
+ * magnetometer response lag relative to the gyro-integrated estimate, or the
+ * yaw-nudge correction coping worse with a moving target than a steady one.
+ * Sharpens, doesn't change, the conclusion above. */
 #define APP_NAV_BRAKE_SWITCH_THRESHOLD_US   2000U
 /* Conservative first-pass limits (see user-selected 1.5 m/s max velocity):
  * kept at/near the low end of the suggested ranges since this mode is unflown. */
