@@ -55,6 +55,7 @@ static size_t client_tx_tail[BRIDGE_MAX_CLIENTS] = {0};
 static size_t client_tx_count[BRIDGE_MAX_CLIENTS] = {0};
 
 static uint32_t last_status_ms = 0;
+static uint32_t last_uart_rx_ms = 0;
 static uint32_t last_wifi_retry_ms = 0;
 static uint32_t wifi_connect_start_ms = 0;
 static uint32_t last_heartbeat_ms = 0;
@@ -484,6 +485,7 @@ void loop()
       }
     }
     uart_to_tcp_bytes += (uint32_t)count;
+    last_uart_rx_ms = millis();
     if (any_queued)
     {
       pulse_activity_led();
@@ -531,11 +533,50 @@ void loop()
             (unsigned long)client_dropped_bytes[0],
             (unsigned long)client_dropped_bytes[1],
             (unsigned long)client_dropped_bytes[2]);
-    bridge_client_printf("[BRIDGE] STAT wifi=%s rssi=%d u2t=%lu t2u=%lu\r\n",
-                         wifi_status_text(WiFi.status()),
-                         WiFi.RSSI(),
-                         (unsigned long)uart_to_tcp_bytes,
-                         (unsigned long)tcp_to_uart_bytes);
+
+    /* Found 2026-08-16: this client-facing broadcast shares the same per-client
+     * TX ring buffer as UART-relayed bytes (both go through bridge_client_queue()),
+     * and used to fire on a strict 1-second wall clock with no idea whether a
+     * relayed line (e.g. a SDLOG DUMP block's ~1KB hex line) was still mid-transfer -
+     * confirmed in a real capture: hex output cut off mid-line, "[BRIDGE] STAT..."
+     * spliced in, then the rest of the block's hex resumed after it on later loop()
+     * iterations.
+     *
+     * First attempt (also 2026-08-16) gated this on Serial2.available() == 0 - which
+     * turned out to be nearly always true right here regardless of whether a transfer
+     * was still going, since it's checked right after the drain loop above already
+     * emptied it THIS iteration; it only ever tells you "this ~1-2ms tick is done",
+     * never "the whole multi-second transfer is done". Confirmed by the truncations
+     * still landing ~every 11 blocks - essentially still every ~1s tick, i.e. the
+     * check wasn't suppressing anything. What actually distinguishes "still streaming"
+     * from "genuinely idle" is recency: at 115200 baud a live multi-block dump refills
+     * Serial2's RX every couple ms (the STM32 side re-fills its own TX queue just as
+     * it drains), so last_uart_rx_ms stays fresh throughout: normal (non-dump)
+     * telemetry has real ~100ms+ gaps between bursts (APP_IMU_TELEMETRY_MS), so a
+     * 50ms idle requirement finds plenty of safe windows during normal operation but
+     * blocks for a live dump's entire duration. */
+    if ((millis() - last_uart_rx_ms) >= 50U)
+    {
+      bool relay_idle = true;
+
+      for (int i = 0; i < BRIDGE_MAX_CLIENTS; i++)
+      {
+        if (clients[i].connected() && (client_tx_count[i] != 0U))
+        {
+          relay_idle = false;
+          break;
+        }
+      }
+
+      if (relay_idle)
+      {
+        bridge_client_printf("[BRIDGE] STAT wifi=%s rssi=%d u2t=%lu t2u=%lu\r\n",
+                             wifi_status_text(WiFi.status()),
+                             WiFi.RSSI(),
+                             (unsigned long)uart_to_tcp_bytes,
+                             (unsigned long)tcp_to_uart_bytes);
+      }
+    }
   }
 
   update_activity_led();
