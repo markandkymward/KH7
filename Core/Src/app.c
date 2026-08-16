@@ -824,6 +824,25 @@ typedef enum
 } App_SdLogCmd_t;
 
 #define APP_SDLOG_DUMP_BLOCKS_PER_CALL 4U
+/* Used to gate how many blocks get pushed into the UART6 TX queue per
+ * App_Update() call against how much room is actually free (see
+ * APP_SDLOG_DUMP_BLOCKS_PER_CALL's cap above) - at 115200 baud the 2048-byte
+ * queue drains far slower than this loop can fill it, so pushing blindly up
+ * to the fixed per-call cap regardless of backlog (found 2026-08-15) silently
+ * dropped most of every block after the first one or two via the queue's own
+ * "drop when full" overflow handling.
+ *
+ * One block's printed line is "SDLOG[" + up to 5 digits + "]=" + 1024 hex
+ * chars + "\r\n", up to ~1039 bytes - but requiring only that much headroom
+ * (tried 2026-08-15) still let occasional blocks come back partially
+ * truncated: nothing else can push into this queue while one block is being
+ * printed (this loop is a single uninterrupted main-loop call), so the
+ * margin should have held, but it was too close to the worst case to be
+ * confident it always does. Requiring the queue to be essentially fully
+ * drained first removes that doubt entirely, at the cost of a small amount of
+ * pipelining - acceptable since this dump is already deliberately spread
+ * across many App_Update() calls rather than optimized for raw throughput. */
+#define APP_SDLOG_DUMP_QUEUE_FREE_THRESHOLD_BYTES 2000U
 
 static volatile App_SdLogCmd_t g_sdlog_cmd_pending = APP_SDLOGCMD_NONE;
 static uint8_t g_sdlog_dump_active = 0U;
@@ -929,7 +948,8 @@ static void App_ServiceSdLog(void)
   }
 
   /* Dumping is chunked across many App_Update() calls (a few blocks at a
-   * time) instead of one long synchronous loop, so a large dump never stalls
+   * time, further throttled below against actual UART6 TX queue headroom)
+   * instead of one long synchronous loop, so a large dump never stalls
    * telemetry/receiver servicing for more than a few SD block reads. */
   for (i = 0U; (i < APP_SDLOG_DUMP_BLOCKS_PER_CALL) && (g_sdlog_dump_active != 0U); i++)
   {
@@ -944,7 +964,22 @@ static void App_ServiceSdLog(void)
      * under this loop's sustained back-to-back byte pushes the drain side could
      * desync and start reading stale bytes from an earlier message still sitting
      * in the reused buffer array. Never reproduced over USB because USB CDC
-     * bypasses this queue entirely (see Communications_FlushUsbTxBuffer()). */
+     * bypasses this queue entirely (see Communications_FlushUsbTxBuffer()).
+     *
+     * That fix stopped the splicing, but exposed a second, separate problem:
+     * with the queue now correctly ordered, most of every block past the
+     * first one or two came back cleanly TRUNCATED instead - the queue is
+     * simply too small (2048 bytes) and too slow to drain (115200 baud) to
+     * absorb APP_SDLOG_DUMP_BLOCKS_PER_CALL blocks (~4KB) every 2ms, so it
+     * fills and starts dropping almost immediately regardless of ordering.
+     * Stop pushing more blocks this call once there isn't comfortably enough
+     * room left for one more - the remaining blocks are simply picked up on a
+     * later call once the ISR has had real time to drain what's queued. */
+    if (Communications_Uart6TxQueueFreeBytes() < APP_SDLOG_DUMP_QUEUE_FREE_THRESHOLD_BYTES)
+    {
+      break;
+    }
+
     if (SD_ReadBlock(g_sdlog_dump_block, buf) == SD_OK)
     {
       printf("SDLOG[%lu]=", (unsigned long)g_sdlog_dump_block);

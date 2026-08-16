@@ -193,30 +193,56 @@ static uint8_t Communications_IsUsbTxBusy(void)
   return (uint8_t)(hcdc->TxState != 0U);
 }
 
+uint16_t Communications_Uart6TxQueueFreeBytes(void)
+{
+  uint16_t head;
+  uint16_t tail;
+  uint16_t used;
+  uint32_t primask = __get_PRIMASK();
+
+  /* head/tail are each individually atomic on this core, but read them as a
+   * consistent pair anyway - the ISR can advance tail between the two reads
+   * otherwise, which would only ever make the result too pessimistic here
+   * (not unsafe), but there's no reason to allow that when it's this cheap. */
+  __disable_irq();
+  head = g_uart6_tx_queue_head;
+  tail = g_uart6_tx_queue_tail;
+  __set_PRIMASK(primask);
+
+  used = (uint16_t)((head + COMM_UART6_TX_QUEUE_SIZE - tail) % COMM_UART6_TX_QUEUE_SIZE);
+  /* Communications_QueueNext()'s "next == tail means full" check means one slot
+   * is never usable - capacity is size-1, not size. */
+  return (uint16_t)((COMM_UART6_TX_QUEUE_SIZE - 1U) - used);
+}
+
 static void Communications_Uart6TxKick(void)
 {
   /* Called from both the main loop (after every push) and the TX-complete ISR
-   * (after every byte) - the whole check/pop/transmit sequence has to be one
-   * critical section, not just the busy check, otherwise the main-loop call can
-   * be preempted between "claim busy" and "actually start the HAL transmit" by
-   * the ISR's own kick, which claims busy again and starts ITS transmit; the
-   * original (resumed) call then starts a second HAL_UART_Transmit_IT while one
-   * is already in flight, and its failure path clears g_uart6_tx_busy out from
-   * under the transmit that's genuinely still running. */
+   * (after every byte). Only the busy check-and-set needs to be atomic against
+   * the ISR's own kick - that's what stops two calls from both starting a
+   * transmit. HAL_UART_Transmit_IT() itself deliberately runs with interrupts
+   * enabled: wrapping it too (tried 2026-08-15) adds disable/enable overhead on
+   * every single transmitted byte, which throttled the ISR-driven drain badly
+   * under a SD log dump's sustained burst - most blocks after the first came
+   * back silently truncated (ring buffer's existing "drop when full" behavior
+   * triggering on nearly every block, not the corruption this was meant to fix).
+   * Communications_QueuePop()/Push() are independently atomic (see above), which
+   * is what actually has to be true for correctness; a rare preemption here in
+   * the gap before HAL_UART_Transmit_IT starts costs at worst one dropped byte
+   * from an already best-effort, drop-when-overloaded queue - not corruption. */
   __disable_irq();
-
   if (g_uart6_tx_busy != 0U)
   {
     __enable_irq();
     return;
   }
   g_uart6_tx_busy = 1U;
+  __enable_irq();
 
   if (Communications_QueuePop(&g_uart6_tx_queue_head, &g_uart6_tx_queue_tail,
                               g_uart6_tx_queue, COMM_UART6_TX_QUEUE_SIZE, &g_uart6_tx_byte) == 0U)
   {
     g_uart6_tx_busy = 0U;
-    __enable_irq();
     return;
   }
 
@@ -224,7 +250,6 @@ static void Communications_Uart6TxKick(void)
   {
     g_uart6_tx_busy = 0U;
   }
-  __enable_irq();
 }
 
 static void Communications_FlushUsbTxBuffer(void)

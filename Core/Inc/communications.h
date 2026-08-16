@@ -20,6 +20,13 @@ void Communications_GetUart6Debug(uint32_t *rx_bytes,
 								  uint32_t *last_byte,
 								  uint32_t *cmd_len,
 								  uint32_t *nonprint_bytes);
+/* Bytes free in the UART6 TX ring buffer right now. At 115200 baud the queue
+ * (2048 bytes) drains far slower than a burst of printf() calls can fill it -
+ * a producer pushing a lot of data in one go (SD log dump) must check this
+ * before deciding whether to produce more this iteration, rather than pushing
+ * a fixed amount regardless of backlog and letting most of it get silently
+ * dropped by the queue's own overflow handling. */
+uint16_t Communications_Uart6TxQueueFreeBytes(void);
 int __io_putchar(int ch);
 
 #ifdef __cplusplus
