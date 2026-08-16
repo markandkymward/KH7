@@ -55,6 +55,20 @@
 			],
 			"isBackground": true,
 			"problemMatcher": []
+		},
+		{
+			"label": "Start KH7 from USB DFU",
+			"type": "shell",
+			"command": "C:/Program Files/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/STM32_Programmer_CLI.exe",
+			"args": [
+				"-c",
+				"port=usb1",
+				"-g",
+				"0x08000000"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
 		}
 	]
 }

@@ -22,6 +22,10 @@
 #include "stm32h7xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <string.h>
+#include "fault_record.h"
+#include "motors.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -46,12 +50,60 @@
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN PFP */
-
+void HardFault_HandlerC(uint32_t *stack_frame);
+void MemManage_HandlerC(uint32_t *stack_frame);
+void BusFault_HandlerC(uint32_t *stack_frame);
+void UsageFault_HandlerC(uint32_t *stack_frame);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+extern UART_HandleTypeDef huart6;
 
+/* Reports fault registers over UART6 (bypassing all buffering) and persists them in
+ * RAM_D3 (survives the IWDG reset that follows) so the next boot can report/log them
+ * even if nothing was listening on UART6 at the exact moment of the crash. */
+static void Fault_ReportAndHalt(const char *name, uint32_t *stack_frame)
+{
+  char buf[160];
+  int len;
+  volatile FaultRecord_t *rec = FAULT_RECORD;
+
+  rec->magic = FAULT_RECORD_MAGIC;
+  memset((void *)rec->name, 0, sizeof(rec->name));
+  strncpy((char *)rec->name, name, sizeof(rec->name) - 1U);
+  rec->pc = stack_frame[6];
+  rec->lr = stack_frame[5];
+  rec->cfsr = SCB->CFSR;
+  rec->hfsr = SCB->HFSR;
+  rec->mmfar = SCB->MMFAR;
+  rec->bfar = SCB->BFAR;
+
+  len = snprintf(buf, sizeof(buf),
+                 "\r\nFAULT[%s] pc=0x%08lX lr=0x%08lX cfsr=0x%08lX hfsr=0x%08lX mmfar=0x%08lX bfar=0x%08lX\r\n",
+                 name,
+                 (unsigned long)stack_frame[6],
+                 (unsigned long)stack_frame[5],
+                 (unsigned long)SCB->CFSR,
+                 (unsigned long)SCB->HFSR,
+                 (unsigned long)SCB->MMFAR,
+                 (unsigned long)SCB->BFAR);
+
+  if (len > 0)
+  {
+    HAL_UART_Transmit(&huart6, (uint8_t *)buf, (uint16_t)len, 100U);
+  }
+
+  /* No IWDG in this build, so this hang is not guaranteed to end in a reset -
+   * force the motors to idle before we spin, otherwise they stay at whatever
+   * PWM they were at the instant of the fault. */
+  Motors_ForceIdleRegistersOnly();
+
+  while (1)
+  {
+    /* Intentionally hang: persisted record above will be reported/logged at next boot (once something resets the board). */
+  }
+}
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
@@ -84,61 +136,77 @@ void NMI_Handler(void)
 /**
   * @brief This function handles Hard fault interrupt.
   */
-void HardFault_Handler(void)
+__attribute__((naked)) void HardFault_Handler(void)
 {
-  /* USER CODE BEGIN HardFault_IRQn 0 */
+  __asm volatile (
+    "tst lr, #4         \n"
+    "ite eq             \n"
+    "mrseq r0, msp      \n"
+    "mrsne r0, psp      \n"
+    "b HardFault_HandlerC\n"
+  );
+}
 
-  /* USER CODE END HardFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_HardFault_IRQn 0 */
-    /* USER CODE END W1_HardFault_IRQn 0 */
-  }
+void HardFault_HandlerC(uint32_t *stack_frame)
+{
+  Fault_ReportAndHalt("HARDFAULT", stack_frame);
 }
 
 /**
   * @brief This function handles Memory management fault.
   */
-void MemManage_Handler(void)
+__attribute__((naked)) void MemManage_Handler(void)
 {
-  /* USER CODE BEGIN MemoryManagement_IRQn 0 */
+  __asm volatile (
+    "tst lr, #4         \n"
+    "ite eq             \n"
+    "mrseq r0, msp      \n"
+    "mrsne r0, psp      \n"
+    "b MemManage_HandlerC\n"
+  );
+}
 
-  /* USER CODE END MemoryManagement_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_MemoryManagement_IRQn 0 */
-    /* USER CODE END W1_MemoryManagement_IRQn 0 */
-  }
+void MemManage_HandlerC(uint32_t *stack_frame)
+{
+  Fault_ReportAndHalt("MEMFAULT", stack_frame);
 }
 
 /**
   * @brief This function handles Pre-fetch fault, memory access fault.
   */
-void BusFault_Handler(void)
+__attribute__((naked)) void BusFault_Handler(void)
 {
-  /* USER CODE BEGIN BusFault_IRQn 0 */
+  __asm volatile (
+    "tst lr, #4         \n"
+    "ite eq             \n"
+    "mrseq r0, msp      \n"
+    "mrsne r0, psp      \n"
+    "b BusFault_HandlerC\n"
+  );
+}
 
-  /* USER CODE END BusFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_BusFault_IRQn 0 */
-    /* USER CODE END W1_BusFault_IRQn 0 */
-  }
+void BusFault_HandlerC(uint32_t *stack_frame)
+{
+  Fault_ReportAndHalt("BUSFAULT", stack_frame);
 }
 
 /**
   * @brief This function handles Undefined instruction or illegal state.
   */
-void UsageFault_Handler(void)
+__attribute__((naked)) void UsageFault_Handler(void)
 {
-  /* USER CODE BEGIN UsageFault_IRQn 0 */
+  __asm volatile (
+    "tst lr, #4         \n"
+    "ite eq             \n"
+    "mrseq r0, msp      \n"
+    "mrsne r0, psp      \n"
+    "b UsageFault_HandlerC\n"
+  );
+}
 
-  /* USER CODE END UsageFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_UsageFault_IRQn 0 */
-    /* USER CODE END W1_UsageFault_IRQn 0 */
-  }
+void UsageFault_HandlerC(uint32_t *stack_frame)
+{
+  Fault_ReportAndHalt("USAGEFAULT", stack_frame);
 }
 
 /**

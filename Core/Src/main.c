@@ -42,6 +42,8 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+static uint32_t g_reset_cause_flags;
+
 ADC_HandleTypeDef hadc1;
 ADC_HandleTypeDef hadc3;
 
@@ -113,7 +115,9 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
+  /* Latch reset cause before clearing, so it can be reported once UART6 is up. */
+  g_reset_cause_flags = RCC->RSR;
+  __HAL_RCC_CLEAR_RESET_FLAGS();
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -144,6 +148,15 @@ int main(void)
   MX_TIM2_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
+  printf("\r\nRESET_CAUSE[%s%s%s%s%s%s] raw=0x%08lX\r\n",
+         (g_reset_cause_flags & RCC_RSR_IWDG1RSTF) ? "IWDG " : "",
+         (g_reset_cause_flags & RCC_RSR_WWDG1RSTF) ? "WWDG " : "",
+         (g_reset_cause_flags & RCC_RSR_BORRSTF) ? "BOR " : "",
+         (g_reset_cause_flags & RCC_RSR_PINRSTF) ? "PIN " : "",
+         (g_reset_cause_flags & RCC_RSR_PORRSTF) ? "POR " : "",
+         (g_reset_cause_flags & RCC_RSR_SFTRSTF) ? "SOFT " : "",
+         (unsigned long)g_reset_cause_flags);
+
   App_Init();
 
   /* USER CODE END 2 */
@@ -1055,6 +1068,7 @@ void Error_Handler(void)
   }
   /* USER CODE END Error_Handler_Debug */
 }
+
 #ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number

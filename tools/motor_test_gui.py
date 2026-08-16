@@ -4,6 +4,7 @@ import re
 import socket
 import struct
 import threading
+import time
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -16,9 +17,12 @@ from serial import SerialException
 ARM_LINE_RE = re.compile(
     r"ARM\[a=(\d+) sw=(\d+) lowSeen=(\d+) thr=(\d+) m\]=\[(\d+) (\d+) (\d+) (\d+)\]"
 )
+ARM_EVENT_RE = re.compile(
+    r"ARM_EVENT\[DISARM reason=([^\s\]]+) link=(\d+) arm_us=(\d+) age_ms=(\d+)\]"
+)
 RX_LINE_RE = re.compile(r"RX\[link=(\d+) frames=(\d+) us\]=\[(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\]")
 RX16_LINE_RE = re.compile(
-    r"RX16\[link=(\d+) frames=(\d+) us\]=\["
+    r"RX16\[link=(\d+) frames=(\d+) age=(\d+) crc=(\d+) sync=(\d+) ore=(\d+) fe=(\d+) ne=(\d+) us\]=\["
     r"(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+"
     r"(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\]"
 )
@@ -42,6 +46,29 @@ MAG_CAL_OK_RE = re.compile(
     r"MAG_CAL\[OK ox=(-?\d*\.?\d+) oy=(-?\d*\.?\d+) sx=(-?\d*\.?\d+) sy=(-?\d*\.?\d+)\]"
 )
 MAG_CAL_FAIL_RE = re.compile(r"MAG_CAL\[FAIL([^\]]*)\]")
+NAV_LINE_RE = re.compile(
+    r"NAV\[valid ref reason fix sats hacc_cm age_ms upd_ms cv ci dup rej drop\]=\["
+    r"(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(-?\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\]"
+)
+NAVPOS_LINE_RE = re.compile(
+    r"NAVPOS\[n e\]=\[(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\]\s+"
+    r"velraw=\[(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\]\s+"
+    r"velfilt=\[(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\]"
+)
+NAVBRK_LINE_RE = re.compile(
+    r"NAVBRK\[req act tiltlim acclim\]=\[(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\]\s+"
+    r"desvel=\[(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\]\s+"
+    r"velerr=\[(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\]\s+"
+    r"accel=\[(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\]\s+"
+    r"ang=\[(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\]"
+)
+NAV_LOST_RE = re.compile(r"NAV_LOST\[reason=([^\]]+)\]")
+NAV_FIX_NAMES = {0: "No fix", 1: "Dead reckoning", 2: "2D", 3: "3D", 4: "GNSS+DR", 5: "Time only"}
+NAV_INVALID_REASON_NAMES = {
+    0: "NONE", 1: "NO_3D_FIX", 2: "GPS_STALE", 3: "BAD_UPDATE_INTERVAL",
+    4: "POOR_ACCURACY", 5: "VELOCITY_INVALID", 6: "POSITION_JUMP", 7: "VELOCITY_JUMP",
+    8: "REACQUIRING", 9: "NO_REFERENCE", 10: "NONFINITE",
+}
 MODE_LINE_RE = re.compile(r"MODE\[name=([^\s\]]+) ch6=(\d+)\]")
 ATT_LINE_RE = re.compile(r"ATT\[src=([^\]]+)\]=\[ROLL_KP\s+([-+]?\d*\.?\d+)\s+PITCH_KP\s+([-+]?\d*\.?\d+)\s+MAX_ANG\s+([-+]?\d*\.?\d+)\]")
 PID_LINE_RE = re.compile(
@@ -156,6 +183,12 @@ class Kh7GroundGui:
             "baro_alt": [],
             "baro_vz": [],
             "mag_heading": [],
+            "nav_north": [],
+            "nav_east": [],
+            "nav_filt_vel_n": [],
+            "nav_filt_vel_e": [],
+            "nav_desired_vel_n": [],
+            "nav_desired_vel_e": [],
         }
 
         self.transport_var = tk.StringVar(value="USB")
@@ -203,12 +236,29 @@ class Kh7GroundGui:
         self.mag_cal_status_var = tk.StringVar(value="Compass cal: not calibrated")
         self.mag_cal_active = False
 
+        self.nav_status_var = tk.StringVar(value="NAV: waiting for data")
+        self.nav_pos_var = tk.StringVar(value="Pos N/E: - / - m")
+        self.nav_vel_var = tk.StringVar(value="Vel raw/filt N,E: -")
+        self.navbrk_status_var = tk.StringVar(value="NAVBRAKE: req=- act=- tilt_lim=- accel_lim=-")
+        self.navbrk_vel_var = tk.StringVar(value="desired/error N,E: -")
+        self.navbrk_cmd_var = tk.StringVar(value="accel N/E/fwd/right, ang roll/pitch: -")
+        self.nav_lost_var = tk.StringVar(value="Last NAV_LOST: -")
+
         self.rc_channels_us = [1500 for _ in range(16)]
         self.rc_channels_us[2] = 988
         self.rc_link_active = 0
         self.rc_frame_count = 0
+        self.rc_frame_age_ms = 0
+        self.rc_crc_errors = 0
+        self.rc_sync_errors = 0
+        self.rc_overrun_errors = 0
+        self.rc_framing_errors = 0
+        self.rc_noise_errors = 0
         self.rc_arm_switch = 0
         self.rc_armed = 0
+        self.rc_last_disarm_reason = "-"
+        self.rc_last_update_monotonic = 0.0
+        self.rc_data_stale = True
 
         self.bb_records = []
         self.bb_flights = []
@@ -476,6 +526,18 @@ class Kh7GroundGui:
             row=6, column=4, columnspan=2, sticky="w", padx=(10, 4), pady=(0, 4)
         )
 
+        nav_box = ttk.LabelFrame(body, text="GPS Navigation / Velocity Brake (experimental)")
+        nav_box.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(nav_box, textvariable=self.nav_status_var).grid(row=0, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 2))
+        ttk.Label(nav_box, textvariable=self.nav_pos_var).grid(row=1, column=0, sticky="w", padx=8, pady=2)
+        ttk.Label(nav_box, textvariable=self.nav_vel_var).grid(row=1, column=1, sticky="w", padx=8, pady=2)
+        ttk.Label(nav_box, textvariable=self.navbrk_status_var).grid(row=2, column=0, columnspan=2, sticky="w", padx=8, pady=2)
+        ttk.Label(nav_box, textvariable=self.navbrk_vel_var).grid(row=3, column=0, sticky="w", padx=8, pady=2)
+        ttk.Label(nav_box, textvariable=self.navbrk_cmd_var).grid(row=3, column=1, sticky="w", padx=8, pady=2)
+        ttk.Label(nav_box, textvariable=self.nav_lost_var, foreground="#ff8a65").grid(
+            row=4, column=0, columnspan=2, sticky="w", padx=8, pady=(2, 6)
+        )
+
         mid = ttk.Frame(body)
         mid.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
@@ -659,6 +721,27 @@ class Kh7GroundGui:
             series=[("mag_heading", "Heading", "#c586ff")],
             y_min=0.0,
             y_max=360.0,
+        )
+
+        self._create_strip_chart(
+            charts_box,
+            chart_key="navpos",
+            title="Nav Local Position N/E (m)",
+            series=[("nav_north", "N", "#45d1ff"), ("nav_east", "E", "#ffd166")],
+            y_min=-20.0,
+            y_max=20.0,
+        )
+
+        self._create_strip_chart(
+            charts_box,
+            chart_key="navvel",
+            title="Nav Velocity N/E (m/s): filtered vs desired",
+            series=[
+                ("nav_filt_vel_n", "filtN", "#45d1ff"), ("nav_filt_vel_e", "filtE", "#69f38a"),
+                ("nav_desired_vel_n", "desN", "#ffd166"), ("nav_desired_vel_e", "desE", "#ff8a65"),
+            ],
+            y_min=-2.0,
+            y_max=2.0,
         )
 
         bb_box = ttk.LabelFrame(body, text="Blackbox Playback (SD log)")
@@ -1426,19 +1509,26 @@ class Kh7GroundGui:
         top = (height - side) / 2.0
         right = left + side
         bottom = top + side
+        link_text = "?" if self.rc_data_stale else str(self.rc_link_active)
+        armed_text = "?" if self.rc_data_stale else str(self.rc_armed)
+        arm_switch_text = "?" if self.rc_data_stale else str(self.rc_arm_switch)
 
         canvas.create_rectangle(left, top, right, bottom, outline="#31404d", width=2)
         canvas.create_text(
             (left + right) / 2.0,
             top + 16,
-            text=f"RC link={self.rc_link_active} frames={self.rc_frame_count}",
-            fill="#d8dde3",
+            text=(f"RC link={link_text} frames={self.rc_frame_count} age={self.rc_frame_age_ms}ms\n"
+                  f"CRC={self.rc_crc_errors} sync={self.rc_sync_errors} ORE/FE/NE="
+                  f"{self.rc_overrun_errors}/{self.rc_framing_errors}/{self.rc_noise_errors}"),
+            fill="#ff8a65" if (self.rc_data_stale or not self.rc_link_active or self.rc_frame_age_ms > 100) else "#d8dde3",
             font=("Consolas", 9, "bold"),
         )
         canvas.create_text(
             (left + right) / 2.0,
             top + 34,
-            text=f"armed={self.rc_armed} arm_sw={self.rc_arm_switch}",
+            text=(f"armed={armed_text} arm_sw={arm_switch_text} "
+                f"last_disarm={self.rc_last_disarm_reason}"
+                f"{'  TELEMETRY STALE' if self.rc_data_stale else ''}"),
             fill="#8fb3c6",
             font=("Consolas", 9),
         )
@@ -1934,8 +2024,23 @@ class Kh7GroundGui:
                 self.att_status_var.set(f"ATT source: {m_att.group(1)}")
             return
 
+        m_arm_event = ARM_EVENT_RE.search(line)
+        if m_arm_event is not None:
+            self.rc_last_update_monotonic = time.monotonic()
+            self.rc_data_stale = False
+            self.rc_armed = 0
+            self.rc_link_active = int(m_arm_event.group(2))
+            arm_us = int(m_arm_event.group(3))
+            self.rc_arm_switch = 1 if arm_us >= 1500 else 0
+            self.rc_channels_us[4] = arm_us
+            self.rc_last_disarm_reason = m_arm_event.group(1)
+            self._draw_rc_canvas()
+            return
+
         m_arm = ARM_LINE_RE.search(line)
         if m_arm is not None:
+            self.rc_last_update_monotonic = time.monotonic()
+            self.rc_data_stale = False
             armed = int(m_arm.group(1))
             arm_sw = int(m_arm.group(2))
             _low_seen = int(m_arm.group(3))
@@ -1962,6 +2067,8 @@ class Kh7GroundGui:
 
         m_rx = RX_LINE_RE.search(line)
         if m_rx is not None:
+            self.rc_last_update_monotonic = time.monotonic()
+            self.rc_data_stale = False
             self.rc_link_active = int(m_rx.group(1))
             self.rc_frame_count = int(m_rx.group(2))
             self.rc_channels_us[0] = int(m_rx.group(3))
@@ -1973,10 +2080,18 @@ class Kh7GroundGui:
 
         m_rx16 = RX16_LINE_RE.search(line)
         if m_rx16 is not None:
+            self.rc_last_update_monotonic = time.monotonic()
+            self.rc_data_stale = False
             self.rc_link_active = int(m_rx16.group(1))
             self.rc_frame_count = int(m_rx16.group(2))
+            self.rc_frame_age_ms = int(m_rx16.group(3))
+            self.rc_crc_errors = int(m_rx16.group(4))
+            self.rc_sync_errors = int(m_rx16.group(5))
+            self.rc_overrun_errors = int(m_rx16.group(6))
+            self.rc_framing_errors = int(m_rx16.group(7))
+            self.rc_noise_errors = int(m_rx16.group(8))
             for idx in range(16):
-                self.rc_channels_us[idx] = int(m_rx16.group(3 + idx))
+                self.rc_channels_us[idx] = int(m_rx16.group(9 + idx))
             self._draw_rc_canvas()
             return
 
@@ -2084,6 +2199,58 @@ class Kh7GroundGui:
             self.mag_cal_status_var.set(f"Calibration FAILED{m_mag_cal_fail.group(1)}")
             self.mag_cal_active = False
             self.mag_cal_button.configure(text="Calibrate")
+            return
+
+        m_nav = NAV_LINE_RE.search(line)
+        if m_nav is not None:
+            (valid, ref, reason, fix_type, num_sv, hacc_cm, age_ms, upd_ms,
+             cv, ci, dup, rej, drop) = (int(g) for g in m_nav.groups())
+            reason_name = NAV_INVALID_REASON_NAMES.get(reason, str(reason))
+            self.nav_status_var.set(
+                f"NAV: valid={'YES' if valid else 'no'} ref={'yes' if ref else 'no'} reason={reason_name} "
+                f"fix={NAV_FIX_NAMES.get(fix_type, fix_type)} sats={num_sv} hAcc={hacc_cm / 100.0:.1f}m "
+                f"age={age_ms}ms updPeriod={upd_ms}ms cv={cv} ci={ci} dup={dup} rej={rej} dropouts={drop}"
+            )
+            return
+
+        m_navpos = NAVPOS_LINE_RE.search(line)
+        if m_navpos is not None:
+            north_m, east_m, raw_n, raw_e, filt_n, filt_e = (float(g) for g in m_navpos.groups())
+            self.nav_pos_var.set(f"Pos N/E: {north_m:.1f} / {east_m:.1f} m")
+            self.nav_vel_var.set(
+                f"Vel raw N/E: {raw_n:.2f}/{raw_e:.2f}  filt N/E: {filt_n:.2f}/{filt_e:.2f} m/s"
+            )
+            self._append_samples([
+                ("nav_north", north_m), ("nav_east", east_m),
+                ("nav_filt_vel_n", filt_n), ("nav_filt_vel_e", filt_e),
+            ])
+            self._redraw_strip_chart("navpos")
+            self._redraw_strip_chart("navvel")
+            return
+
+        m_navbrk = NAVBRK_LINE_RE.search(line)
+        if m_navbrk is not None:
+            g = m_navbrk.groups()
+            requested, active, tilt_lim, accel_lim = (int(x) for x in g[0:4])
+            des_n, des_e, err_n, err_e = (float(x) for x in g[4:8])
+            accel_n, accel_e, accel_fwd, accel_right = (float(x) for x in g[8:12])
+            ang_roll, ang_pitch = (float(x) for x in g[12:14])
+            self.navbrk_status_var.set(
+                f"NAVBRAKE: requested={'YES' if requested else 'no'} active={'YES' if active else 'no'} "
+                f"tilt_limited={'YES' if tilt_lim else 'no'} accel_limited={'YES' if accel_lim else 'no'}"
+            )
+            self.navbrk_vel_var.set(f"desired N/E={des_n:.2f}/{des_e:.2f}  error N/E={err_n:.2f}/{err_e:.2f} m/s")
+            self.navbrk_cmd_var.set(
+                f"accel N/E={accel_n:.2f}/{accel_e:.2f} fwd/right={accel_fwd:.2f}/{accel_right:.2f} m/s^2  "
+                f"ang roll/pitch={ang_roll:.1f}/{ang_pitch:.1f} deg"
+            )
+            self._append_samples([("nav_desired_vel_n", des_n), ("nav_desired_vel_e", des_e)])
+            self._redraw_strip_chart("navvel")
+            return
+
+        m_nav_lost = NAV_LOST_RE.search(line)
+        if m_nav_lost is not None:
+            self.nav_lost_var.set(f"Last NAV_LOST: reason={m_nav_lost.group(1)} (t={time.strftime('%H:%M:%S')})")
             return
 
         m_imu = IMU_LINE_RE.search(line)
@@ -2209,6 +2376,14 @@ class Kh7GroundGui:
             self._poll_usb()
         else:
             self._poll_wifi()
+
+        rc_data_stale = (
+            self.rc_last_update_monotonic == 0.0
+            or (time.monotonic() - self.rc_last_update_monotonic) > 0.75
+        )
+        if rc_data_stale != self.rc_data_stale:
+            self.rc_data_stale = rc_data_stale
+            self._draw_rc_canvas()
 
         self.root.after(50, self._poll_io)
 

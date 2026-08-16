@@ -22,9 +22,15 @@ extern UART_HandleTypeDef huart7;
 #define COMM_ESCPT_UART_BUDGET    64U
 #define COMM_ESCPT_USB_CHUNK      64U
 #define COMM_ESCPT_QUEUE_SIZE     512U
+#define COMM_UART6_TX_QUEUE_SIZE  2048U
 
 static uint8_t g_usb_tx_buffer[COMM_USB_TX_BUFFER_SIZE];
 static uint16_t g_usb_tx_len = 0U;
+static uint8_t g_uart6_tx_queue[COMM_UART6_TX_QUEUE_SIZE];
+static volatile uint16_t g_uart6_tx_queue_head = 0U;
+static volatile uint16_t g_uart6_tx_queue_tail = 0U;
+static volatile uint8_t g_uart6_tx_busy = 0U;
+static uint8_t g_uart6_tx_byte = 0U;
 
 static char g_uart6_cmd_line[COMM_UART6_CMD_BUF_SIZE];
 static uint8_t g_uart6_cmd_len = 0U;
@@ -42,17 +48,18 @@ static uint8_t g_escpt_uart_to_usb[COMM_ESCPT_QUEUE_SIZE];
 static volatile uint16_t g_escpt_uart_to_usb_head = 0U;
 static volatile uint16_t g_escpt_uart_to_usb_tail = 0U;
 
-static uint16_t Communications_QueueNext(uint16_t index)
+static uint16_t Communications_QueueNext(uint16_t index, uint16_t size)
 {
-  return (uint16_t)((index + 1U) % COMM_ESCPT_QUEUE_SIZE);
+  return (uint16_t)((index + 1U) % size);
 }
 
 static uint8_t Communications_QueuePush(volatile uint16_t *head,
                                         volatile uint16_t *tail,
                                         uint8_t *buffer,
+                                        uint16_t size,
                                         uint8_t value)
 {
-  uint16_t next = Communications_QueueNext(*head);
+  uint16_t next = Communications_QueueNext(*head, size);
 
   if (next == *tail)
   {
@@ -67,6 +74,7 @@ static uint8_t Communications_QueuePush(volatile uint16_t *head,
 static uint8_t Communications_QueuePop(volatile uint16_t *head,
                                        volatile uint16_t *tail,
                                        uint8_t *buffer,
+                                       uint16_t size,
                                        uint8_t *value)
 {
   if (*tail == *head)
@@ -75,7 +83,7 @@ static uint8_t Communications_QueuePop(volatile uint16_t *head,
   }
 
   *value = buffer[*tail];
-  *tail = Communications_QueueNext(*tail);
+  *tail = Communications_QueueNext(*tail, size);
   return 1U;
 }
 
@@ -150,6 +158,32 @@ static uint8_t Communications_IsUsbTxBusy(void)
   return (uint8_t)(hcdc->TxState != 0U);
 }
 
+static void Communications_Uart6TxKick(void)
+{
+  /* Called from both the main loop and the TX-complete ISR - guard the busy
+   * check-and-set so the two can never both start a transmit at once. */
+  __disable_irq();
+  if (g_uart6_tx_busy != 0U)
+  {
+    __enable_irq();
+    return;
+  }
+  g_uart6_tx_busy = 1U;
+  __enable_irq();
+
+  if (Communications_QueuePop(&g_uart6_tx_queue_head, &g_uart6_tx_queue_tail,
+                              g_uart6_tx_queue, COMM_UART6_TX_QUEUE_SIZE, &g_uart6_tx_byte) == 0U)
+  {
+    g_uart6_tx_busy = 0U;
+    return;
+  }
+
+  if (HAL_UART_Transmit_IT(&huart6, &g_uart6_tx_byte, 1U) != HAL_OK)
+  {
+    g_uart6_tx_busy = 0U;
+  }
+}
+
 static void Communications_FlushUsbTxBuffer(void)
 {
   if (g_usb_tx_len == 0U)
@@ -167,11 +201,38 @@ static void Communications_FlushUsbTxBuffer(void)
   }
 
 #if COMM_LOG_TO_UART6
-  /* Always mirror logs to UART6 so Wi-Fi bridge clients reliably receive responses. */
-  (void)HAL_UART_Transmit(&huart6, g_usb_tx_buffer, g_usb_tx_len, COMM_UART6_TX_TIMEOUT_MS);
+  /* Never block the control loop on UART6: a synchronous HAL_UART_Transmit here used to
+   * cost up to COMM_UART6_TX_TIMEOUT_MS per printed line. Queue every byte into a ring
+   * buffer instead of a single in-flight slot - a telemetry burst is many back-to-back
+   * printf lines, and a single-slot "drop if busy" design silently lost everything after
+   * the first line. The ring drains automatically via HAL_UART_TxCpltCallback chaining one
+   * byte at a time, and only drops the newest bytes if it's genuinely full (sustained
+   * overload), never blocking and never truncating a burst down to just its first line. */
+  {
+    uint16_t i;
+
+    for (i = 0U; i < g_usb_tx_len; i++)
+    {
+      if (Communications_QueuePush(&g_uart6_tx_queue_head, &g_uart6_tx_queue_tail,
+                                   g_uart6_tx_queue, COMM_UART6_TX_QUEUE_SIZE, g_usb_tx_buffer[i]) == 0U)
+      {
+        break; /* ring full - drop the remainder of this chunk rather than blocking */
+      }
+    }
+  }
+  Communications_Uart6TxKick();
 #endif
 
   g_usb_tx_len = 0U;
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART6)
+  {
+    g_uart6_tx_busy = 0U;
+    Communications_Uart6TxKick();
+  }
 }
 
 void Communications_Init(void)
@@ -210,6 +271,7 @@ void Communications_EscPassthroughFromUsb(const uint8_t *data, uint16_t len)
     (void)Communications_QueuePush(&g_escpt_usb_to_uart_head,
                                    &g_escpt_usb_to_uart_tail,
                                    g_escpt_usb_to_uart,
+                                   COMM_ESCPT_QUEUE_SIZE,
                                    data[i]);
   }
   __enable_irq();
@@ -238,6 +300,7 @@ void Communications_ServiceEscPassthrough(void)
     (void)Communications_QueuePush(&g_escpt_uart_to_usb_head,
                                    &g_escpt_uart_to_usb_tail,
                                    g_escpt_uart_to_usb,
+                                   COMM_ESCPT_QUEUE_SIZE,
                                    byte);
     __enable_irq();
   }
@@ -248,6 +311,7 @@ void Communications_ServiceEscPassthrough(void)
     if (Communications_QueuePop(&g_escpt_usb_to_uart_head,
                                 &g_escpt_usb_to_uart_tail,
                                 g_escpt_usb_to_uart,
+                                COMM_ESCPT_QUEUE_SIZE,
                                 &byte) == 0U)
     {
       __enable_irq();
@@ -261,6 +325,7 @@ void Communications_ServiceEscPassthrough(void)
       (void)Communications_QueuePush(&g_escpt_usb_to_uart_head,
                                      &g_escpt_usb_to_uart_tail,
                                      g_escpt_usb_to_uart,
+                                     COMM_ESCPT_QUEUE_SIZE,
                                      byte);
       __enable_irq();
       break;
@@ -283,6 +348,7 @@ void Communications_ServiceEscPassthrough(void)
          (Communications_QueuePop(&g_escpt_uart_to_usb_head,
                                   &g_escpt_uart_to_usb_tail,
                                   g_escpt_uart_to_usb,
+                                  COMM_ESCPT_QUEUE_SIZE,
                                   &byte) != 0U))
   {
     tx_buf[tx_len++] = byte;

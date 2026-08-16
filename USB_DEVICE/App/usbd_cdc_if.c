@@ -454,6 +454,14 @@ void CDC_ProcessCommandLine(const char *line)
     return;
   }
 
+  if (strcmp(line, "TELARM STATUS") == 0)
+  {
+    /* Read-only: RC channel 7 (hi=on, lo=off) is the sole control for this flag now -
+     * no command can set it, only query the current confirmed state. */
+    App_PrintArmedTelemetryStatus();
+    return;
+  }
+
   if (strcmp(line, "MAG CAL START") == 0)
   {
     App_RequestMagCalStart();

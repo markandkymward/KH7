@@ -15,6 +15,7 @@ void Motors_WriteUs(uint16_t s1_us,
                     uint16_t s4_us);
 uint8_t Motors_RunTestPattern(uint32_t now_ms);
 void Motors_StopAll(void);
+void Motors_ForceIdleRegistersOnly(void);
 
 #ifdef __cplusplus
 }

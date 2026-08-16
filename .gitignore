@@ -1,4 +1,5 @@
 build/
+.pio/
 *.o
 *.obj
 *.d
@@ -30,3 +31,4 @@ tools/_reachability*.txt
 tools/_verify_wrap_fix.txt
 tools/_yawstick_analysis.txt
 gaps*_out.txt
+*_capture*.txt

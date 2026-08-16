@@ -49,8 +49,13 @@ BLOCK_RE = re.compile(r"SDLOG\[(\d+)\]=([0-9A-Fa-f]+)")
 # predictable place regardless of the caller's current working directory.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-RECORD_STRUCT = struct.Struct("<I9hHHHHBBhhhhhhhhHhH")
-RECORD_SIZE = RECORD_STRUCT.size  # 54 bytes, matches App_SdLogRecord_t in Core/Src/app.c
+RECORD_STRUCT = struct.Struct(
+    "<I9hHHHHBBhhhhhhhhHhH"  # original fields (54 bytes)
+    "BBBB"                    # nav_flags, nav_invalid_reason, nav_fix_type, nav_num_sv
+    "HHHHH"                   # nav_h_acc_cm, nav_age_ms, nav_update_period_ms, nav_consecutive_valid, nav_dropout_count
+    + "h" * 16                # nav north/east/vel(raw,filt,desired,error)/accel(n,e,fwd,right) + pilot stick, all int16
+)
+RECORD_SIZE = RECORD_STRUCT.size  # 100 bytes, matches App_SdLogRecord_t in Core/Src/app.c
 FIELD_NAMES = (
     "time_ms",
     "setpoint_roll_dps", "setpoint_pitch_dps", "setpoint_yaw_dps",
@@ -64,10 +69,32 @@ FIELD_NAMES = (
     "throttle_cmd_us", "throttle_actual_us",
     "arm_us",
     "yaw_deg_x10", "mag_heading_x10",
+    "nav_flags", "nav_invalid_reason", "nav_fix_type", "nav_num_sv",
+    "nav_h_acc_cm", "nav_age_ms", "nav_update_period_ms", "nav_consecutive_valid", "nav_dropout_count",
+    "nav_north_m_x10", "nav_east_m_x10",
+    "nav_raw_vel_n_x100", "nav_raw_vel_e_x100",
+    "nav_filt_vel_n_x100", "nav_filt_vel_e_x100",
+    "nav_desired_vel_n_x100", "nav_desired_vel_e_x100",
+    "nav_vel_error_n_x100", "nav_vel_error_e_x100",
+    "nav_accel_cmd_n_x1000", "nav_accel_cmd_e_x1000",
+    "nav_accel_cmd_fwd_x1000", "nav_accel_cmd_right_x1000",
+    "pilot_roll_stick_us", "pilot_pitch_stick_us",
 )
 APP_SDLOG_FLAG_LINK_ACTIVE = 0x08  # bit set when receiver_state.link_active was true
 APP_SDLOG_FLAG_MAG_HEALTHY = 0x10  # bit set when Mag_IsHealthy() was true
-FLIGHT_MODE_NAMES = {0: "RATE", 1: "ATTITUDE", 2: "ALTHOLD"}
+APP_SDLOG_NAV_FLAG_REQUESTED = 0x01
+APP_SDLOG_NAV_FLAG_ACTIVE = 0x02
+APP_SDLOG_NAV_FLAG_TILT_LIMITED = 0x04
+APP_SDLOG_NAV_FLAG_ACCEL_LIMITED = 0x08
+APP_SDLOG_NAV_FLAG_NEW_SAMPLE = 0x10
+APP_SDLOG_NAV_FLAG_REJECTED = 0x20
+APP_SDLOG_NAV_FLAG_REF_VALID = 0x40
+NAV_INVALID_REASON_NAMES = {
+    0: "NONE", 1: "NO_3D_FIX", 2: "GPS_STALE", 3: "BAD_UPDATE_INTERVAL",
+    4: "POOR_ACCURACY", 5: "VELOCITY_INVALID", 6: "POSITION_JUMP", 7: "VELOCITY_JUMP",
+    8: "REACQUIRING", 9: "NO_REFERENCE", 10: "NONFINITE",
+}
+FLIGHT_MODE_NAMES = {0: "RATE", 1: "ATTITUDE", 2: "ALTHOLD", 3: "NAVBRAKE"}
 FLIGHT_GAP_MS = 1500  # a stored-sample time gap bigger than this means a new flight
 PID_TERM_LIMIT_US = 320  # APP_RATE_TERM_LIMIT_US in Core/Src/app.c - used for saturation %
 NOMINAL_BATTERY_V = 11.1  # APP_VOLTAGE_COMP_REFERENCE_V in Core/Src/app.c - 3S nominal pack voltage
@@ -266,6 +293,14 @@ def _flight_arrays(sub: List[dict]) -> dict:
     a["baro_alt_m"] = a["baro_alt_cm"] / 100.0
     a["baro_vz_mps"] = a["baro_vz_cms"] / 100.0
     a["battery_v"] = a["battery_decivolts"] / 10.0
+    a["nav_h_acc_m"] = a["nav_h_acc_cm"] / 100.0
+    a["nav_north_m"] = a["nav_north_m_x10"] / 10.0
+    a["nav_east_m"] = a["nav_east_m_x10"] / 10.0
+    for suffix in ("raw_vel_n", "raw_vel_e", "filt_vel_n", "filt_vel_e",
+                   "desired_vel_n", "desired_vel_e", "vel_error_n", "vel_error_e"):
+        a[f"nav_{suffix}_mps"] = a[f"nav_{suffix}_x100"] / 100.0
+    for suffix in ("accel_cmd_n", "accel_cmd_e", "accel_cmd_fwd", "accel_cmd_right"):
+        a[f"nav_{suffix}_mps2"] = a[f"nav_{suffix}_x1000"] / 1000.0
     dt = np.diff(a["time_ms"])
     dt = dt[dt > 0]
     a["fs_hz"] = 1000.0 / np.median(dt) if dt.size else 125.0
@@ -308,9 +343,9 @@ def print_summary(a: dict) -> None:
           f"roll min={a['roll_deg'].min():.1f} max={a['roll_deg'].max():.1f}deg")
 
     mode_bits = ((a["flags"].astype(int) >> 1) & 0x03)
-    in_attitude = (mode_bits == 1) | (mode_bits == 2)
+    in_attitude = (mode_bits == 1) | (mode_bits == 2) | (mode_bits == 3)
     if np.any(in_attitude):
-        print(f"\nATTITUDE/ALTHOLD mode angle tracking ({int(in_attitude.sum())} samples):")
+        print(f"\nATTITUDE/ALTHOLD/NAVBRAKE mode angle tracking ({int(in_attitude.sum())} samples):")
         for axis in ("roll", "pitch"):
             cmd = a[f"target_{axis}_deg"][in_attitude]
             act = a[f"{axis}_deg"][in_attitude]
@@ -375,6 +410,29 @@ def print_summary(a: dict) -> None:
             err_a = err_all[mask_active]
             print(f"  while commanding yaw (stick active, {int(mask_active.sum())} samples): "
                   f"tracking err rms={np.sqrt(np.mean(err_a ** 2)):.1f} peak={np.max(np.abs(err_a)):.1f}deg")
+
+    nav_flags = a["nav_flags"].astype(int)
+    nav_requested = (nav_flags & APP_SDLOG_NAV_FLAG_REQUESTED) != 0
+    nav_active = (nav_flags & APP_SDLOG_NAV_FLAG_ACTIVE) != 0
+    if np.any(nav_requested) or np.any(a["nav_fix_type"] > 0):
+        reasons = a["nav_invalid_reason"].astype(int)
+        print(f"\nGPS nav: fix_type min={a['nav_fix_type'].min():.0f} max={a['nav_fix_type'].max():.0f}  "
+              f"sats min={a['nav_num_sv'].min():.0f} max={a['nav_num_sv'].max():.0f}  "
+              f"hAcc min={a['nav_h_acc_m'].min():.1f} max={a['nav_h_acc_m'].max():.1f}m  "
+              f"dropout_count max={int(a['nav_dropout_count'].max())}")
+        print(f"  NAVBRAKE requested={int(nav_requested.sum())}/{n} active={int(nav_active.sum())}/{n} "
+              f"tilt_limited={int(np.sum((nav_flags & APP_SDLOG_NAV_FLAG_TILT_LIMITED) != 0))} "
+              f"accel_limited={int(np.sum((nav_flags & APP_SDLOG_NAV_FLAG_ACCEL_LIMITED) != 0))}")
+        if np.any(nav_active):
+            print(f"  while active: north min={a['nav_north_m'][nav_active].min():.1f} max={a['nav_north_m'][nav_active].max():.1f}m  "
+                  f"east min={a['nav_east_m'][nav_active].min():.1f} max={a['nav_east_m'][nav_active].max():.1f}m  "
+                  f"filt_vel_n rms={np.sqrt(np.mean(a['nav_filt_vel_n_mps'][nav_active] ** 2)):.2f} "
+                  f"filt_vel_e rms={np.sqrt(np.mean(a['nav_filt_vel_e_mps'][nav_active] ** 2)):.2f} m/s")
+        invalid = reasons[~nav_active & nav_requested]
+        if invalid.size:
+            uniq, counts = np.unique(invalid, return_counts=True)
+            reason_str = ", ".join(f"{NAV_INVALID_REASON_NAMES.get(int(u), u)}={int(c)}" for u, c in zip(uniq, counts))
+            print(f"  invalid-while-requested reasons: {reason_str}")
 
 
 _PYPLOT_CACHE: dict = {}

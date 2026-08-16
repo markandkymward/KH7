@@ -131,6 +131,7 @@ void Telemetry_PrintReceiverState(const receiver_state_t *state)
 void Telemetry_PrintReceiverState16(const receiver_state_t *state)
 {
   uint16_t ch_us[RECEIVER_CHANNEL_COUNT];
+  uint32_t frame_age_ms;
   uint8_t i;
 
   if (state == NULL)
@@ -143,9 +144,17 @@ void Telemetry_PrintReceiverState16(const receiver_state_t *state)
     ch_us[i] = Telemetry_CrsfRawToUs(state->channels[i]);
   }
 
-  printf("RX16[link=%u frames=%lu us]=[%u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u]\r\n",
+  frame_age_ms = (state->frame_count != 0U) ? (HAL_GetTick() - state->last_frame_ms) : 0xFFFFFFFFU;
+
+  printf("RX16[link=%u frames=%lu age=%lu crc=%lu sync=%lu ore=%lu fe=%lu ne=%lu us]=[%u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u]\r\n",
          (unsigned int)state->link_active,
          (unsigned long)state->frame_count,
+         (unsigned long)frame_age_ms,
+         (unsigned long)state->crc_error_count,
+         (unsigned long)state->sync_error_count,
+         (unsigned long)state->overrun_error_count,
+         (unsigned long)state->framing_error_count,
+         (unsigned long)state->noise_error_count,
          (unsigned int)ch_us[0],
          (unsigned int)ch_us[1],
          (unsigned int)ch_us[2],
@@ -332,4 +341,84 @@ void Telemetry_PrintMagState(uint8_t healthy,
          (long)x_mg,
          (long)y_mg,
          (long)z_mg);
+}
+
+void Telemetry_PrintNavState(uint8_t valid,
+                             uint8_t reference_valid,
+                             uint8_t invalid_reason,
+                             uint8_t fix_type,
+                             uint8_t num_sv,
+                             float h_acc_m,
+                             uint32_t age_ms,
+                             uint32_t update_period_ms,
+                             uint32_t consecutive_valid,
+                             uint32_t consecutive_invalid,
+                             uint32_t duplicate_count,
+                             uint32_t rejected_count,
+                             uint32_t dropout_count)
+{
+  int32_t h_acc_cm = (int32_t)(h_acc_m * 100.0f);
+
+  printf("NAV[valid ref reason fix sats hacc_cm age_ms upd_ms cv ci dup rej drop]=[%u %u %u %u %u %ld %lu %lu %lu %lu %lu %lu %lu]\r\n",
+         (unsigned int)valid,
+         (unsigned int)reference_valid,
+         (unsigned int)invalid_reason,
+         (unsigned int)fix_type,
+         (unsigned int)num_sv,
+         (long)h_acc_cm,
+         (unsigned long)age_ms,
+         (unsigned long)update_period_ms,
+         (unsigned long)consecutive_valid,
+         (unsigned long)consecutive_invalid,
+         (unsigned long)duplicate_count,
+         (unsigned long)rejected_count,
+         (unsigned long)dropout_count);
+}
+
+void Telemetry_PrintNavPosVel(float north_m,
+                              float east_m,
+                              float raw_vel_n_mps,
+                              float raw_vel_e_mps,
+                              float filt_vel_n_mps,
+                              float filt_vel_e_mps)
+{
+  printf("NAVPOS[n e]=[%.2f %.2f] velraw=[%.2f %.2f] velfilt=[%.2f %.2f]\r\n",
+         (double)north_m,
+         (double)east_m,
+         (double)raw_vel_n_mps,
+         (double)raw_vel_e_mps,
+         (double)filt_vel_n_mps,
+         (double)filt_vel_e_mps);
+}
+
+void Telemetry_PrintNavBrake(uint8_t requested,
+                             uint8_t active,
+                             uint8_t tilt_limited,
+                             uint8_t accel_limited,
+                             float desired_vel_n_mps,
+                             float desired_vel_e_mps,
+                             float vel_error_n_mps,
+                             float vel_error_e_mps,
+                             float accel_cmd_n_mps2,
+                             float accel_cmd_e_mps2,
+                             float accel_cmd_fwd_mps2,
+                             float accel_cmd_right_mps2,
+                             float target_roll_deg,
+                             float target_pitch_deg)
+{
+  printf("NAVBRK[req act tiltlim acclim]=[%u %u %u %u] desvel=[%.2f %.2f] velerr=[%.2f %.2f] accel=[%.2f %.2f %.2f %.2f] ang=[%.1f %.1f]\r\n",
+         (unsigned int)requested,
+         (unsigned int)active,
+         (unsigned int)tilt_limited,
+         (unsigned int)accel_limited,
+         (double)desired_vel_n_mps,
+         (double)desired_vel_e_mps,
+         (double)vel_error_n_mps,
+         (double)vel_error_e_mps,
+         (double)accel_cmd_n_mps2,
+         (double)accel_cmd_e_mps2,
+         (double)accel_cmd_fwd_mps2,
+         (double)accel_cmd_right_mps2,
+         (double)target_roll_deg,
+         (double)target_pitch_deg);
 }

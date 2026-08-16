@@ -71,21 +71,37 @@ static void SD_SpiReconfigure(uint32_t prescaler)
   (void)HAL_SPI_Init(&hspi1);
 }
 
-static void SD_SpiTxRx(const uint8_t *tx, uint8_t *rx, uint16_t len)
+static HAL_StatusTypeDef SD_SpiTxRx(const uint8_t *tx, uint8_t *rx, uint16_t len)
 {
-  uint16_t i;
+  uint8_t tx_fill[32];
+  uint8_t rx_discard[32];
+  uint16_t offset = 0U;
 
-  for (i = 0U; i < len; i++)
+  memset(tx_fill, 0xFF, sizeof(tx_fill));
+
+  while (offset < len)
   {
-    uint8_t txb = (tx != NULL) ? tx[i] : 0xFFU;
-    uint8_t rxb = 0xFFU;
+    uint16_t chunk_len = (uint16_t)(len - offset);
+    HAL_StatusTypeDef status;
 
-    (void)HAL_SPI_TransmitReceive(&hspi1, &txb, &rxb, 1U, SD_SPI_TIMEOUT_MS);
-    if (rx != NULL)
+    if (chunk_len > sizeof(tx_fill))
     {
-      rx[i] = rxb;
+      chunk_len = sizeof(tx_fill);
     }
+
+    status = HAL_SPI_TransmitReceive(&hspi1,
+                                     (uint8_t *)((tx != NULL) ? &tx[offset] : tx_fill),
+                                     (rx != NULL) ? &rx[offset] : rx_discard,
+                                     chunk_len,
+                                     SD_SPI_TIMEOUT_MS);
+    if (status != HAL_OK)
+    {
+      return status;
+    }
+    offset = (uint16_t)(offset + chunk_len);
   }
+
+  return HAL_OK;
 }
 
 static void SD_Deselect(void)
@@ -307,11 +323,19 @@ SD_Status SD_WriteBlockBegin(uint32_t block_addr, const uint8_t *buf512)
     return SD_ERR_CMD;
   }
 
-  SD_SpiTxRx(&token, NULL, 1U);
-  SD_SpiTxRx(buf512, NULL, (uint16_t)SD_BLOCK_SIZE);
-  SD_SpiTxRx(crc, NULL, 2U);
+  if ((SD_SpiTxRx(&token, NULL, 1U) != HAL_OK) ||
+      (SD_SpiTxRx(buf512, NULL, (uint16_t)SD_BLOCK_SIZE) != HAL_OK) ||
+      (SD_SpiTxRx(crc, NULL, 2U) != HAL_OK))
+  {
+    SD_Deselect();
+    return SD_ERR_TIMEOUT;
+  }
 
-  SD_SpiTxRx(NULL, &resp, 1U);
+  if (SD_SpiTxRx(NULL, &resp, 1U) != HAL_OK)
+  {
+    SD_Deselect();
+    return SD_ERR_TIMEOUT;
+  }
   if ((resp & 0x1FU) != 0x05U)
   {
     SD_Deselect();

@@ -2,6 +2,7 @@
 #include "communications.h"
 #include "gps.h"
 #include "app.h"
+#include "motors.h"
 
 #include "main.h"
 
@@ -14,6 +15,20 @@
 #define CRSF_RC_PAYLOAD_SIZE           22U
 #define CRSF_LINK_TIMEOUT_MS           250U
 #define CRSF_ADDRESS_FLIGHT_CONTROLLER 0xC8U
+
+/* Highest-priority safety net: the instant a CRSF frame shows the arm switch in
+ * the disarm position, force motors to idle right here in the UART4 RX ISR -
+ * completely independent of whether App_Update()'s main loop is still running.
+ * This is REDUNDANT with app.c's own arm-switch handling (still the source of
+ * truth for normal operation/telemetry/logging) and only matters if the main
+ * loop is stalled and never reaches its own check. NOTE: this cannot help if
+ * the CPU is fully deadlocked inside a HIGHER-priority interrupt - UART4_IRQn
+ * runs at priority 4, below OTG_FS_IRQn's priority 0, so a stuck USB ISR would
+ * still block this from ever running. Constants below intentionally duplicate
+ * app.c's APP_CH_ARM_INDEX/APP_ARM_THRESHOLD_US/CRSF-to-us scaling so this
+ * safety path has zero dependency on app.c - keep in sync if those ever change. */
+#define RECEIVER_ARM_CHANNEL_INDEX     4U
+#define RECEIVER_ARM_RAW_THRESHOLD     992U /* raw CRSF value corresponding to ~1500us */
 
 typedef struct
 {
@@ -101,6 +116,7 @@ static void Receiver_ProcessFrame(void)
 
   if (crc_expected != crc_computed)
   {
+    g_receiver_state.crc_error_count++;
     return;
   }
 
@@ -111,6 +127,11 @@ static void Receiver_ProcessFrame(void)
     g_receiver_state.frame_received = 1U;
     g_receiver_state.frame_count++;
     g_receiver_state.last_frame_ms = HAL_GetTick();
+
+    if (g_receiver_state.channels[RECEIVER_ARM_CHANNEL_INDEX] < RECEIVER_ARM_RAW_THRESHOLD)
+    {
+      Motors_ForceIdleRegistersOnly();
+    }
   }
 }
 
@@ -136,6 +157,7 @@ static void Receiver_HandleByte(uint8_t byte)
   {
     if ((byte < 2U) || (byte > CRSF_FRAME_MAX_SIZE))
     {
+      g_receiver_state.sync_error_count++;
       Receiver_ResetParser();
       return;
     }
@@ -167,6 +189,7 @@ void Receiver_Init(void)
   }
 
   Receiver_ResetParser();
+  HAL_NVIC_SetPriority(UART4_IRQn, 4U, 0U);
   printf("[Receiver_Init] Starting UART4/UART6 RX interrupts\r\n");
   App_AppendBootLog("[Receiver_Init] Starting UART4/UART6 RX interrupts\r\n");
   
@@ -183,11 +206,14 @@ void Receiver_Init(void)
 
 void Receiver_Update(uint32_t now_ms)
 {
+  __disable_irq();
+  now_ms = HAL_GetTick();
   if ((g_receiver_state.link_active != 0U) &&
       ((now_ms - g_receiver_state.last_frame_ms) > CRSF_LINK_TIMEOUT_MS))
   {
     g_receiver_state.link_active = 0U;
   }
+  __enable_irq();
 }
 
 void Receiver_GetState(receiver_state_t *state)
@@ -225,6 +251,20 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == UART4)
   {
+    uint32_t error_code = huart->ErrorCode;
+
+    if ((error_code & HAL_UART_ERROR_ORE) != 0U)
+    {
+      g_receiver_state.overrun_error_count++;
+    }
+    if ((error_code & HAL_UART_ERROR_FE) != 0U)
+    {
+      g_receiver_state.framing_error_count++;
+    }
+    if ((error_code & HAL_UART_ERROR_NE) != 0U)
+    {
+      g_receiver_state.noise_error_count++;
+    }
     Receiver_ResetParser();
     (void)HAL_UART_AbortReceive(huart);
     (void)HAL_UART_Receive_IT(&huart4, &g_rx_byte, 1U);

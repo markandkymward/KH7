@@ -16,6 +16,11 @@ typedef struct
   uint8_t frame_received;
   uint32_t frame_count;
   uint32_t last_frame_ms;
+  uint32_t crc_error_count;
+  uint32_t sync_error_count;
+  uint32_t overrun_error_count;
+  uint32_t framing_error_count;
+  uint32_t noise_error_count;
 } receiver_state_t;
 
 void Receiver_Init(void);

@@ -10,18 +10,20 @@
 #include "baro.h"
 #include "gps.h"
 #include "mag.h"
+#include "nav.h"
 #include "motors.h"
 #include "communications.h"
 #include "receiver.h"
 #include "telemetry.h"
 #include "sdcard.h"
+#include "fault_record.h"
 #include "main.h"
 
 #define APP_MOTOR_TEST_MODE 0U
 #define APP_CONTROL_LOOP_MS 2U
 #define RAD_PER_DEG       0.0174532925f
 #define APP_ENABLE_IMU_RUNTIME_TELEMETRY 0U
-#define APP_ENABLE_ARM_RUNTIME_TELEMETRY 0U
+#define APP_ENABLE_ARM_RUNTIME_TELEMETRY 1U
 #define APP_ENABLE_RECEIVER_RUNTIME_TELEMETRY 0U
 #define APP_ENABLE_ANGLE_TELEMETRY 0U
 /* USB motor-test (bench, ground-only) mode always streams IMU state for motor_test_gui.py,
@@ -33,6 +35,7 @@
 #define APP_CH_YAW_INDEX       3U
 #define APP_CH_ARM_INDEX       4U
 #define APP_CH_MODE_INDEX      5U
+#define APP_CH_TELARM_INDEX    6U
 #define APP_ARM_THRESHOLD_US   1500U
 /* A single corrupted/noisy CRSF frame can momentarily report the arm channel
  * or link as bad for just one control-loop iteration - require the disarm
@@ -103,6 +106,23 @@
  * corrections are inherently a slow process. */
 #define APP_ALTHOLD_TRIM_LPF_HZ             1.5f
 #define APP_ALTHOLD_TRIM_LIMIT_US          250U
+/* --- NAV_VELOCITY_BRAKE (experimental GPS horizontal velocity brake, phase 1) ---
+ * Reuses the ATTITUDE-mode angle controller (roll/pitch) and the ALTHOLD throttle
+ * controller (vertical) - this section only adds the outer velocity->angle loop.
+ * Engaged when ch6 (the existing mode switch) exceeds this threshold - a 4th band
+ * above ALTHOLD's >=1800us, so it needs a transmitter mix that can drive ch6 above
+ * 2000us (the existing 3-way RATE/ATTITUDE/ALTHOLD switch positions are unaffected). */
+#define APP_NAV_BRAKE_SWITCH_THRESHOLD_US   2000U
+/* Conservative first-pass limits (see user-selected 1.5 m/s max velocity):
+ * kept at/near the low end of the suggested ranges since this mode is unflown. */
+#define APP_NAV_BRAKE_MAX_TILT_DEG          8.0f
+#define APP_NAV_BRAKE_MAX_ACCEL_MPS2        1.0f
+#define APP_NAV_BRAKE_MAX_VEL_MPS           1.5f
+#define APP_NAV_BRAKE_STICK_DEADBAND_US      20U
+/* accel_cmd (m/s^2) = Kp * vel_error (m/s). At the max 1.5 m/s error this gives
+ * 0.9 m/s^2, leaving headroom below the 1.0 m/s^2 clamp instead of saturating
+ * immediately at every large error. */
+#define APP_NAV_BRAKE_VELOCITY_KP            0.6f
 #define APP_ROLL_SIGN          (1)
 #define APP_PITCH_SIGN         (-1)
 #define APP_YAW_SIGN           (1)
@@ -214,6 +234,7 @@ typedef enum
   APP_FLIGHT_MODE_RATE = 0U,
   APP_FLIGHT_MODE_ATTITUDE = 1U,
   APP_FLIGHT_MODE_ALTHOLD = 2U,
+  APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE = 3U,
 } App_FlightMode_t;
 
 typedef enum
@@ -337,6 +358,10 @@ static volatile uint16_t g_glog_count = 0U;
 static volatile uint8_t g_glog_capturing = 0U;
 static volatile uint8_t g_glog_dump_pending = 0U;
 static volatile uint8_t g_glog_armed_state = 0U;
+/* Runtime toggle for the high-volume bench IMU/NAV telemetry stream while armed (blocking
+ * UART6 writes add control-loop latency, so this defaults off/safe for real flight and is
+ * only turned on for prop-off bench diagnostics via App_RequestArmedTelemetryEnabled()). */
+static volatile uint8_t g_armed_test_telemetry_enabled = 0U;
 
 void App_RequestGyroLogDump(void)
 {
@@ -452,14 +477,24 @@ static void App_ServiceSdCommands(void)
  * previously a real control-loop stall that showed up as uncommanded-looking
  * attitude transients in flight logs - no longer blocks App_Update(). */
 #define APP_SDLOG_MAGIC 0x4B484C47UL /* "KHLG" */
-#define APP_SDLOG_DECIMATION 4U /* every 4th 2ms control tick -> 125Hz log rate */
+#define APP_SDLOG_DECIMATION 10U /* every 10th 2ms control tick -> 50Hz log rate */
 #define APP_SDLOG_FLAG_ARMED 0x01U
 #define APP_SDLOG_FLAG_MODE_SHIFT 1U
 #define APP_SDLOG_FLAG_MODE_MASK 0x06U
 #define APP_SDLOG_FLAG_LINK_ACTIVE 0x08U /* receiver_state.link_active, to tell a switch glitch apart from an RF link dropout */
 #define APP_SDLOG_FLAG_MAG_HEALTHY 0x10U
 
-/* Fixed 32-byte little-endian record (matches tools/sdlog_analyze.py's struct format). */
+#define APP_SDLOG_NAV_FLAG_REQUESTED    0x01U
+#define APP_SDLOG_NAV_FLAG_ACTIVE       0x02U
+#define APP_SDLOG_NAV_FLAG_TILT_LIMITED 0x04U
+#define APP_SDLOG_NAV_FLAG_ACCEL_LIMITED 0x08U
+#define APP_SDLOG_NAV_FLAG_NEW_SAMPLE   0x10U
+#define APP_SDLOG_NAV_FLAG_REJECTED     0x20U
+#define APP_SDLOG_NAV_FLAG_REF_VALID    0x40U
+
+/* Record grew from the original 32 bytes as fields were added over time (see repo
+ * history) - matches tools/sdlog_analyze.py's struct format, which must be updated
+ * in lockstep with any change here. */
 typedef struct __attribute__((packed))
 {
   uint32_t time_ms;
@@ -489,6 +524,33 @@ typedef struct __attribute__((packed))
   uint16_t arm_us;
   int16_t yaw_deg_x10;
   uint16_t mag_heading_x10;
+  /* --- GPS navigation foundation / NAV_VELOCITY_BRAKE fields (added with the
+   * GPS nav phase-1 feature) --- */
+  uint8_t nav_flags;             /* APP_SDLOG_NAV_FLAG_* bits */
+  uint8_t nav_invalid_reason;    /* Nav_InvalidReason_t */
+  uint8_t nav_fix_type;
+  uint8_t nav_num_sv;
+  uint16_t nav_h_acc_cm;
+  uint16_t nav_age_ms;
+  uint16_t nav_update_period_ms;
+  uint16_t nav_consecutive_valid;
+  uint16_t nav_dropout_count;
+  int16_t nav_north_m_x10;
+  int16_t nav_east_m_x10;
+  int16_t nav_raw_vel_n_x100;
+  int16_t nav_raw_vel_e_x100;
+  int16_t nav_filt_vel_n_x100;
+  int16_t nav_filt_vel_e_x100;
+  int16_t nav_desired_vel_n_x100;
+  int16_t nav_desired_vel_e_x100;
+  int16_t nav_vel_error_n_x100;
+  int16_t nav_vel_error_e_x100;
+  int16_t nav_accel_cmd_n_x1000;
+  int16_t nav_accel_cmd_e_x1000;
+  int16_t nav_accel_cmd_fwd_x1000;
+  int16_t nav_accel_cmd_right_x1000;
+  int16_t pilot_roll_stick_us;
+  int16_t pilot_pitch_stick_us;
 } App_SdLogRecord_t;
 
 #define APP_SDLOG_RECORDS_PER_BLOCK (SD_BLOCK_SIZE / sizeof(App_SdLogRecord_t))
@@ -527,17 +589,20 @@ static void App_SdLogAwaitWrite(void)
 
 static void App_SdLogFlushBufferAsync(void)
 {
-  /* Overrun guard: a block fills roughly every several hundred ms of flight
-   * time, far longer than one SD write takes, so this should never actually
-   * wait - it exists only as a correctness fallback. */
-  App_SdLogAwaitWrite();
+  /* Never wait on storage from the armed control path. If the card has not
+   * completed the previous block, drop this block instead of delaying motor
+   * control or preventing an arm-switch disarm from being processed. */
+  if (g_sdlog_write_pending != 0U)
+  {
+    return;
+  }
 
   memcpy(g_sdlog_write_buf, g_sdlog_block_buf, sizeof(g_sdlog_write_buf));
   if (SD_WriteBlockBegin(g_sdlog_flight_next_block, g_sdlog_write_buf) == SD_OK)
   {
     g_sdlog_write_pending = 1U;
+    g_sdlog_flight_next_block++;
   }
-  g_sdlog_flight_next_block++;
 }
 
 static void App_SdLogSaveSuperblock(void)
@@ -637,6 +702,102 @@ static void App_SdLogAppendRecord(const App_SdLogRecord_t *rec)
   }
 }
 
+/* Full-rate (undecimated) rolling black-box buffer of the most recent stretch of
+ * flight, kept in RAM_D3 (0x38000000, 64KB - unused by anything else in this
+ * project; contents survive an IWDG/software reset, only lost on a true power
+ * cycle). Captured every armed control-loop iteration alongside (not instead of)
+ * the normal decimated persisted SD log, so a mid-flight hang/crash that the
+ * ~50Hz log would only catch coarsely can still be inspected at full loop rate
+ * on the next boot. Recovered records are written out as their own "flight"
+ * segment in the persisted SD log (via the same arm/append/flush path used for a
+ * real flight), so existing tooling (SDLOG DUMP LAST, sdlog_analyze.py) needs no
+ * changes to see them. */
+#define APP_BLACKBOX_RING_ADDR     0x38000200UL
+#define APP_BLACKBOX_RING_MAGIC    0x4B42524Cu /* 'KBRL' */
+#define APP_BLACKBOX_RING_CAPACITY 400U
+
+typedef struct __attribute__((packed))
+{
+  uint32_t magic;
+  uint32_t write_index;
+  uint32_t count;
+  App_SdLogRecord_t ring[APP_BLACKBOX_RING_CAPACITY];
+} App_BlackboxRing_t;
+
+#define APP_BLACKBOX_RING ((volatile App_BlackboxRing_t *)APP_BLACKBOX_RING_ADDR)
+
+static void App_BlackboxCapture(const App_SdLogRecord_t *rec)
+{
+  volatile App_BlackboxRing_t *bb = APP_BLACKBOX_RING;
+
+  if (bb->magic != APP_BLACKBOX_RING_MAGIC)
+  {
+    bb->magic = APP_BLACKBOX_RING_MAGIC;
+    bb->write_index = 0U;
+    bb->count = 0U;
+  }
+
+  memcpy((void *)&bb->ring[bb->write_index], rec, sizeof(*rec));
+  bb->write_index = (bb->write_index + 1U) % APP_BLACKBOX_RING_CAPACITY;
+  if (bb->count < APP_BLACKBOX_RING_CAPACITY)
+  {
+    bb->count++;
+  }
+}
+
+/* Called once at boot (after SD_Init()/App_SdLogLoadSuperblock()) - if the previous
+ * session left a valid ring behind, writes it out as a new flight segment. */
+static void App_BlackboxDumpIfPresent(void)
+{
+  volatile App_BlackboxRing_t *bb = APP_BLACKBOX_RING;
+  uint32_t n;
+  uint32_t start_idx;
+  uint32_t i;
+
+  if ((bb->magic != APP_BLACKBOX_RING_MAGIC) || (bb->count == 0U))
+  {
+    return;
+  }
+
+  n = bb->count;
+  start_idx = (n >= APP_BLACKBOX_RING_CAPACITY) ? bb->write_index : 0U;
+
+  printf("BLACKBOX[records=%lu]\r\n", (unsigned long)n);
+
+  App_SdLogArmStart();
+  for (i = 0U; i < n; i++)
+  {
+    App_SdLogRecord_t rec;
+    uint32_t idx = (start_idx + i) % APP_BLACKBOX_RING_CAPACITY;
+
+    memcpy(&rec, (const void *)&bb->ring[idx], sizeof(rec));
+    App_SdLogAppendRecord(&rec);
+  }
+  App_SdLogFlushFlight();
+
+  bb->magic = 0U;
+}
+
+/* Reports (over UART6) and clears the persistent fault record left by stm32h7xx_it.c's
+ * fault handlers, if any - a reprint at boot in case nothing was listening live. */
+static void App_ReportAndClearFaultRecord(void)
+{
+  volatile FaultRecord_t *rec = FAULT_RECORD;
+  char name[sizeof(rec->name)];
+
+  if (rec->magic != FAULT_RECORD_MAGIC)
+  {
+    return;
+  }
+
+  memcpy(name, (const void *)rec->name, sizeof(name));
+  printf("FAULT_PERSISTED[%s] pc=0x%08lX lr=0x%08lX cfsr=0x%08lX hfsr=0x%08lX mmfar=0x%08lX bfar=0x%08lX\r\n",
+         name, (unsigned long)rec->pc, (unsigned long)rec->lr, (unsigned long)rec->cfsr,
+         (unsigned long)rec->hfsr, (unsigned long)rec->mmfar, (unsigned long)rec->bfar);
+
+  rec->magic = 0U;
+}
+
 typedef enum
 {
   APP_SDLOGCMD_NONE = 0,
@@ -671,6 +832,19 @@ void App_RequestSdLogDumpLast(void)
 void App_RequestSdLogErase(void)
 {
   g_sdlog_cmd_pending = APP_SDLOGCMD_ERASE;
+}
+
+void App_RequestArmedTelemetryEnabled(uint8_t enabled)
+{
+  g_armed_test_telemetry_enabled = (enabled != 0U) ? 1U : 0U;
+  printf("TELARM[%s]\r\n", (g_armed_test_telemetry_enabled != 0U) ? "ON" : "OFF");
+}
+
+void App_PrintArmedTelemetryStatus(void)
+{
+  /* Read-only echo of the current flag - lets any client (field tester, GUI) resync its
+   * displayed/base toggle state without side effects, in case another client changed it. */
+  printf("TELARM[%s]\r\n", (g_armed_test_telemetry_enabled != 0U) ? "ON" : "OFF");
 }
 
 static void App_ServiceSdLog(void)
@@ -880,6 +1054,11 @@ static uint8_t App_UpdateGyroBias(float ax_g,
 
 static App_FlightMode_t App_SelectFlightMode(uint16_t mode_us)
 {
+  if (mode_us > APP_NAV_BRAKE_SWITCH_THRESHOLD_US)
+  {
+    return APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE;
+  }
+
   if (mode_us >= APP_ALTHOLD_SWITCH_THRESHOLD_US)
   {
     return APP_FLIGHT_MODE_ALTHOLD;
@@ -897,6 +1076,8 @@ static const char *App_FlightModeName(App_FlightMode_t mode)
 {
   switch (mode)
   {
+    case APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE:
+      return "NAVBRAKE";
     case APP_FLIGHT_MODE_ALTHOLD:
       return "ALTHOLD";
     case APP_FLIGHT_MODE_ATTITUDE:
@@ -1106,6 +1287,19 @@ static float App_StickOffsetUsToRateDps(int32_t stick_offset_us, float max_rate_
   }
 
   return normalized * max_rate_dps;
+}
+
+/* NAV_VELOCITY_BRAKE pilot stick mapping: same shape as App_StickOffsetUsToRateDps()
+ * (deadband + linear normalize to +-1) but scaled to a velocity instead of a rate. */
+static float App_NavStickOffsetToVelocityMps(int32_t stick_offset_us, float max_vel_mps)
+{
+  float normalized;
+
+  stick_offset_us = App_ApplyDeadbandUs(stick_offset_us, (int32_t)APP_NAV_BRAKE_STICK_DEADBAND_US);
+  normalized = ((float)stick_offset_us) / ((float)((int32_t)APP_PWM_MAX_US - (int32_t)APP_PWM_MID_US));
+  normalized = App_ClampFloat(normalized, -1.0f, 1.0f);
+
+  return normalized * max_vel_mps;
 }
 
 static int32_t App_ClampControlTerm(int32_t value, int32_t limit)
@@ -1900,15 +2094,8 @@ void App_Init(void)
     printf("BARO_INIT[FAIL chip_id=0x%02X]\r\n", (unsigned int)Baro_GetLastChipId());
   }
 
-  if (GPS_Init() == HAL_OK)
-  {
-    printf("GPS_INIT[OK]\r\n");
-  }
-  else
-  {
-    printf("GPS_INIT[FAIL prt_ack=%u msg_ack=%u]\r\n", (unsigned int)GPS_GetLastPrtAcked(),
-           (unsigned int)GPS_GetLastMsgAcked());
-  }
+  /* GPS is only used by NAV_VELOCITY_BRAKE - not initialized at boot; App_Update()'s
+   * retry only attempts GPS_Init() once that mode is actually selected. */
 
   if (Mag_Init() == HAL_OK)
   {
@@ -1923,6 +2110,11 @@ void App_Init(void)
   {
     App_SdLogLoadSuperblock();
   }
+
+  App_ReportAndClearFaultRecord();
+  App_BlackboxDumpIfPresent();
+
+  Nav_Init();
 }
 
 void App_Update(void)
@@ -1930,6 +2122,7 @@ void App_Update(void)
   static uint32_t detect_retry_counter = 0U;
   static uint32_t last_tick_ms = 0U;
   static uint8_t last_motor_test_step = 0xFFU;
+  static uint8_t last_telarm_switch_high = 0xFFU; /* sentinel forces an initial sync on first read */
 
   if (g_boot_log_pending != 0U)
   {
@@ -2016,6 +2209,12 @@ void App_Update(void)
   static uint16_t althold_settle_ref_us = APP_PWM_MID_US;
   static uint32_t althold_settle_start_ms = 0U;
   static float althold_trim_filtered_us = 0.0f;
+  static uint8_t nav_brake_active = 0U;
+  static uint8_t nav_brake_disqualified_latch = 0U;
+  /* Gates ALL GPS init/retry/parsing and Nav_Update() to only when NAV_VELOCITY_BRAKE
+   * is the currently selected mode - updated wherever flight_mode is (re)computed
+   * below, so it always reflects the mode switch with at most one iteration of lag. */
+  static App_FlightMode_t last_known_flight_mode = APP_FLIGHT_MODE_RATE;
   int32_t althold_trim_us;
   uint32_t liftoff_ramp_elapsed_ms;
   float liftoff_ramp_factor;
@@ -2043,6 +2242,20 @@ void App_Update(void)
   float target_pitch_deg;
   float roll_angle_error_deg;
   float pitch_angle_error_deg;
+  Nav_State_t nav_state;
+  uint8_t nav_brake_requested;
+  uint8_t nav_brake_tilt_limited;
+  uint8_t nav_brake_accel_limited;
+  float nav_brake_desired_north_vel_mps;
+  float nav_brake_desired_east_vel_mps;
+  float nav_brake_north_vel_error_mps;
+  float nav_brake_east_vel_error_mps;
+  float nav_brake_north_accel_cmd_mps2;
+  float nav_brake_east_accel_cmd_mps2;
+  float nav_brake_fwd_accel_cmd_mps2;
+  float nav_brake_right_accel_cmd_mps2;
+  int16_t pilot_roll_stick_us;
+  int16_t pilot_pitch_stick_us;
   uint16_t roll_us;
   uint16_t pitch_us;
   uint16_t throttle_us;
@@ -2103,6 +2316,20 @@ void App_Update(void)
   arm_switch_high = 0U;
   throttle_low = 0U;
   throttle_us = APP_PWM_MIN_US;
+  nav_brake_requested = 0U;
+  nav_brake_tilt_limited = 0U;
+  nav_brake_accel_limited = 0U;
+  nav_brake_desired_north_vel_mps = 0.0f;
+  nav_brake_desired_east_vel_mps = 0.0f;
+  nav_brake_north_vel_error_mps = 0.0f;
+  nav_brake_east_vel_error_mps = 0.0f;
+  nav_brake_north_accel_cmd_mps2 = 0.0f;
+  nav_brake_east_accel_cmd_mps2 = 0.0f;
+  nav_brake_fwd_accel_cmd_mps2 = 0.0f;
+  nav_brake_right_accel_cmd_mps2 = 0.0f;
+  pilot_roll_stick_us = 0;
+  pilot_pitch_stick_us = 0;
+  memset(&nav_state, 0, sizeof(nav_state));
 
   HAL_GPIO_TogglePin(LED0_GPIO_Port, LED0_Pin);
 
@@ -2147,8 +2374,10 @@ void App_Update(void)
   }
 
   /* GPS_Init() blocks waiting for UBX ACKs (up to ~1s worst case) - only retry
-   * while disarmed, matching the SD/PID-save armed-guard pattern above. */
-  if ((GPS_IsConfigured() == 0U) && (g_glog_armed_state == 0U) &&
+   * while disarmed, matching the SD/PID-save armed-guard pattern above. GPS is
+   * only used by NAV_VELOCITY_BRAKE - no GPS init/retry/parsing in any other mode. */
+  if ((last_known_flight_mode == APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE) &&
+      (GPS_IsConfigured() == 0U) && (g_glog_armed_state == 0U) &&
       ((now_ms - last_gps_retry_ms) >= APP_GPS_RETRY_MS))
   {
     if (GPS_Init() == HAL_OK)
@@ -2173,6 +2402,14 @@ void App_Update(void)
     }
     (void)Mag_Update();
     last_mag_sample_ms = now_ms;
+  }
+
+  /* Nav_Update() (and the GPS data it consumes) is only relevant to NAV_VELOCITY_BRAKE -
+   * skipped entirely in every other mode, leaving nav_state at its last value. */
+  if (last_known_flight_mode == APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE)
+  {
+    Nav_Update(now_ms, motors_armed);
+    Nav_GetState(&nav_state);
   }
 
   if (usb_motor_test_enabled != 0U)
@@ -2225,6 +2462,7 @@ void App_Update(void)
     {
       mode_us = App_CrsfRawToUs(receiver_state.channels[APP_CH_MODE_INDEX]);
       flight_mode = App_SelectFlightMode(mode_us);
+      last_known_flight_mode = flight_mode;
       Telemetry_PrintFlightMode(App_FlightModeName(flight_mode), mode_us);
       last_mode_telemetry_ms = now_ms;
     }
@@ -2398,6 +2636,14 @@ void App_Update(void)
                                GPS_GetLatitudeDeg(), GPS_GetLongitudeDeg(), GPS_GetAltitudeM());
         Telemetry_PrintMagState(Mag_IsHealthy(), Mag_GetXGauss(), Mag_GetYGauss(), Mag_GetZGauss(),
                                Mag_GetHeadingDeg());
+        Telemetry_PrintNavState(nav_state.valid, nav_state.reference_valid, (uint8_t)nav_state.invalid_reason,
+                               nav_state.fix_type, nav_state.num_sv, nav_state.h_acc_m,
+                               nav_state.age_ms, nav_state.update_period_ms,
+                               nav_state.consecutive_valid, nav_state.consecutive_invalid,
+                               nav_state.duplicate_count, nav_state.rejected_count, nav_state.dropout_count);
+        Telemetry_PrintNavPosVel(nav_state.north_m, nav_state.east_m,
+                                nav_state.raw_north_vel_mps, nav_state.raw_east_vel_mps,
+                                nav_state.filtered_north_vel_mps, nav_state.filtered_east_vel_mps);
         last_imu_telemetry_ms = now_ms;
       }
 #endif
@@ -2448,8 +2694,27 @@ void App_Update(void)
     yaw_us = App_CrsfRawToUs(receiver_state.channels[APP_CH_YAW_INDEX]);
     mode_us = App_CrsfRawToUs(receiver_state.channels[APP_CH_MODE_INDEX]);
     flight_mode = App_SelectFlightMode(mode_us);
+    last_known_flight_mode = flight_mode;
     arm_switch_high = (uint8_t)(arm_us >= APP_ARM_THRESHOLD_US);
     throttle_low = (uint8_t)(throttle_us <= APP_THROTTLE_LOW_US);
+
+    /* RC channel 7 controls the armed bench telemetry stream (hi=on, lo=off) - source of
+     * truth is the switch position itself, not a latched command, so it can never drift
+     * out of sync with what the pilot is holding. Edge-triggered so this never prints (or
+     * touches the flag) more than once per actual transition. */
+    {
+      uint16_t telarm_us = App_CrsfRawToUs(receiver_state.channels[APP_CH_TELARM_INDEX]);
+      uint8_t telarm_switch_high = (uint8_t)(telarm_us >= APP_ARM_THRESHOLD_US);
+
+      if (telarm_switch_high != last_telarm_switch_high)
+      {
+        last_telarm_switch_high = telarm_switch_high;
+        App_RequestArmedTelemetryEnabled(telarm_switch_high);
+      }
+    }
+    /* Reflects the mode-switch position for telemetry/bench visibility even while
+     * disarmed - the armed block below recomputes/uses this for actual control. */
+    nav_brake_requested = (flight_mode == APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE) ? 1U : 0U;
 
     if ((startup_safety_checked == 0U) && (receiver_state.link_active != 0U))
     {
@@ -2511,17 +2776,35 @@ void App_Update(void)
       if ((disarm_condition_active != 0U) &&
           ((now_ms - disarm_condition_start_ms) >= APP_DISARM_DEBOUNCE_MS))
       {
-        if ((motors_armed != 0U) && (g_sdlog_active != 0U))
+        uint8_t was_armed = motors_armed;
+        const char *disarm_reason = (receiver_state.link_active == 0U) ? "RX_LINK_LOST" : "ARM_SWITCH_LOW";
+
+        motors_armed = 0U;
+        g_glog_armed_state = 0U;
+        Motors_SetOutputEnabled(1U);
+        Motors_StopAll();
+
+        if (was_armed != 0U)
+        {
+          printf("ARM_EVENT[DISARM reason=%s link=%u arm_us=%u age_ms=%lu]\r\n",
+                 disarm_reason,
+                 (unsigned int)receiver_state.link_active,
+                 (unsigned int)arm_us,
+                 (unsigned long)(now_ms - receiver_state.last_frame_ms));
+        }
+
+        if ((was_armed != 0U) && (g_sdlog_active != 0U))
         {
           App_SdLogFlushFlight();
         }
-        motors_armed = 0U;
         trim_captured = 0U;
         arm_hold_start_ms = 0U;
         roll_integral_dps_s = 0.0f;
         pitch_integral_dps_s = 0.0f;
         yaw_integral_dps_s = 0.0f;
         pid_state_initialized = 0U;
+        nav_brake_active = 0U;
+        nav_brake_disqualified_latch = 0U;
       }
 
       Motors_SetOutputEnabled(1U);
@@ -2572,8 +2855,145 @@ void App_Update(void)
           trim_captured = 1U;
         }
 
-        if ((flight_mode == APP_FLIGHT_MODE_ATTITUDE) || (flight_mode == APP_FLIGHT_MODE_ALTHOLD))
+        pilot_roll_stick_us = (int16_t)((int32_t)roll_us - (int32_t)roll_center_us);
+        pilot_pitch_stick_us = (int16_t)((int32_t)pitch_us - (int32_t)pitch_center_us);
+        nav_brake_requested = (flight_mode == APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE) ? 1U : 0U;
+
+        if (nav_brake_requested != 0U)
         {
+          /* Engagement requirements (section 9): valid+referenced GPS nav, a
+           * usable attitude/yaw solution, altitude hold available, link up,
+           * and not latched out from a previous in-mode GPS loss. */
+          uint8_t nav_engage_ok = (uint8_t)((nav_state.valid != 0U) &&
+                                            (nav_state.reference_valid != 0U) &&
+                                            (attitude_zero_captured != 0U) &&
+                                            (Baro_IsHealthy() != 0U) &&
+                                            (receiver_state.link_active != 0U) &&
+                                            (nav_brake_disqualified_latch == 0U));
+
+          if (nav_engage_ok != 0U)
+          {
+            float fwd_cmd_mps;
+            float right_cmd_mps;
+            float desired_north_vel_mps;
+            float desired_east_vel_mps;
+
+            if (nav_brake_active == 0U)
+            {
+              /* Fresh engagement this iteration: explicitly latch the local
+               * reference now (sec.4) so this always works even if the
+               * disarmed auto-latch never had the chance to run. */
+              Nav_LatchReference();
+            }
+
+            fwd_cmd_mps = ((float)APP_PITCH_SIGN) *
+                          App_NavStickOffsetToVelocityMps(pilot_pitch_stick_us, APP_NAV_BRAKE_MAX_VEL_MPS);
+            right_cmd_mps = ((float)APP_ROLL_SIGN) *
+                            App_NavStickOffsetToVelocityMps(pilot_roll_stick_us, APP_NAV_BRAKE_MAX_VEL_MPS);
+
+            /* Pilot command flow (sec.7): body-relative stick -> yaw-rotated
+             * desired N/E velocity -> compare to filtered GPS velocity ->
+             * earth-frame accel command -> body-frame accel -> angle command. */
+            Nav_RotateBodyToNed(fwd_cmd_mps, right_cmd_mps, yaw_deg,
+                               &desired_north_vel_mps, &desired_east_vel_mps);
+
+            nav_brake_north_vel_error_mps = desired_north_vel_mps - nav_state.filtered_north_vel_mps;
+            nav_brake_east_vel_error_mps = desired_east_vel_mps - nav_state.filtered_east_vel_mps;
+
+            nav_brake_north_accel_cmd_mps2 = App_ClampFloat(APP_NAV_BRAKE_VELOCITY_KP * nav_brake_north_vel_error_mps,
+                                                            -APP_NAV_BRAKE_MAX_ACCEL_MPS2, APP_NAV_BRAKE_MAX_ACCEL_MPS2);
+            nav_brake_east_accel_cmd_mps2 = App_ClampFloat(APP_NAV_BRAKE_VELOCITY_KP * nav_brake_east_vel_error_mps,
+                                                           -APP_NAV_BRAKE_MAX_ACCEL_MPS2, APP_NAV_BRAKE_MAX_ACCEL_MPS2);
+
+            Nav_RotateNedToBody(nav_brake_north_accel_cmd_mps2, nav_brake_east_accel_cmd_mps2, yaw_deg,
+                               &nav_brake_fwd_accel_cmd_mps2, &nav_brake_right_accel_cmd_mps2);
+
+            target_pitch_deg = ((float)APP_PITCH_SIGN) *
+                               Nav_AccelToAngleDeg(nav_brake_fwd_accel_cmd_mps2, APP_NAV_BRAKE_MAX_TILT_DEG);
+            target_roll_deg = ((float)APP_ROLL_SIGN) *
+                              Nav_AccelToAngleDeg(nav_brake_right_accel_cmd_mps2, APP_NAV_BRAKE_MAX_TILT_DEG);
+
+            nav_brake_desired_north_vel_mps = desired_north_vel_mps;
+            nav_brake_desired_east_vel_mps = desired_east_vel_mps;
+            nav_brake_tilt_limited = (uint8_t)((fabsf(target_pitch_deg) >= (APP_NAV_BRAKE_MAX_TILT_DEG - 0.01f)) ||
+                                               (fabsf(target_roll_deg) >= (APP_NAV_BRAKE_MAX_TILT_DEG - 0.01f)));
+            nav_brake_accel_limited = (uint8_t)((fabsf(nav_brake_north_accel_cmd_mps2) >= (APP_NAV_BRAKE_MAX_ACCEL_MPS2 - 0.001f)) ||
+                                                (fabsf(nav_brake_east_accel_cmd_mps2) >= (APP_NAV_BRAKE_MAX_ACCEL_MPS2 - 0.001f)));
+
+            nav_brake_active = 1U;
+          }
+          else
+          {
+            if (nav_brake_active != 0U)
+            {
+              const char *lost_reason;
+
+              /* Was engaged, lost validity this iteration - log the exact
+               * reason (sec.9) and latch out until the pilot leaves and
+               * reselects this mode. Never retain a stale nav command: fall
+               * straight through to the plain stick-angle behavior below. */
+              if (nav_state.valid == 0U)
+              {
+                lost_reason = Nav_InvalidReasonName(nav_state.invalid_reason);
+              }
+              else if (nav_state.reference_valid == 0U)
+              {
+                lost_reason = "NO_REFERENCE";
+              }
+              else if (attitude_zero_captured == 0U)
+              {
+                lost_reason = "ATTITUDE_NOT_READY";
+              }
+              else if (Baro_IsHealthy() == 0U)
+              {
+                lost_reason = "BARO_UNHEALTHY";
+              }
+              else if (receiver_state.link_active == 0U)
+              {
+                lost_reason = "RX_LINK_LOST";
+              }
+              else
+              {
+                lost_reason = "GATE_UNKNOWN";
+              }
+              printf("NAV_LOST[reason=%s]\r\n", lost_reason);
+              nav_brake_disqualified_latch = 1U;
+            }
+            nav_brake_active = 0U;
+
+            target_roll_deg = ((float)APP_ROLL_SIGN) * App_StickOffsetUsToAngleDeg((int32_t)roll_us - (int32_t)roll_center_us,
+                                                                                    active_attitude_gains.max_angle_deg);
+            target_pitch_deg = ((float)APP_PITCH_SIGN) * App_StickOffsetUsToAngleDeg((int32_t)pitch_us - (int32_t)pitch_center_us,
+                                                                                      active_attitude_gains.max_angle_deg);
+            nav_brake_desired_north_vel_mps = 0.0f;
+            nav_brake_desired_east_vel_mps = 0.0f;
+            nav_brake_north_vel_error_mps = 0.0f;
+            nav_brake_east_vel_error_mps = 0.0f;
+            nav_brake_north_accel_cmd_mps2 = 0.0f;
+            nav_brake_east_accel_cmd_mps2 = 0.0f;
+            nav_brake_fwd_accel_cmd_mps2 = 0.0f;
+            nav_brake_right_accel_cmd_mps2 = 0.0f;
+            nav_brake_tilt_limited = 0U;
+            nav_brake_accel_limited = 0U;
+          }
+
+          roll_angle_error_deg = Attitude_WrapAngle180(target_roll_deg - roll_deg);
+          pitch_angle_error_deg = Attitude_WrapAngle180(target_pitch_deg - pitch_deg);
+
+          cmd_roll_rate_dps = App_ClampFloat(roll_angle_error_deg * active_attitude_gains.roll_kp,
+                                             -APP_RATE_CMD_MAX_ROLL_DPS,
+                                             APP_RATE_CMD_MAX_ROLL_DPS);
+          cmd_pitch_rate_dps = App_ClampFloat(pitch_angle_error_deg * active_attitude_gains.pitch_kp,
+                                              -APP_RATE_CMD_MAX_PITCH_DPS,
+                                              APP_RATE_CMD_MAX_PITCH_DPS);
+        }
+        else if ((flight_mode == APP_FLIGHT_MODE_ATTITUDE) || (flight_mode == APP_FLIGHT_MODE_ALTHOLD))
+        {
+          /* Leaving NAV_VELOCITY_BRAKE always clears the disqualify latch -
+           * re-selecting the mode later always gets a fresh engagement chance. */
+          nav_brake_active = 0U;
+          nav_brake_disqualified_latch = 0U;
+
           target_roll_deg = ((float)APP_ROLL_SIGN) * App_StickOffsetUsToAngleDeg((int32_t)roll_us - (int32_t)roll_center_us,
                                                                                   active_attitude_gains.max_angle_deg);
           target_pitch_deg = ((float)APP_PITCH_SIGN) * App_StickOffsetUsToAngleDeg((int32_t)pitch_us - (int32_t)pitch_center_us,
@@ -2590,6 +3010,9 @@ void App_Update(void)
         }
         else
         {
+          nav_brake_active = 0U;
+          nav_brake_disqualified_latch = 0U;
+
           cmd_roll_rate_dps = ((float)APP_ROLL_SIGN) * App_StickOffsetUsToRateDps((int32_t)roll_us - (int32_t)roll_center_us,
                              APP_RATE_CMD_MAX_ROLL_DPS);
           cmd_pitch_rate_dps = ((float)APP_PITCH_SIGN) * App_StickOffsetUsToRateDps((int32_t)pitch_us - (int32_t)pitch_center_us,
@@ -2700,7 +3123,8 @@ void App_Update(void)
         yaw_term = App_ClampControlTerm((int32_t)yaw_term_f, APP_RATE_TERM_LIMIT_US);
         baro_healthy_now = Baro_IsHealthy();
         althold_trim_us = 0;
-        if ((flight_mode == APP_FLIGHT_MODE_ALTHOLD) && (baro_healthy_now != 0U) &&
+        if (((flight_mode == APP_FLIGHT_MODE_ALTHOLD) || (flight_mode == APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE)) &&
+            (baro_healthy_now != 0U) &&
             (Baro_GetAltitudeM() >= APP_BARO_VZ_DAMP_MIN_ALT_M))
         {
           /* Also gated on altitude (same APP_BARO_VZ_DAMP_MIN_ALT_M ground-effect
@@ -2912,7 +3336,7 @@ void App_Update(void)
         /* Physical channels map as: CH1=LA, CH2=LF, CH3=RA, CH4=RF. */
         Motors_WriteUs(s4_us, s1_us, s3_us, s2_us);
 
-        if ((g_sdlog_active != 0U) && ((sdlog_decim_counter++ % APP_SDLOG_DECIMATION) == 0U))
+        if (g_sdlog_active != 0U)
         {
           App_SdLogRecord_t sdlog_rec;
 
@@ -2937,8 +3361,9 @@ void App_Update(void)
                                       ((Mag_IsHealthy() != 0U) ? APP_SDLOG_FLAG_MAG_HEALTHY : 0U));
           sdlog_rec.pitch_deg_x10 = (int16_t)(pitch_deg * 10.0f);
           sdlog_rec.roll_deg_x10 = (int16_t)(roll_deg * 10.0f);
-          /* target_roll/pitch_deg are only meaningful (set this iteration) in ATTITUDE/ALTHOLD mode. */
-          if ((flight_mode == APP_FLIGHT_MODE_ATTITUDE) || (flight_mode == APP_FLIGHT_MODE_ALTHOLD))
+          /* target_roll/pitch_deg are only meaningful (set this iteration) in an angle-mode branch. */
+          if ((flight_mode == APP_FLIGHT_MODE_ATTITUDE) || (flight_mode == APP_FLIGHT_MODE_ALTHOLD) ||
+              (flight_mode == APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE))
           {
             sdlog_rec.target_pitch_deg_x10 = (int16_t)(target_pitch_deg * 10.0f);
             sdlog_rec.target_roll_deg_x10 = (int16_t)(target_roll_deg * 10.0f);
@@ -2955,7 +3380,48 @@ void App_Update(void)
           sdlog_rec.arm_us = arm_us;
           sdlog_rec.yaw_deg_x10 = (int16_t)(yaw_deg * 10.0f);
           sdlog_rec.mag_heading_x10 = (uint16_t)(Mag_GetHeadingDeg() * 10.0f);
-          App_SdLogAppendRecord(&sdlog_rec);
+
+          sdlog_rec.nav_flags = (uint8_t)((nav_brake_requested != 0U ? APP_SDLOG_NAV_FLAG_REQUESTED : 0U) |
+                                          (nav_brake_active != 0U ? APP_SDLOG_NAV_FLAG_ACTIVE : 0U) |
+                                          (nav_brake_tilt_limited != 0U ? APP_SDLOG_NAV_FLAG_TILT_LIMITED : 0U) |
+                                          (nav_brake_accel_limited != 0U ? APP_SDLOG_NAV_FLAG_ACCEL_LIMITED : 0U) |
+                                          (nav_state.new_sample != 0U ? APP_SDLOG_NAV_FLAG_NEW_SAMPLE : 0U) |
+                                          ((nav_state.rejected_count > 0U) &&
+                                           (nav_state.invalid_reason == NAV_INVALID_REASON_POSITION_JUMP ||
+                                            nav_state.invalid_reason == NAV_INVALID_REASON_VELOCITY_JUMP ||
+                                            nav_state.invalid_reason == NAV_INVALID_REASON_BAD_UPDATE_INTERVAL) ?
+                                           APP_SDLOG_NAV_FLAG_REJECTED : 0U) |
+                                          (nav_state.reference_valid != 0U ? APP_SDLOG_NAV_FLAG_REF_VALID : 0U));
+          sdlog_rec.nav_invalid_reason = (uint8_t)nav_state.invalid_reason;
+          sdlog_rec.nav_fix_type = nav_state.fix_type;
+          sdlog_rec.nav_num_sv = nav_state.num_sv;
+          sdlog_rec.nav_h_acc_cm = (uint16_t)App_ClampFloat(nav_state.h_acc_m * 100.0f, 0.0f, 65535.0f);
+          sdlog_rec.nav_age_ms = (uint16_t)((nav_state.age_ms > 65535U) ? 65535U : nav_state.age_ms);
+          sdlog_rec.nav_update_period_ms = (uint16_t)((nav_state.update_period_ms > 65535U) ? 65535U : nav_state.update_period_ms);
+          sdlog_rec.nav_consecutive_valid = (uint16_t)((nav_state.consecutive_valid > 65535U) ? 65535U : nav_state.consecutive_valid);
+          sdlog_rec.nav_dropout_count = (uint16_t)((nav_state.dropout_count > 65535U) ? 65535U : nav_state.dropout_count);
+          sdlog_rec.nav_north_m_x10 = (int16_t)(nav_state.north_m * 10.0f);
+          sdlog_rec.nav_east_m_x10 = (int16_t)(nav_state.east_m * 10.0f);
+          sdlog_rec.nav_raw_vel_n_x100 = (int16_t)(nav_state.raw_north_vel_mps * 100.0f);
+          sdlog_rec.nav_raw_vel_e_x100 = (int16_t)(nav_state.raw_east_vel_mps * 100.0f);
+          sdlog_rec.nav_filt_vel_n_x100 = (int16_t)(nav_state.filtered_north_vel_mps * 100.0f);
+          sdlog_rec.nav_filt_vel_e_x100 = (int16_t)(nav_state.filtered_east_vel_mps * 100.0f);
+          sdlog_rec.nav_desired_vel_n_x100 = (int16_t)(nav_brake_desired_north_vel_mps * 100.0f);
+          sdlog_rec.nav_desired_vel_e_x100 = (int16_t)(nav_brake_desired_east_vel_mps * 100.0f);
+          sdlog_rec.nav_vel_error_n_x100 = (int16_t)(nav_brake_north_vel_error_mps * 100.0f);
+          sdlog_rec.nav_vel_error_e_x100 = (int16_t)(nav_brake_east_vel_error_mps * 100.0f);
+          sdlog_rec.nav_accel_cmd_n_x1000 = (int16_t)(nav_brake_north_accel_cmd_mps2 * 1000.0f);
+          sdlog_rec.nav_accel_cmd_e_x1000 = (int16_t)(nav_brake_east_accel_cmd_mps2 * 1000.0f);
+          sdlog_rec.nav_accel_cmd_fwd_x1000 = (int16_t)(nav_brake_fwd_accel_cmd_mps2 * 1000.0f);
+          sdlog_rec.nav_accel_cmd_right_x1000 = (int16_t)(nav_brake_right_accel_cmd_mps2 * 1000.0f);
+          sdlog_rec.pilot_roll_stick_us = pilot_roll_stick_us;
+          sdlog_rec.pilot_pitch_stick_us = pilot_pitch_stick_us;
+
+          App_BlackboxCapture(&sdlog_rec);
+          if ((sdlog_decim_counter++ % APP_SDLOG_DECIMATION) == 0U)
+          {
+            App_SdLogAppendRecord(&sdlog_rec);
+          }
         }
       }
     }
@@ -3135,9 +3601,8 @@ void App_Update(void)
       mag_yaw_nudge_dps = 0.0f;
     }
 
-    /* Stream IMU state whenever disarmed (ground/bench monitoring) even though
-     * APP_ENABLE_IMU_RUNTIME_TELEMETRY stays off for real armed flight. */
-    if ((APP_ENABLE_IMU_RUNTIME_TELEMETRY || (motors_armed == 0U)) &&
+    /* Stream while disarmed, or while armed with bench telemetry toggled on. */
+    if ((APP_ENABLE_IMU_RUNTIME_TELEMETRY || (g_armed_test_telemetry_enabled != 0U) || (motors_armed == 0U)) &&
         ((now_ms - last_imu_telemetry_ms) >= APP_IMU_TELEMETRY_MS))
     {
       Telemetry_PrintImuState(ax_g,
@@ -3158,13 +3623,89 @@ void App_Update(void)
                              GPS_GetLatitudeDeg(), GPS_GetLongitudeDeg(), GPS_GetAltitudeM());
       Telemetry_PrintMagState(Mag_IsHealthy(), Mag_GetXGauss(), Mag_GetYGauss(), Mag_GetZGauss(),
                              Mag_GetHeadingDeg());
+      Telemetry_PrintNavState(nav_state.valid, nav_state.reference_valid, (uint8_t)nav_state.invalid_reason,
+                             nav_state.fix_type, nav_state.num_sv, nav_state.h_acc_m,
+                             nav_state.age_ms, nav_state.update_period_ms,
+                             nav_state.consecutive_valid, nav_state.consecutive_invalid,
+                             nav_state.duplicate_count, nav_state.rejected_count, nav_state.dropout_count);
+      Telemetry_PrintNavPosVel(nav_state.north_m, nav_state.east_m,
+                              nav_state.raw_north_vel_mps, nav_state.raw_east_vel_mps,
+                              nav_state.filtered_north_vel_mps, nav_state.filtered_east_vel_mps);
+      {
+        /* Bench-test diagnostic (section 14): while DISARMED, motors_armed's mixer
+         * block above never ran, so target_roll/pitch_deg and the nav_brake_* accel
+         * fields are stale/irrelevant - recompute a "would-be" nav-brake command
+         * here purely for bench validation (sign conventions, yaw rotation, GPS
+         * velocity braking direction) using the SAME named transformation
+         * functions as the real controller. This NEVER reaches the motors (motors
+         * are already forced to idle/stopped while disarmed) and is clearly a
+         * distinct print (bench values only substituted while disarmed below). */
+        uint8_t bench_requested = nav_brake_requested;
+        uint8_t bench_active = nav_brake_active;
+        uint8_t bench_tilt_limited = nav_brake_tilt_limited;
+        uint8_t bench_accel_limited = nav_brake_accel_limited;
+        float bench_desired_n = nav_brake_desired_north_vel_mps;
+        float bench_desired_e = nav_brake_desired_east_vel_mps;
+        float bench_err_n = nav_brake_north_vel_error_mps;
+        float bench_err_e = nav_brake_east_vel_error_mps;
+        float bench_accel_n = nav_brake_north_accel_cmd_mps2;
+        float bench_accel_e = nav_brake_east_accel_cmd_mps2;
+        float bench_accel_fwd = nav_brake_fwd_accel_cmd_mps2;
+        float bench_accel_right = nav_brake_right_accel_cmd_mps2;
+        float bench_target_roll_deg = target_roll_deg;
+        float bench_target_pitch_deg = target_pitch_deg;
+
+        if (motors_armed == 0U)
+        {
+          float fwd_cmd_mps = ((float)APP_PITCH_SIGN) *
+                              App_NavStickOffsetToVelocityMps((int32_t)pitch_us - (int32_t)pitch_center_us,
+                                                              APP_NAV_BRAKE_MAX_VEL_MPS);
+          float right_cmd_mps = ((float)APP_ROLL_SIGN) *
+                                App_NavStickOffsetToVelocityMps((int32_t)roll_us - (int32_t)roll_center_us,
+                                                                APP_NAV_BRAKE_MAX_VEL_MPS);
+          float desired_n;
+          float desired_e;
+
+          Nav_RotateBodyToNed(fwd_cmd_mps, right_cmd_mps, yaw_deg, &desired_n, &desired_e);
+
+          bench_err_n = desired_n - nav_state.filtered_north_vel_mps;
+          bench_err_e = desired_e - nav_state.filtered_east_vel_mps;
+          bench_accel_n = App_ClampFloat(APP_NAV_BRAKE_VELOCITY_KP * bench_err_n,
+                                         -APP_NAV_BRAKE_MAX_ACCEL_MPS2, APP_NAV_BRAKE_MAX_ACCEL_MPS2);
+          bench_accel_e = App_ClampFloat(APP_NAV_BRAKE_VELOCITY_KP * bench_err_e,
+                                         -APP_NAV_BRAKE_MAX_ACCEL_MPS2, APP_NAV_BRAKE_MAX_ACCEL_MPS2);
+          Nav_RotateNedToBody(bench_accel_n, bench_accel_e, yaw_deg, &bench_accel_fwd, &bench_accel_right);
+          bench_target_pitch_deg = ((float)APP_PITCH_SIGN) * Nav_AccelToAngleDeg(bench_accel_fwd, APP_NAV_BRAKE_MAX_TILT_DEG);
+          bench_target_roll_deg = ((float)APP_ROLL_SIGN) * Nav_AccelToAngleDeg(bench_accel_right, APP_NAV_BRAKE_MAX_TILT_DEG);
+          bench_desired_n = desired_n;
+          bench_desired_e = desired_e;
+          bench_tilt_limited = (uint8_t)((fabsf(bench_target_pitch_deg) >= (APP_NAV_BRAKE_MAX_TILT_DEG - 0.01f)) ||
+                                         (fabsf(bench_target_roll_deg) >= (APP_NAV_BRAKE_MAX_TILT_DEG - 0.01f)));
+          bench_accel_limited = (uint8_t)((fabsf(bench_accel_n) >= (APP_NAV_BRAKE_MAX_ACCEL_MPS2 - 0.001f)) ||
+                                          (fabsf(bench_accel_e) >= (APP_NAV_BRAKE_MAX_ACCEL_MPS2 - 0.001f)));
+        }
+
+        Telemetry_PrintNavBrake(bench_requested, bench_active, bench_tilt_limited, bench_accel_limited,
+                               bench_desired_n, bench_desired_e,
+                               bench_err_n, bench_err_e,
+                               bench_accel_n, bench_accel_e,
+                               bench_accel_fwd, bench_accel_right,
+                               bench_target_roll_deg, bench_target_pitch_deg);
+         printf("NAVGATE[nav ref att baro link latch]=[%u %u %u %u %u %u]\r\n",
+           (unsigned int)nav_state.valid,
+           (unsigned int)nav_state.reference_valid,
+           (unsigned int)attitude_zero_captured,
+           (unsigned int)Baro_IsHealthy(),
+           (unsigned int)receiver_state.link_active,
+           (unsigned int)nav_brake_disqualified_latch);
+      }
       last_imu_telemetry_ms = now_ms;
     }
 #if APP_ENABLE_ANGLE_TELEMETRY
     Telemetry_PrintAngles(pitch_deg, roll_deg, yaw_deg);
 #endif
   }
-  else if (APP_ENABLE_IMU_RUNTIME_TELEMETRY || (motors_armed == 0U))
+  else if (APP_ENABLE_IMU_RUNTIME_TELEMETRY || (g_armed_test_telemetry_enabled != 0U) || (motors_armed == 0U))
   {
     Telemetry_PrintImuReadFailed(IMU_GetType(), IMU_GetWhoAmI());
   }

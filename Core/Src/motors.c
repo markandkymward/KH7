@@ -202,3 +202,19 @@ void Motors_StopAll(void)
                  MOTOR_PWM_MIN_US,
                  MOTOR_PWM_MIN_US);
 }
+
+/* Reentrant-safe subset of Motors_StopAll(): ONLY writes the timer compare
+ * registers, touching none of the g_motor_pwm_started/g_motor_ch*_started
+ * lazy-init state machine or HAL_TIM_PWM_Start()/Stop() calls. Safe to call
+ * from an interrupt that can preempt the main loop mid-way through that
+ * state machine (see receiver.c's ISR-level arm-switch safety net) - the
+ * plain Motors_StopAll()/Motors_WriteUs() path is NOT safe for that since it
+ * can leave the timer's channel-enable bits/HAL state corrupted if the ISR
+ * lands mid-sequence. */
+void Motors_ForceIdleRegistersOnly(void)
+{
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, MOTOR_PWM_MIN_US);
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, MOTOR_PWM_MIN_US);
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, MOTOR_PWM_MIN_US);
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, MOTOR_PWM_MIN_US);
+}
