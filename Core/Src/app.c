@@ -164,9 +164,24 @@
  * rotation while holding heading). Re-check compass-vs-yaw tracking error on the
  * next flight before trusting this - if interference is still significant,
  * disable again (set kp back to 0.0f) rather than re-tune the field-strength gate
- * further blind. */
-#define APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG 0.05f
-#define APP_MAG_YAW_NUDGE_MAX_DPS        2.0f
+ * further blind.
+ *
+ * GAIN RAISED (2026-08-16) after a disarmed, motionless-on-a-table bench test
+ * showed the old 0.05/2.0 pair was nowhere near enough authority: roll/pitch
+ * stayed flat to 0.1deg for 90s (strong two_kp=3.0 accel correction holding
+ * them), while yaw free-drifted 0.5->40.7deg with an ACCELERATING rate
+ * (~0.02deg/s early, ~1.9deg/s by the end) even though the raw tilt-compensated
+ * compass heading sat rock-stable at 352.5-354.2deg the whole time - i.e. the
+ * reference was trustworthy and available, the correction was just too weak to
+ * use it (already saturated at -2.0dps while yaw error was -40deg). No motor
+ * current is flowing during this bench test, so the field-deviation
+ * interference gate above is the thing standing between this larger gain and a
+ * repeat of the pre-relocation runaway once armed - re-validate with the same
+ * bench test after any further change, and re-check real-flight tracking error
+ * (see the FOLLOW-UP comment near APP_NAV_BRAKE_SWITCH_THRESHOLD_US above)
+ * before trusting NAVBRAKE with motors spinning. */
+#define APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG 0.4f
+#define APP_MAG_YAW_NUDGE_MAX_DPS        8.0f
 /* Motor/ESC current is a well-known source of magnetic interference that can
  * swing the compass heading by 100+ degrees at flight throttle even though
  * nothing physically rotated - trust the heading only while the total field
