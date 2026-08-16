@@ -111,7 +111,23 @@
  * controller (vertical) - this section only adds the outer velocity->angle loop.
  * Engaged when ch6 (the existing mode switch) exceeds this threshold - a 4th band
  * above ALTHOLD's >=1800us, so it needs a transmitter mix that can drive ch6 above
- * 2000us (the existing 3-way RATE/ATTITUDE/ALTHOLD switch positions are unaffected). */
+ * 2000us (the existing 3-way RATE/ATTITUDE/ALTHOLD switch positions are unaffected).
+ *
+ * FLIGHT-TESTED FINDING (2026-08-15): an earlier pitch-sign bug (APP_PITCH_SIGN was
+ * applied twice - once converting stick to fwd_cmd_mps, again converting the
+ * resulting accel to target_pitch_deg - so the two flips canceled and inverted the
+ * pilot's fwd/aft command) was found and fixed. Bench-verified correct while
+ * disarmed (no motor current). But a real flight afterwards - fully engaged the
+ * whole time (NAVBRAKE requested=176/176 active=176/176) - still would not track
+ * the stick and drifted. SD log analysis showed why: compass-vs-yaw tracking error
+ * peaked at 25.3deg during that flight (rms 9.3deg) vs. peak 5.2deg on the same
+ * airframe disarmed/no-motor-current. Both Nav_RotateBodyToNed() (stick command)
+ * and Nav_RotateNedToBody() (velocity-error accel) key off yaw_deg, so a yaw error
+ * that size rotates "forward" into materially the wrong geographic direction -
+ * independent of, and not fixed by, the pitch-sign fix. This is the same
+ * motor-current magnetic interference already called out near
+ * APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG below - do not trust NAVBRAKE until that's
+ * actually resolved, not just mitigated. */
 #define APP_NAV_BRAKE_SWITCH_THRESHOLD_US   2000U
 /* Conservative first-pass limits (see user-selected 1.5 m/s max velocity):
  * kept at/near the low end of the suggested ranges since this mode is unflown. */
@@ -919,6 +935,17 @@ static void App_ServiceSdLog(void)
   {
     uint16_t b;
 
+    /* KNOWN ISSUE (found 2026-08-15, over the ESP32 WiFi bridge, not yet root-caused):
+     * a SDLOG DUMP block's hex output can come back with other telemetry lines
+     * (RX16/ARM/GPS/MODE/etc.) spliced into the MIDDLE of a block's 1024 hex
+     * characters, with no line break - i.e. some other UART6 producer is winning a
+     * race against this 512-call printf("%02X", ...) loop rather than being
+     * serialized after it. Same-session pulls over USB (COM6) of the identical
+     * block range (first=14 last=55) came back with all 42 blocks at the full,
+     * clean 512 bytes each - so this is USB-avoidable in practice, but the
+     * underlying race (likely an ISR-context print - CRSF/GPS UART RX callbacks -
+     * interleaving with this loop's UART6 TX enqueue) is still unfixed. Prefer
+     * --usb for tools/sdlog_analyze.py until this is actually fixed. */
     if (SD_ReadBlock(g_sdlog_dump_block, buf) == SD_OK)
     {
       printf("SDLOG[%lu]=", (unsigned long)g_sdlog_dump_block);
