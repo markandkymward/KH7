@@ -86,8 +86,13 @@ PID_FLASH_RE = re.compile(
 # tools/sdlog_analyze.py (--save-raw), mirroring its RECORD_STRUCT/FIELD_NAMES/flight
 # segmentation without pulling in numpy/matplotlib.
 BB_BLOCK_RE = re.compile(r"SDLOG\[(\d+)\]=([0-9A-Fa-f]+)")
-BB_RECORD_STRUCT = struct.Struct("<I9hHHHHBB")
-BB_RECORD_SIZE = BB_RECORD_STRUCT.size  # 32 bytes, matches App_SdLogRecord_t in Core/Src/app.c
+BB_RECORD_STRUCT = struct.Struct(
+    "<I9hHHHHBBhhhhhhhhHhH"  # original fields (54 bytes)
+    "BBBB"                    # nav_flags, nav_invalid_reason, nav_fix_type, nav_num_sv
+    "HHHHH"                   # nav_h_acc_cm, nav_age_ms, nav_update_period_ms, nav_consecutive_valid, nav_dropout_count
+    + "h" * 16                # nav north/east/vel(raw,filt,desired,error)/accel(n,e,fwd,right) + pilot stick, all int16
+)
+BB_RECORD_SIZE = BB_RECORD_STRUCT.size  # 100 bytes, matches App_SdLogRecord_t in Core/Src/app.c
 BB_FIELD_NAMES = (
     "time_ms",
     "setpoint_roll_dps", "setpoint_pitch_dps", "setpoint_yaw_dps",
@@ -95,9 +100,25 @@ BB_FIELD_NAMES = (
     "pid_roll_us", "pid_pitch_us", "pid_yaw_us",
     "motor_fl_us", "motor_fr_us", "motor_rr_us", "motor_rl_us",
     "battery_decivolts", "flags",
+    "pitch_deg_x10", "roll_deg_x10",
+    "target_pitch_deg_x10", "target_roll_deg_x10",
+    "baro_alt_cm", "baro_vz_cms",
+    "throttle_cmd_us", "throttle_actual_us",
+    "arm_us",
+    "yaw_deg_x10", "mag_heading_x10",
+    "nav_flags", "nav_invalid_reason", "nav_fix_type", "nav_num_sv",
+    "nav_h_acc_cm", "nav_age_ms", "nav_update_period_ms", "nav_consecutive_valid", "nav_dropout_count",
+    "nav_north_m_x10", "nav_east_m_x10",
+    "nav_raw_vel_n_x100", "nav_raw_vel_e_x100",
+    "nav_filt_vel_n_x100", "nav_filt_vel_e_x100",
+    "nav_desired_vel_n_x100", "nav_desired_vel_e_x100",
+    "nav_vel_error_n_x100", "nav_vel_error_e_x100",
+    "nav_accel_cmd_n_x1000", "nav_accel_cmd_e_x1000",
+    "nav_accel_cmd_fwd_x1000", "nav_accel_cmd_right_x1000",
+    "pilot_roll_stick_us", "pilot_pitch_stick_us",
 )
 BB_FLIGHT_GAP_MS = 1500  # a stored-sample time gap bigger than this means a new flight
-BB_FLIGHT_MODE_NAMES = {0: "RATE", 1: "ATTITUDE", 2: "ALTHOLD"}
+BB_FLIGHT_MODE_NAMES = {0: "RATE", 1: "ATTITUDE", 2: "ALTHOLD", 3: "NAVBRAKE"}
 
 
 def _bb_parse_records(text: str) -> list:

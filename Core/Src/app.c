@@ -2886,8 +2886,14 @@ void App_Update(void)
               Nav_LatchReference();
             }
 
-            fwd_cmd_mps = ((float)APP_PITCH_SIGN) *
-                          App_NavStickOffsetToVelocityMps(pilot_pitch_stick_us, APP_NAV_BRAKE_MAX_VEL_MPS);
+            /* NOTE: unlike target_pitch_deg below, fwd_cmd_mps is NOT sign-flipped by
+             * APP_PITCH_SIGN here - Nav_RotateBodyToNed()'s "fwd" is a true physical
+             * FRD quantity (see nav.h), and target_pitch_deg already applies the one
+             * flip needed to convert an accel command into this codebase's pitch-angle
+             * convention. Flipping here too would cancel that flip and invert the
+             * pilot's pitch command (this bit the first flight test: full forward
+             * stick drifted aft, regardless of heading). */
+            fwd_cmd_mps = App_NavStickOffsetToVelocityMps(pilot_pitch_stick_us, APP_NAV_BRAKE_MAX_VEL_MPS);
             right_cmd_mps = ((float)APP_ROLL_SIGN) *
                             App_NavStickOffsetToVelocityMps(pilot_roll_stick_us, APP_NAV_BRAKE_MAX_VEL_MPS);
 
@@ -3657,8 +3663,9 @@ void App_Update(void)
 
         if (motors_armed == 0U)
         {
-          float fwd_cmd_mps = ((float)APP_PITCH_SIGN) *
-                              App_NavStickOffsetToVelocityMps((int32_t)pitch_us - (int32_t)pitch_center_us,
+          /* No APP_PITCH_SIGN flip here - see the matching comment on the armed
+           * path above; this bench block must stay in sync with it. */
+          float fwd_cmd_mps = App_NavStickOffsetToVelocityMps((int32_t)pitch_us - (int32_t)pitch_center_us,
                                                               APP_NAV_BRAKE_MAX_VEL_MPS);
           float right_cmd_mps = ((float)APP_ROLL_SIGN) *
                                 App_NavStickOffsetToVelocityMps((int32_t)roll_us - (int32_t)roll_center_us,
