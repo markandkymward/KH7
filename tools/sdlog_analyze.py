@@ -97,9 +97,9 @@ NAV_INVALID_REASON_NAMES = {
 FLIGHT_MODE_NAMES = {0: "RATE", 1: "ATTITUDE", 2: "ALTHOLD", 3: "NAVBRAKE"}
 FLIGHT_GAP_MS = 1500  # a stored-sample time gap bigger than this means a new flight
 PID_TERM_LIMIT_US = 320  # APP_RATE_TERM_LIMIT_US in Core/Src/app.c - used for saturation %
-NOMINAL_BATTERY_V = 11.1  # APP_VOLTAGE_COMP_REFERENCE_V in Core/Src/app.c - 3S nominal pack voltage
 LANDING_CLIP_S = 1.0  # trailing seconds always trimmed - landing/disarm produces a large
                       # non-representative tracking-error/PID spike right before the log ends
+LIPO_NOMINAL_CELL_V = 3.7  # standard LiPo nominal-per-cell voltage, used to infer pack S-count
 
 
 class _TcpLineSource:
@@ -314,6 +314,21 @@ def _flight_arrays(sub: List[dict]) -> dict:
     return a
 
 
+LIPO_MAX_CHARGE_CELL_V = 4.25  # full-charge ceiling per cell (4.20V + margin)
+
+
+def infer_nominal_battery_v(measured_v: float) -> float:
+    """Infer nominal pack voltage from a measured voltage: the smallest LiPo cell
+    count whose full-charge ceiling (4.25V/cell) could explain the reading - keeps
+    the dashboard label correct automatically as packs change (2S/3S/4S/6S/...).
+    Plain round(measured_v / 3.7) misclassifies fresh packs: a full 4S reads ~16.8V,
+    which rounds to "5S" (16.8/3.7 = 4.54) instead of the correct 4S."""
+    for cells in range(1, 13):
+        if measured_v <= (cells * LIPO_MAX_CHARGE_CELL_V):
+            return cells * LIPO_NOMINAL_CELL_V
+    return round(measured_v / LIPO_NOMINAL_CELL_V) * LIPO_NOMINAL_CELL_V
+
+
 def print_summary(a: dict) -> None:
     n = len(a["t_s"])
     duration = a["t_s"][-1] if n else 0.0
@@ -521,7 +536,8 @@ def plot_dashboard(a: dict, out_path: str):
     for ax_angle in angle_axes:
         ax_angle.set_xlabel("time (s)")
 
-    fig.suptitle(f"KH7 SD flight log - {t[-1]:.1f}s, ~{a['fs_hz']:.0f}Hz  |  nominal battery: {NOMINAL_BATTERY_V:.1f}V",
+    nominal_battery_v = infer_nominal_battery_v(a["battery_v"].max())
+    fig.suptitle(f"KH7 SD flight log - {t[-1]:.1f}s, ~{a['fs_hz']:.0f}Hz  |  nominal battery: {nominal_battery_v:.1f}V",
                  fontsize=24)
     fig.savefig(out_path, dpi=130)
     print(f"Saved dashboard: {os.path.abspath(out_path)}")
