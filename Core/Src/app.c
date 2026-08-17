@@ -180,8 +180,58 @@
  * bench test after any further change, and re-check real-flight tracking error
  * (see the FOLLOW-UP comment near APP_NAV_BRAKE_SWITCH_THRESHOLD_US above)
  * before trusting NAVBRAKE with motors spinning. */
-#define APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG 0.4f
-#define APP_MAG_YAW_NUDGE_MAX_DPS        8.0f
+/* DISABLED (2026-08-17): a sign-inversion bug in how this nudge fed into gz_dps
+ * (see the `gz_dps -= mag_yaw_nudge_dps` comment below) made it fight itself
+ * whenever error was large, and even after fixing the sign, the boundary-escape
+ * logic (see APP_MAG_YAW_NUDGE_ESCAPE_ZONE_DEG) still left yaw parked in a
+ * bounded oscillation near +-180deg instead of converging to 0. Directly
+ * measured (MAGDBG telemetry) ground gyro-Z bias is tiny at rest (~0.07dps),
+ * so gyro-bias learning alone is a safe, well-behaved fallback - zeroing both
+ * constants below disables the nudge everywhere (including the escape-zone
+ * path, whose forced target is MAX_DPS) without touching the surrounding
+ * control flow. Revisit with a proper vector-based (not angle-subtraction)
+ * magnetometer fusion, not a live patch. */
+#define APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG 0.0f
+#define APP_MAG_YAW_NUDGE_MAX_DPS        0.0f
+/* SLEW-LIMITED (2026-08-17): a raw P-controller on a wrapped angle is unstable
+ * exactly at a +-180deg error - "which way is shortest" is undefined there and
+ * flips on noise, so the target below can flip from +max to -max every single
+ * control-loop iteration. Rate-limiting the APPLIED nudge (not the target)
+ * turns that chatter into a near-zero average output right at the degenerate
+ * point instead of violent +/-max swings every 2ms - confirmed necessary
+ * empirically: raising MAX_DPS alone (8->20, to actually outrun the observed
+ * cold-boot gz bias) made the un-slewed chatter proportionally worse, not
+ * better. Sized so a full -max..+max reversal takes about 1s, comfortably
+ * faster than the many-second timescale this correction is meant to work on. */
+#define APP_MAG_YAW_NUDGE_SLEW_DPS_PER_S 40.0f
+/* ESCAPE DIRECTION (2026-08-17): the slew limiter above smooths the chatter but
+ * cannot fix a genuinely stable-but-wrong equilibrium - confirmed live over a
+ * 120s cold-boot capture, yaw sat oscillating at +-177..180deg the entire time
+ * without ever resolving. Right at +-180deg error, "which way is shortest" is
+ * NOT just noisy, it is mathematically undefined (both directions are equally
+ * short), so noise keeps flipping the computed sign and the correction never
+ * commits to a direction long enough to walk yaw out of the ambiguous zone.
+ * Fix: once |error| is within this many degrees of the 180deg boundary, ignore
+ * the (unreliable, right there) computed sign and always escape the same way -
+ * that guarantees yaw walks out of the ambiguous zone within a bounded time
+ * instead of being able to sit at it indefinitely. Normal signed P-control
+ * resumes automatically once |error| drops back under the threshold, where the
+ * shortest direction is no longer ambiguous. */
+#define APP_MAG_YAW_NUDGE_ESCAPE_ZONE_DEG 15.0f
+/* BUG FOUND (2026-08-17) during flight-test prep: the reference heading used to
+ * anchor the nudge above was a single raw compass sample taken the instant
+ * attitude-zero settled - if that one sample was a transient/bad reading (e.g.
+ * right after the QMC5883L's own power-on settling), every later heading gets
+ * compared against a wrong reference. A ~180deg reference error is the worst
+ * case for any angle-based P-controller: "which way is shortest" is undefined
+ * right at 180deg and flips on noise, so the nudge chatters at its +/-max cap
+ * every iteration instead of converging - confirmed live (gz alternating
+ * exactly +8.0/-8.0 dps every sample, yaw hopping across the +-180 wrap
+ * boundary, reproducing at every power-on). Fixed by averaging the reference
+ * over APP_MAG_REF_AVG_MS instead of trusting one sample - same pattern already
+ * used for the attitude-zero capture above (APP_ATTITUDE_ZERO_AVG_MS), and
+ * circularly (unit-vector sin/cos averaging) since heading wraps at 360. */
+#define APP_MAG_REF_AVG_MS 300U
 /* Motor/ESC current is a well-known source of magnetic interference that can
  * swing the compass heading by 100+ degrees at flight throttle even though
  * nothing physically rotated - trust the heading only while the total field
@@ -2273,10 +2323,31 @@ void App_Update(void)
   static uint32_t startup_zero_avg_sample_count = 0U;
   static uint8_t startup_beep_active = 0U;
   static uint32_t startup_beep_start_ms = 0U;
+  /* BUG FOUND (2026-08-17): the fixed APP_ATTITUDE_ZERO_SETTLE_MS timer races
+   * gyro-bias readiness (APP_YAW_BIAS_SETTLE_SAMPLES at the 2ms/500Hz loop is
+   * ~1000*2ms=2000ms - the SAME as this timer), so attitude-zero could complete
+   * before bias correction ever engages, averaging/zeroing yaw while gz still
+   * has its full raw, uncalibrated offset. That raw offset integrating
+   * unopposed for ~2s was enough to push yaw close to the +-180deg wrap
+   * boundary before any correction (bias or mag-nudge) got a chance to act,
+   * which is a degenerate point for an angle-based P-controller (see
+   * APP_MAG_YAW_NUDGE_MAX_DPS above) - reproduced at every power-on. Fixed by
+   * keying the averaging window off gyro-bias-ready instead of the boot clock. */
+  static uint8_t bias_ready_seen_for_zero = 0U;
+  static uint32_t bias_ready_since_ms = 0U;
   static uint8_t mag_yaw_ref_captured = 0U;
   static float mag_heading_at_ref_deg = 0.0f;
   static float mag_ref_field_g = 0.0f;
   static float mag_yaw_nudge_dps = 0.0f;
+  /* Reference-capture averaging state (see APP_MAG_REF_AVG_MS below) - heading is
+   * circular, so this averages unit vectors (sin/cos sums), not raw degrees, to
+   * avoid a wraparound-crossing average being wrong the same way a single bad
+   * sample was. */
+  static float mag_ref_avg_sin_sum = 0.0f;
+  static float mag_ref_avg_cos_sum = 0.0f;
+  static float mag_ref_avg_field_sum_g = 0.0f;
+  static uint32_t mag_ref_avg_sample_count = 0U;
+  static uint32_t mag_ref_avg_start_ms = 0U;
   static float battery_voltage_filtered_v = 0.0f;
   static uint8_t battery_voltage_valid = 0U;
   static uint32_t battery_adc_raw = 0U;
@@ -2612,7 +2683,23 @@ void App_Update(void)
       gx_dps -= g_roll_gyro_bias_dps;
       gy_dps -= g_pitch_gyro_bias_dps;
       gz_dps -= g_yaw_gyro_bias_dps;
-      gz_dps += mag_yaw_nudge_dps;
+      /* BUG FOUND (2026-08-17): this was `+=`, i.e. assumed increasing gz_dps
+       * increases yaw_deg. Attitude_GetBoardAnglesDeg() computes
+       * `yaw = -atan2f(...)` - note the explicit negation - so the true
+       * relationship is inverted: increasing gz_dps DECREASES yaw_deg. With
+       * `+=`, a nudge computed to correct a positive error (yaw needs to
+       * increase) instead drove yaw the wrong way, making the error grow,
+       * making the nudge grow, etc. - genuine positive feedback. Confirmed
+       * directly via live MAGDBG telemetry: nudge went increasingly negative
+       * (-2.94 -> -20.00 dps, correctly trying to pull yaw down) while yaw
+       * simultaneously climbed 5.9 -> 139.0deg in the same window - the
+       * "correction" and the observed effect moved in the same direction.
+       * This is very likely the actual root cause of every yaw-drift/runaway
+       * symptom chased this session, not gain magnitude - the gain increases
+       * made the (backwards) feedback loop diverge faster, which is why
+       * "raising MAX_DPS alone made the chatter worse, not better" (see the
+       * slew-limiter comment above) - a real, retrospectively obvious tell. */
+      gz_dps -= mag_yaw_nudge_dps;
 
       gyro_lpf_alpha = App_LpfAlpha(((float)APP_CONTROL_LOOP_MS) * 0.001f, APP_GYRO_RATE_LPF_HZ);
       filtered_gyro_roll_rate_dps += gyro_lpf_alpha * (gx_dps - filtered_gyro_roll_rate_dps);
@@ -2651,7 +2738,13 @@ void App_Update(void)
 
       if (attitude_zero_captured == 0U)
       {
-        if (now_ms >= (APP_ATTITUDE_ZERO_SETTLE_MS - APP_ATTITUDE_ZERO_AVG_MS))
+        if ((bias_ready_seen_for_zero == 0U) && (g_gyro_bias_ready != 0U))
+        {
+          bias_ready_seen_for_zero = 1U;
+          bias_ready_since_ms = now_ms;
+        }
+
+        if ((bias_ready_seen_for_zero != 0U) && (now_ms >= bias_ready_since_ms))
         {
           startup_roll_offset_sum_deg += roll_deg;
           startup_pitch_offset_sum_deg += pitch_deg;
@@ -2659,7 +2752,9 @@ void App_Update(void)
           startup_zero_avg_sample_count++;
         }
 
-        if ((now_ms >= APP_ATTITUDE_ZERO_SETTLE_MS) && (startup_zero_avg_sample_count > 0U))
+        if ((bias_ready_seen_for_zero != 0U) &&
+            ((now_ms - bias_ready_since_ms) >= APP_ATTITUDE_ZERO_AVG_MS) &&
+            (startup_zero_avg_sample_count > 0U))
         {
           startup_roll_offset_deg = startup_roll_offset_sum_deg / ((float)startup_zero_avg_sample_count);
           startup_pitch_offset_deg = startup_pitch_offset_sum_deg / ((float)startup_zero_avg_sample_count);
@@ -2686,10 +2781,25 @@ void App_Update(void)
 
         if (mag_yaw_ref_captured == 0U)
         {
-          mag_heading_at_ref_deg = Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg);
-          mag_ref_field_g = mag_field_now_g;
-          mag_yaw_ref_captured = 1U;
-          mag_yaw_nudge_dps = 0.0f;
+          float heading_now_rad = Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg) * RAD_PER_DEG;
+
+          if (mag_ref_avg_sample_count == 0U)
+          {
+            mag_ref_avg_start_ms = now_ms;
+          }
+
+          mag_ref_avg_sin_sum += sinf(heading_now_rad);
+          mag_ref_avg_cos_sum += cosf(heading_now_rad);
+          mag_ref_avg_field_sum_g += mag_field_now_g;
+          mag_ref_avg_sample_count++;
+
+          if ((now_ms - mag_ref_avg_start_ms) >= APP_MAG_REF_AVG_MS)
+          {
+            mag_heading_at_ref_deg = atan2f(mag_ref_avg_sin_sum, mag_ref_avg_cos_sum) * (1.0f / RAD_PER_DEG);
+            mag_ref_field_g = mag_ref_avg_field_sum_g / ((float)mag_ref_avg_sample_count);
+            mag_yaw_ref_captured = 1U;
+            mag_yaw_nudge_dps = 0.0f;
+          }
         }
         else if ((mag_ref_field_g > 0.01f) &&
                  (fabsf(mag_field_now_g - mag_ref_field_g) / mag_ref_field_g > APP_MAG_TRUST_MAX_MAG_DEVIATION_FRAC))
@@ -2700,9 +2810,26 @@ void App_Update(void)
         {
           float mag_delta_deg = Attitude_WrapAngle180(Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg) - mag_heading_at_ref_deg);
           float yaw_error_deg = Attitude_WrapAngle180(mag_delta_deg - yaw_deg);
+          float mag_yaw_nudge_target_dps;
+          float mag_yaw_nudge_max_step_dps;
 
-          mag_yaw_nudge_dps = App_ClampFloat(yaw_error_deg * APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG,
-                                              -APP_MAG_YAW_NUDGE_MAX_DPS, APP_MAG_YAW_NUDGE_MAX_DPS);
+          if (fabsf(yaw_error_deg) >= (180.0f - APP_MAG_YAW_NUDGE_ESCAPE_ZONE_DEG))
+          {
+            /* Right at the wrap boundary "shortest direction" is undefined, not just
+             * noisy - always escape the same way rather than trusting the sign here. */
+            mag_yaw_nudge_target_dps = APP_MAG_YAW_NUDGE_MAX_DPS;
+          }
+          else
+          {
+            mag_yaw_nudge_target_dps = App_ClampFloat(yaw_error_deg * APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG,
+                                                        -APP_MAG_YAW_NUDGE_MAX_DPS, APP_MAG_YAW_NUDGE_MAX_DPS);
+          }
+
+          mag_yaw_nudge_max_step_dps = APP_MAG_YAW_NUDGE_SLEW_DPS_PER_S *
+                                              (((float)APP_CONTROL_LOOP_MS) * 0.001f);
+
+          mag_yaw_nudge_dps += App_ClampFloat(mag_yaw_nudge_target_dps - mag_yaw_nudge_dps,
+                                               -mag_yaw_nudge_max_step_dps, mag_yaw_nudge_max_step_dps);
         }
       }
       else
@@ -3645,7 +3772,13 @@ void App_Update(void)
 
     if (attitude_zero_captured == 0U)
     {
-      if (now_ms >= (APP_ATTITUDE_ZERO_SETTLE_MS - APP_ATTITUDE_ZERO_AVG_MS))
+      if ((bias_ready_seen_for_zero == 0U) && (g_gyro_bias_ready != 0U))
+      {
+        bias_ready_seen_for_zero = 1U;
+        bias_ready_since_ms = now_ms;
+      }
+
+      if ((bias_ready_seen_for_zero != 0U) && (now_ms >= bias_ready_since_ms))
       {
         startup_roll_offset_sum_deg += roll_deg;
         startup_pitch_offset_sum_deg += pitch_deg;
@@ -3653,7 +3786,9 @@ void App_Update(void)
         startup_zero_avg_sample_count++;
       }
 
-      if ((now_ms >= APP_ATTITUDE_ZERO_SETTLE_MS) && (startup_zero_avg_sample_count > 0U))
+      if ((bias_ready_seen_for_zero != 0U) &&
+          ((now_ms - bias_ready_since_ms) >= APP_ATTITUDE_ZERO_AVG_MS) &&
+          (startup_zero_avg_sample_count > 0U))
       {
         startup_roll_offset_deg = startup_roll_offset_sum_deg / ((float)startup_zero_avg_sample_count);
         startup_pitch_offset_deg = startup_pitch_offset_sum_deg / ((float)startup_zero_avg_sample_count);
@@ -3680,10 +3815,25 @@ void App_Update(void)
 
       if (mag_yaw_ref_captured == 0U)
       {
-        mag_heading_at_ref_deg = Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg);
-        mag_ref_field_g = mag_field_now_g;
-        mag_yaw_ref_captured = 1U;
-        mag_yaw_nudge_dps = 0.0f;
+        float heading_now_rad = Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg) * RAD_PER_DEG;
+
+        if (mag_ref_avg_sample_count == 0U)
+        {
+          mag_ref_avg_start_ms = now_ms;
+        }
+
+        mag_ref_avg_sin_sum += sinf(heading_now_rad);
+        mag_ref_avg_cos_sum += cosf(heading_now_rad);
+        mag_ref_avg_field_sum_g += mag_field_now_g;
+        mag_ref_avg_sample_count++;
+
+        if ((now_ms - mag_ref_avg_start_ms) >= APP_MAG_REF_AVG_MS)
+        {
+          mag_heading_at_ref_deg = atan2f(mag_ref_avg_sin_sum, mag_ref_avg_cos_sum) * (1.0f / RAD_PER_DEG);
+          mag_ref_field_g = mag_ref_avg_field_sum_g / ((float)mag_ref_avg_sample_count);
+          mag_yaw_ref_captured = 1U;
+          mag_yaw_nudge_dps = 0.0f;
+        }
       }
       else if ((mag_ref_field_g > 0.01f) &&
                (fabsf(mag_field_now_g - mag_ref_field_g) / mag_ref_field_g > APP_MAG_TRUST_MAX_MAG_DEVIATION_FRAC))
@@ -3694,9 +3844,25 @@ void App_Update(void)
       {
         float mag_delta_deg = Attitude_WrapAngle180(Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg) - mag_heading_at_ref_deg);
         float yaw_error_deg = Attitude_WrapAngle180(mag_delta_deg - yaw_deg);
+        float mag_yaw_nudge_target_dps;
+        float mag_yaw_nudge_max_step_dps;
 
-        mag_yaw_nudge_dps = App_ClampFloat(yaw_error_deg * APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG,
-                                            -APP_MAG_YAW_NUDGE_MAX_DPS, APP_MAG_YAW_NUDGE_MAX_DPS);
+        if (fabsf(yaw_error_deg) >= (180.0f - APP_MAG_YAW_NUDGE_ESCAPE_ZONE_DEG))
+        {
+          /* Right at the wrap boundary "shortest direction" is undefined, not just
+           * noisy - always escape the same way rather than trusting the sign here. */
+          mag_yaw_nudge_target_dps = APP_MAG_YAW_NUDGE_MAX_DPS;
+        }
+        else
+        {
+          mag_yaw_nudge_target_dps = App_ClampFloat(yaw_error_deg * APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG,
+                                                      -APP_MAG_YAW_NUDGE_MAX_DPS, APP_MAG_YAW_NUDGE_MAX_DPS);
+        }
+
+        mag_yaw_nudge_max_step_dps = APP_MAG_YAW_NUDGE_SLEW_DPS_PER_S * dt_s;
+
+        mag_yaw_nudge_dps += App_ClampFloat(mag_yaw_nudge_target_dps - mag_yaw_nudge_dps,
+                                             -mag_yaw_nudge_max_step_dps, mag_yaw_nudge_max_step_dps);
       }
     }
     else
@@ -3717,6 +3883,10 @@ void App_Update(void)
                               pitch_deg,
                               roll_deg,
                               yaw_deg);
+      printf("MAGDBG[ref=%d.%02d nudge=%d.%02d biasz=%d.%02d]\r\n",
+             (int)mag_heading_at_ref_deg, (int)(fabsf(mag_heading_at_ref_deg - (int)mag_heading_at_ref_deg) * 100.0f),
+             (int)mag_yaw_nudge_dps, (int)(fabsf(mag_yaw_nudge_dps - (int)mag_yaw_nudge_dps) * 100.0f),
+             (int)g_yaw_gyro_bias_dps, (int)(fabsf(g_yaw_gyro_bias_dps - (int)g_yaw_gyro_bias_dps) * 100.0f));
       if (battery_voltage_valid != 0U)
       {
         Telemetry_PrintBatteryState(battery_voltage_filtered_v, battery_adc_raw);
