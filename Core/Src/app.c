@@ -277,15 +277,23 @@
 #define APP_RATE_CMD_MAX_ROLL_DPS   300.0f
 #define APP_RATE_CMD_MAX_PITCH_DPS  300.0f
 #define APP_RATE_CMD_MAX_YAW_DPS    220.0f
-#define APP_RATE_KP_ROLL_DEFAULT_US_PER_DPS 0.90f
-#define APP_RATE_KP_PITCH_DEFAULT_US_PER_DPS 0.90f
-#define APP_RATE_KP_YAW_DEFAULT_US_PER_DPS  0.80f
+/* Live-tuned 2026-08-18 via SD-log correlation testing (setpoint_*_dps vs gyro_*_dps
+ * per axis across multiple real flights) - see the "KH7 yaw system state" memory note
+ * for the full before/after numbers. Kp raised from 0.90/0.90/0.80 after yaw tracking
+ * correlation was found much weaker than roll/pitch (0.046-0.29 vs 0.8-0.94); yaw Kp was
+ * walked up through 0.55/0.6/0.66 before settling at parity with roll/pitch. Kd added
+ * from 0 after that - roll/yaw showed a clear, repeatable correlation improvement; pitch's
+ * effect was inconclusive (flight-to-flight noise swamped the signal) but kept at 0.03
+ * with no evidence of a regression. */
+#define APP_RATE_KP_ROLL_DEFAULT_US_PER_DPS 0.70f
+#define APP_RATE_KP_PITCH_DEFAULT_US_PER_DPS 0.70f
+#define APP_RATE_KP_YAW_DEFAULT_US_PER_DPS  0.70f
 #define APP_RATE_KI_ROLL_DEFAULT_US_PER_DPS_S 0.00f
 #define APP_RATE_KI_PITCH_DEFAULT_US_PER_DPS_S 0.00f
 #define APP_RATE_KI_YAW_DEFAULT_US_PER_DPS_S  0.00f
-#define APP_RATE_KD_ROLL_DEFAULT_US_PER_DPS_PER_S 0.00f
-#define APP_RATE_KD_PITCH_DEFAULT_US_PER_DPS_PER_S 0.00f
-#define APP_RATE_KD_YAW_DEFAULT_US_PER_DPS_PER_S  0.00f
+#define APP_RATE_KD_ROLL_DEFAULT_US_PER_DPS_PER_S 0.025f
+#define APP_RATE_KD_PITCH_DEFAULT_US_PER_DPS_PER_S 0.03f
+#define APP_RATE_KD_YAW_DEFAULT_US_PER_DPS_PER_S  0.02f
 #define APP_RATE_KFF_ROLL_DEFAULT_US_PER_DPS_PER_S 0.00f
 #define APP_RATE_KFF_PITCH_DEFAULT_US_PER_DPS_PER_S 0.00f
 #define APP_RATE_KFF_YAW_DEFAULT_US_PER_DPS_PER_S  0.00f
