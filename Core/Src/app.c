@@ -180,44 +180,42 @@
  * bench test after any further change, and re-check real-flight tracking error
  * (see the FOLLOW-UP comment near APP_NAV_BRAKE_SWITCH_THRESHOLD_US above)
  * before trusting NAVBRAKE with motors spinning. */
-/* DISABLED (2026-08-17): a sign-inversion bug in how this nudge fed into gz_dps
- * (see the `gz_dps -= mag_yaw_nudge_dps` comment below) made it fight itself
- * whenever error was large, and even after fixing the sign, the boundary-escape
- * logic (see APP_MAG_YAW_NUDGE_ESCAPE_ZONE_DEG) still left yaw parked in a
- * bounded oscillation near +-180deg instead of converging to 0. Directly
- * measured (MAGDBG telemetry) ground gyro-Z bias is tiny at rest (~0.07dps),
- * so gyro-bias learning alone is a safe, well-behaved fallback - zeroing both
- * constants below disables the nudge everywhere (including the escape-zone
- * path, whose forced target is MAX_DPS) without touching the surrounding
- * control flow. Revisit with a proper vector-based (not angle-subtraction)
- * magnetometer fusion, not a live patch. */
+/* REDESIGNED (2026-08-17), vector-based instead of angle-subtraction: every
+ * earlier version of this correction computed error as a raw degree
+ * difference (mag_delta_deg - yaw_deg), which has a hard discontinuity at
+ * +-180deg - right at that boundary "which way is shortest" flips on noise
+ * (confirmed live: nudge chattering exactly between +max/-max every sample),
+ * and even a slew limiter plus a special-cased forced-escape-direction hack
+ * only left yaw parked in a bounded oscillation near the boundary instead of
+ * converging. Real Mahony/Madgwick AHRS filters avoid this class of bug
+ * entirely by correcting from a CROSS PRODUCT of measured vs. reference
+ * vectors, not a subtracted angle - see the sinf() at the injection site
+ * below. sin(current - reference) matches a plain angle error for small
+ * errors (sin(x) ~= x near 0) but SMOOTHLY tapers to exactly zero at the
+ * antipodal point instead of staying pinned at max magnitude right up to a
+ * discontinuous jump - there is no wrap boundary left to chatter at, so the
+ * escape-zone hack this comment used to describe is gone, not just tuned. */
+/* DISABLED AGAIN (2026-08-17): a fast-lock gain (Kp 2.5, cap 90dps) tested
+ * clean on the bench (stationary hold, and a ~150deg hand rotation converging
+ * in ~1.8-2.2s with no overshoot) but made in-flight yaw slewing MUCH worse
+ * once actually flown - real flight vibration regularly pushes accelerometer
+ * trust-gating past its limits (see the vibration findings elsewhere this
+ * session), and a much stronger correction reacting to that noisier/
+ * vibration-corrupted heading amplifies bad signal far more violently than
+ * the original conservative gain did. The field-deviation interference gate
+ * below only catches gross field-strength shifts, not general vibration
+ * noise on the heading itself. No gain has been flight-validated as safe yet
+ * - zeroing both constants disables the nudge entirely (vector-based math and
+ * sign fixes stay in place) until this gets properly tuned against real
+ * flight data, not more bench guesses. */
 #define APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG 0.0f
 #define APP_MAG_YAW_NUDGE_MAX_DPS        0.0f
-/* SLEW-LIMITED (2026-08-17): a raw P-controller on a wrapped angle is unstable
- * exactly at a +-180deg error - "which way is shortest" is undefined there and
- * flips on noise, so the target below can flip from +max to -max every single
- * control-loop iteration. Rate-limiting the APPLIED nudge (not the target)
- * turns that chatter into a near-zero average output right at the degenerate
- * point instead of violent +/-max swings every 2ms - confirmed necessary
- * empirically: raising MAX_DPS alone (8->20, to actually outrun the observed
- * cold-boot gz bias) made the un-slewed chatter proportionally worse, not
- * better. Sized so a full -max..+max reversal takes about 1s, comfortably
- * faster than the many-second timescale this correction is meant to work on. */
-#define APP_MAG_YAW_NUDGE_SLEW_DPS_PER_S 40.0f
-/* ESCAPE DIRECTION (2026-08-17): the slew limiter above smooths the chatter but
- * cannot fix a genuinely stable-but-wrong equilibrium - confirmed live over a
- * 120s cold-boot capture, yaw sat oscillating at +-177..180deg the entire time
- * without ever resolving. Right at +-180deg error, "which way is shortest" is
- * NOT just noisy, it is mathematically undefined (both directions are equally
- * short), so noise keeps flipping the computed sign and the correction never
- * commits to a direction long enough to walk yaw out of the ambiguous zone.
- * Fix: once |error| is within this many degrees of the 180deg boundary, ignore
- * the (unreliable, right there) computed sign and always escape the same way -
- * that guarantees yaw walks out of the ambiguous zone within a bounded time
- * instead of being able to sit at it indefinitely. Normal signed P-control
- * resumes automatically once |error| drops back under the threshold, where the
- * shortest direction is no longer ambiguous. */
-#define APP_MAG_YAW_NUDGE_ESCAPE_ZONE_DEG 15.0f
+/* Slew-limits the APPLIED nudge (not the target) so it ramps smoothly even
+ * across a fast target change, rather than stepping instantly - a general
+ * control-loop courtesy, not a workaround (the vector-based error above has
+ * no discontinuity left to need rate-limiting away). Sized so a full
+ * -max..+max reversal still takes about 1s, matching the fast-lock intent above. */
+#define APP_MAG_YAW_NUDGE_SLEW_DPS_PER_S 180.0f
 /* BUG FOUND (2026-08-17) during flight-test prep: the reference heading used to
  * anchor the nudge above was a single raw compass sample taken the instant
  * attitude-zero settled - if that one sample was a transient/bad reading (e.g.
@@ -2809,21 +2807,17 @@ void App_Update(void)
         else
         {
           float mag_delta_deg = Attitude_WrapAngle180(Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg) - mag_heading_at_ref_deg);
-          float yaw_error_deg = Attitude_WrapAngle180(mag_delta_deg - yaw_deg);
-          float mag_yaw_nudge_target_dps;
+          /* Cross-product-style error: sin() of the angle difference, not the
+           * difference itself - matches a plain error for small angles (sin(x) ~= x
+           * near 0) but tapers smoothly to zero at the antipodal point instead of a
+           * discontinuous wrap. RAD_PER_DEG in the denominator keeps
+           * APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG's small-angle meaning ("dps per degree
+           * of error") even though the input to Kp is now a sine, not a degree. */
+          float yaw_error_sin = sinf((mag_delta_deg - yaw_deg) * RAD_PER_DEG);
+          float mag_yaw_nudge_target_dps = App_ClampFloat(
+              yaw_error_sin * (APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG / RAD_PER_DEG),
+              -APP_MAG_YAW_NUDGE_MAX_DPS, APP_MAG_YAW_NUDGE_MAX_DPS);
           float mag_yaw_nudge_max_step_dps;
-
-          if (fabsf(yaw_error_deg) >= (180.0f - APP_MAG_YAW_NUDGE_ESCAPE_ZONE_DEG))
-          {
-            /* Right at the wrap boundary "shortest direction" is undefined, not just
-             * noisy - always escape the same way rather than trusting the sign here. */
-            mag_yaw_nudge_target_dps = APP_MAG_YAW_NUDGE_MAX_DPS;
-          }
-          else
-          {
-            mag_yaw_nudge_target_dps = App_ClampFloat(yaw_error_deg * APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG,
-                                                        -APP_MAG_YAW_NUDGE_MAX_DPS, APP_MAG_YAW_NUDGE_MAX_DPS);
-          }
 
           mag_yaw_nudge_max_step_dps = APP_MAG_YAW_NUDGE_SLEW_DPS_PER_S *
                                               (((float)APP_CONTROL_LOOP_MS) * 0.001f);
@@ -3719,7 +3713,16 @@ void App_Update(void)
     gx_dps -= g_roll_gyro_bias_dps;
     gy_dps -= g_pitch_gyro_bias_dps;
     gz_dps -= g_yaw_gyro_bias_dps;
-    gz_dps += mag_yaw_nudge_dps;
+    /* `+=` assumed increasing gz_dps increases yaw_deg. Attitude_GetBoardAnglesDeg()
+     * computes `yaw = -atan2f(...)` - note the explicit negation - so the true
+     * relationship is inverted: increasing gz_dps DECREASES yaw_deg. This is the
+     * real-flight-loop counterpart of the same fix already applied at the USB-test
+     * call site above (see its comment for the full derivation and live evidence);
+     * this site was missed by that earlier edit despite the tool reporting all
+     * occurrences replaced - confirmed by the vector-based nudge (2026-08-17)
+     * converging smoothly but to the wrong (antipodal) equilibrium with `+=` still
+     * here, exactly the signature of inverted feedback on a sin()-shaped error. */
+    gz_dps -= mag_yaw_nudge_dps;
 
     gyro_lpf_alpha = App_LpfAlpha(dt_s, APP_GYRO_RATE_LPF_HZ);
     filtered_gyro_roll_rate_dps += gyro_lpf_alpha * (gx_dps - filtered_gyro_roll_rate_dps);
@@ -3843,21 +3846,17 @@ void App_Update(void)
       else
       {
         float mag_delta_deg = Attitude_WrapAngle180(Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg) - mag_heading_at_ref_deg);
-        float yaw_error_deg = Attitude_WrapAngle180(mag_delta_deg - yaw_deg);
-        float mag_yaw_nudge_target_dps;
+        /* Cross-product-style error: sin() of the angle difference, not the
+         * difference itself - matches a plain error for small angles (sin(x) ~= x
+         * near 0) but tapers smoothly to zero at the antipodal point instead of a
+         * discontinuous wrap. RAD_PER_DEG in the denominator keeps
+         * APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG's small-angle meaning ("dps per degree
+         * of error") even though the input to Kp is now a sine, not a degree. */
+        float yaw_error_sin = sinf((mag_delta_deg - yaw_deg) * RAD_PER_DEG);
+        float mag_yaw_nudge_target_dps = App_ClampFloat(
+            yaw_error_sin * (APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG / RAD_PER_DEG),
+            -APP_MAG_YAW_NUDGE_MAX_DPS, APP_MAG_YAW_NUDGE_MAX_DPS);
         float mag_yaw_nudge_max_step_dps;
-
-        if (fabsf(yaw_error_deg) >= (180.0f - APP_MAG_YAW_NUDGE_ESCAPE_ZONE_DEG))
-        {
-          /* Right at the wrap boundary "shortest direction" is undefined, not just
-           * noisy - always escape the same way rather than trusting the sign here. */
-          mag_yaw_nudge_target_dps = APP_MAG_YAW_NUDGE_MAX_DPS;
-        }
-        else
-        {
-          mag_yaw_nudge_target_dps = App_ClampFloat(yaw_error_deg * APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG,
-                                                      -APP_MAG_YAW_NUDGE_MAX_DPS, APP_MAG_YAW_NUDGE_MAX_DPS);
-        }
 
         mag_yaw_nudge_max_step_dps = APP_MAG_YAW_NUDGE_SLEW_DPS_PER_S * dt_s;
 
@@ -3883,10 +3882,6 @@ void App_Update(void)
                               pitch_deg,
                               roll_deg,
                               yaw_deg);
-      printf("MAGDBG[ref=%d.%02d nudge=%d.%02d biasz=%d.%02d]\r\n",
-             (int)mag_heading_at_ref_deg, (int)(fabsf(mag_heading_at_ref_deg - (int)mag_heading_at_ref_deg) * 100.0f),
-             (int)mag_yaw_nudge_dps, (int)(fabsf(mag_yaw_nudge_dps - (int)mag_yaw_nudge_dps) * 100.0f),
-             (int)g_yaw_gyro_bias_dps, (int)(fabsf(g_yaw_gyro_bias_dps - (int)g_yaw_gyro_bias_dps) * 100.0f));
       if (battery_voltage_valid != 0U)
       {
         Telemetry_PrintBatteryState(battery_voltage_filtered_v, battery_adc_raw);
