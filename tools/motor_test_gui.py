@@ -257,9 +257,17 @@ class Kh7GroundGui:
         self.mag_cal_status_var = tk.StringVar(value="Compass cal: not calibrated")
         self.mag_cal_active = False
 
-        self.nav_status_var = tk.StringVar(value="NAV: waiting for data")
+        # Primary GPS line, styled after the field tester's display: just fix/sats/hAcc,
+        # the fields that actually answer "is GPS usable right now" at a glance.
+        self.nav_gps_var = tk.StringVar(value="GPS: waiting for data")
         self.nav_pos_var = tk.StringVar(value="Pos N/E: - / - m")
-        self.nav_vel_var = tk.StringVar(value="Vel raw/filt N,E: -")
+        self.nav_vel_var = tk.StringVar(value="Vel N/E: - m/s")
+        self.nav_vel_raw_var = tk.StringVar(value="")
+        # Everything below is diagnostic detail (validity reason, age/update period,
+        # sample counters, raw vs filtered velocity) - real, still useful for debugging a
+        # GPS problem, but not what you need at a glance, so it's visually de-emphasized
+        # in the UI rather than crammed into the primary line.
+        self.nav_diag_var = tk.StringVar(value="")
         self.navbrk_status_var = tk.StringVar(value="NAVBRAKE: req=- act=- tilt_lim=- accel_lim=-")
         self.navbrk_vel_var = tk.StringVar(value="desired/error N,E: -")
         self.navbrk_cmd_var = tk.StringVar(value="accel N/E/fwd/right, ang roll/pitch: -")
@@ -300,19 +308,34 @@ class Kh7GroundGui:
         self.bb_pid_yaw_var = tk.StringVar(value="0")
 
         self.pid_vars = {
-            "roll_kp": tk.StringVar(value="0.9000"),
+            "roll_kp": tk.StringVar(value="0.7000"),
             "roll_ki": tk.StringVar(value="0.0000"),
-            "roll_kd": tk.StringVar(value="0.0000"),
+            "roll_kd": tk.StringVar(value="0.0250"),
             "roll_kff": tk.StringVar(value="0.0000"),
-            "pitch_kp": tk.StringVar(value="0.9000"),
+            "pitch_kp": tk.StringVar(value="0.7000"),
             "pitch_ki": tk.StringVar(value="0.0000"),
-            "pitch_kd": tk.StringVar(value="0.0000"),
+            "pitch_kd": tk.StringVar(value="0.0300"),
             "pitch_kff": tk.StringVar(value="0.0000"),
-            "yaw_kp": tk.StringVar(value="0.8000"),
+            "yaw_kp": tk.StringVar(value="0.7000"),
             "yaw_ki": tk.StringVar(value="0.0000"),
-            "yaw_kd": tk.StringVar(value="0.0000"),
+            "yaw_kd": tk.StringVar(value="0.0200"),
             "yaw_kff": tk.StringVar(value="0.0000"),
         }
+        # Guards against the PID save race: incoming board telemetry (from PID GET/SET/
+        # SAVE/LOAD/DEFAULT/DEBUG, and the connect-time sync retry loop) previously
+        # unconditionally overwrote these fields with zero regard for in-progress edits
+        # or which request a response actually belonged to - a late/delayed response
+        # could silently stomp newly-typed values back to old (possibly zero) ones,
+        # which then got sent for real on the next Save click. pid_dirty blocks telemetry
+        # from touching the fields while the user has unconfirmed edits;
+        # _pid_updating_from_board distinguishes our own programmatic .set() calls (which
+        # must NOT re-arm dirty) from real user keystrokes (which must).
+        self.pid_dirty = False
+        self._pid_updating_from_board = False
+        self._pid_save_awaiting = False
+        self._pid_save_timeout_id = None
+        for _var in self.pid_vars.values():
+            _var.trace_add("write", self._on_pid_field_edited)
         self.att_vars = {
             "roll_kp": tk.StringVar(value="5.0000"),
             "pitch_kp": tk.StringVar(value="5.0000"),
@@ -547,16 +570,29 @@ class Kh7GroundGui:
             row=6, column=4, columnspan=2, sticky="w", padx=(10, 4), pady=(0, 4)
         )
 
+        # Layout mirrors the field tester display: one prominent GPS status line
+        # (fix/sats/hAcc - "is GPS usable right now"), then Position/Velocity, then
+        # NAVBRAKE, with verbose diagnostic detail (validity reason, age, sample
+        # counters, raw velocity) demoted to a single de-emphasized line instead of
+        # crammed into the primary readouts.
         nav_box = ttk.LabelFrame(body, text="GPS Navigation / Velocity Brake (experimental)")
         nav_box.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(nav_box, textvariable=self.nav_status_var).grid(row=0, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 2))
+        ttk.Label(
+            nav_box, textvariable=self.nav_gps_var, font=("TkDefaultFont", 10, "bold")
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 2))
         ttk.Label(nav_box, textvariable=self.nav_pos_var).grid(row=1, column=0, sticky="w", padx=8, pady=2)
         ttk.Label(nav_box, textvariable=self.nav_vel_var).grid(row=1, column=1, sticky="w", padx=8, pady=2)
-        ttk.Label(nav_box, textvariable=self.navbrk_status_var).grid(row=2, column=0, columnspan=2, sticky="w", padx=8, pady=2)
-        ttk.Label(nav_box, textvariable=self.navbrk_vel_var).grid(row=3, column=0, sticky="w", padx=8, pady=2)
-        ttk.Label(nav_box, textvariable=self.navbrk_cmd_var).grid(row=3, column=1, sticky="w", padx=8, pady=2)
+        ttk.Label(nav_box, textvariable=self.nav_vel_raw_var, foreground="#8a8a8a").grid(
+            row=2, column=1, sticky="w", padx=8, pady=(0, 2)
+        )
+        ttk.Label(nav_box, textvariable=self.nav_diag_var, foreground="#8a8a8a").grid(
+            row=3, column=0, columnspan=2, sticky="w", padx=8, pady=2
+        )
+        ttk.Label(nav_box, textvariable=self.navbrk_status_var).grid(row=4, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 2))
+        ttk.Label(nav_box, textvariable=self.navbrk_vel_var).grid(row=5, column=0, sticky="w", padx=8, pady=2)
+        ttk.Label(nav_box, textvariable=self.navbrk_cmd_var).grid(row=5, column=1, sticky="w", padx=8, pady=2)
         ttk.Label(nav_box, textvariable=self.nav_lost_var, foreground="#ff8a65").grid(
-            row=4, column=0, columnspan=2, sticky="w", padx=8, pady=(2, 6)
+            row=6, column=0, columnspan=2, sticky="w", padx=8, pady=(2, 6)
         )
 
         mid = ttk.Frame(body)
@@ -639,8 +675,10 @@ class Kh7GroundGui:
         pid_btns.grid(row=4, column=0, columnspan=5, sticky="ew", padx=6, pady=(6, 6))
 
         ttk.Button(pid_btns, text="Read", command=self.pid_read).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(pid_btns, text="Apply", command=self.pid_apply).pack(side=tk.LEFT, padx=4)
-        ttk.Button(pid_btns, text="Save", command=self.pid_save).pack(side=tk.LEFT, padx=4)
+        self.pid_apply_button = ttk.Button(pid_btns, text="Apply", command=self.pid_apply)
+        self.pid_apply_button.pack(side=tk.LEFT, padx=4)
+        self.pid_save_button = ttk.Button(pid_btns, text="Save", command=self.pid_save)
+        self.pid_save_button.pack(side=tk.LEFT, padx=4)
         ttk.Button(pid_btns, text="Load", command=self.pid_load).pack(side=tk.LEFT, padx=4)
         ttk.Button(pid_btns, text="Defaults", command=self.pid_defaults).pack(side=tk.LEFT, padx=4)
         ttk.Button(pid_btns, text="Debug", command=self.pid_debug).pack(side=tk.LEFT, padx=4)
@@ -1979,25 +2017,44 @@ class Kh7GroundGui:
         m_pid = PID_LINE_RE.search(line)
         if m_pid is not None:
             self.pid_received_once = True
-            self.pid_vars["roll_kp"].set(f"{float(m_pid.group(2)):.4f}")
-            self.pid_vars["roll_ki"].set(f"{float(m_pid.group(3)):.4f}")
-            self.pid_vars["roll_kd"].set(f"{float(m_pid.group(4)):.4f}")
-            self.pid_vars["roll_kff"].set(f"{float(m_pid.group(5)):.4f}")
-            self.pid_vars["pitch_kp"].set(f"{float(m_pid.group(6)):.4f}")
-            self.pid_vars["pitch_ki"].set(f"{float(m_pid.group(7)):.4f}")
-            self.pid_vars["pitch_kd"].set(f"{float(m_pid.group(8)):.4f}")
-            self.pid_vars["pitch_kff"].set(f"{float(m_pid.group(9)):.4f}")
-            self.pid_vars["yaw_kp"].set(f"{float(m_pid.group(10)):.4f}")
-            self.pid_vars["yaw_ki"].set(f"{float(m_pid.group(11)):.4f}")
-            self.pid_vars["yaw_kd"].set(f"{float(m_pid.group(12)):.4f}")
-            self.pid_vars["yaw_kff"].set(f"{float(m_pid.group(13)):.4f}")
+            if self.pid_dirty:
+                # Never let a data dump - possibly a delayed response to an earlier,
+                # now-superseded request - clobber edits the user hasn't confirmed saved
+                # yet. See the pid_dirty comment at its declaration for the failure mode
+                # this prevents.
+                self.pid_status_var.set(f"PID source: {m_pid.group(1)} (fields not refreshed - unsaved edits)")
+                self._update_pid_health()
+                return
+            self._pid_updating_from_board = True
+            try:
+                self.pid_vars["roll_kp"].set(f"{float(m_pid.group(2)):.4f}")
+                self.pid_vars["roll_ki"].set(f"{float(m_pid.group(3)):.4f}")
+                self.pid_vars["roll_kd"].set(f"{float(m_pid.group(4)):.4f}")
+                self.pid_vars["roll_kff"].set(f"{float(m_pid.group(5)):.4f}")
+                self.pid_vars["pitch_kp"].set(f"{float(m_pid.group(6)):.4f}")
+                self.pid_vars["pitch_ki"].set(f"{float(m_pid.group(7)):.4f}")
+                self.pid_vars["pitch_kd"].set(f"{float(m_pid.group(8)):.4f}")
+                self.pid_vars["pitch_kff"].set(f"{float(m_pid.group(9)):.4f}")
+                self.pid_vars["yaw_kp"].set(f"{float(m_pid.group(10)):.4f}")
+                self.pid_vars["yaw_ki"].set(f"{float(m_pid.group(11)):.4f}")
+                self.pid_vars["yaw_kd"].set(f"{float(m_pid.group(12)):.4f}")
+                self.pid_vars["yaw_kff"].set(f"{float(m_pid.group(13)):.4f}")
+            finally:
+                self._pid_updating_from_board = False
             self.pid_status_var.set(f"PID source: {m_pid.group(1)}")
             self._update_pid_health()
             return
 
         m_pid_status = PID_STATUS_RE.search(line)
         if m_pid_status is not None:
-            self.pid_status_var.set(f"{m_pid_status.group(1)}: {m_pid_status.group(2)}")
+            kind = m_pid_status.group(1)
+            detail = m_pid_status.group(2)
+            if kind == "SET" and self._pid_save_awaiting and detail != "QUEUED":
+                # QUEUED is just the immediate parse-ack, printed before the command is
+                # actually processed - the terminal result (OK/OK_NO_SAVE/FAIL...) is a
+                # separate, later line. Only that one resolves the pending save.
+                self._pid_save_resolved(detail=detail)
+            self.pid_status_var.set(f"{kind}: {detail}")
             return
 
         m_mode = MODE_LINE_RE.search(line)
@@ -2227,10 +2284,18 @@ class Kh7GroundGui:
             (valid, ref, reason, fix_type, num_sv, hacc_cm, age_ms, upd_ms,
              cv, ci, dup, rej, drop) = (int(g) for g in m_nav.groups())
             reason_name = NAV_INVALID_REASON_NAMES.get(reason, str(reason))
-            self.nav_status_var.set(
-                f"NAV: valid={'YES' if valid else 'no'} ref={'yes' if ref else 'no'} reason={reason_name} "
-                f"fix={NAV_FIX_NAMES.get(fix_type, fix_type)} sats={num_sv} hAcc={hacc_cm / 100.0:.1f}m "
-                f"age={age_ms}ms updPeriod={upd_ms}ms cv={cv} ci={ci} dup={dup} rej={rej} dropouts={drop}"
+            # Primary line: just "is GPS usable right now" - fix/sats/hAcc, the same
+            # three fields the field tester leads with. Everything else here is
+            # diagnostic detail useful when GPS is misbehaving, not for a normal glance,
+            # so it's demoted to the secondary (grey) line instead of crowding this one.
+            fix_name = NAV_FIX_NAMES.get(fix_type, fix_type)
+            self.nav_gps_var.set(
+                f"GPS: {fix_name}  sats={num_sv}  hAcc={hacc_cm / 100.0:.1f}m"
+                f"{'  (nav valid)' if valid else '  (nav NOT valid)'}"
+            )
+            self.nav_diag_var.set(
+                f"ref={'yes' if ref else 'no'} reason={reason_name} age={age_ms}ms "
+                f"updPeriod={upd_ms}ms cv={cv} ci={ci} dup={dup} rej={rej} dropouts={drop}"
             )
             return
 
@@ -2238,9 +2303,8 @@ class Kh7GroundGui:
         if m_navpos is not None:
             north_m, east_m, raw_n, raw_e, filt_n, filt_e = (float(g) for g in m_navpos.groups())
             self.nav_pos_var.set(f"Pos N/E: {north_m:.1f} / {east_m:.1f} m")
-            self.nav_vel_var.set(
-                f"Vel raw N/E: {raw_n:.2f}/{raw_e:.2f}  filt N/E: {filt_n:.2f}/{filt_e:.2f} m/s"
-            )
+            self.nav_vel_var.set(f"Vel N/E: {filt_n:.2f} / {filt_e:.2f} m/s")
+            self.nav_vel_raw_var.set(f"(raw vel N/E: {raw_n:.2f} / {raw_e:.2f} m/s)")
             self._append_samples([
                 ("nav_north", north_m), ("nav_east", east_m),
                 ("nav_filt_vel_n", filt_n), ("nav_filt_vel_e", filt_e),
@@ -2535,22 +2599,85 @@ class Kh7GroundGui:
             self.mag_cal_button.configure(text="Calibrate")
             self.mag_cal_status_var.set("Stopping, computing...")
 
-    def pid_apply(self) -> None:
-        values = self._pid_values_from_ui()
-        if values is None:
+    def _on_pid_field_edited(self, *_args) -> None:
+        # Fires on every StringVar .set(), including our own programmatic updates from
+        # board telemetry - only real user keystrokes should arm the dirty flag.
+        if self._pid_updating_from_board:
             return
+        self.pid_dirty = True
 
-        cmd = "PID SET " + " ".join(f"{v:.6f}" for v in values)
-        self.send_command(cmd)
+    def pid_apply(self) -> None:
+        # Firmware's PID SET path applies and saves in one operation - Apply and Save
+        # are the same request, so both go through the same verified round-trip.
+        self._pid_send_set_and_save()
 
     def pid_save(self) -> None:
+        self._pid_send_set_and_save()
+
+    def _pid_send_set_and_save(self) -> None:
+        if self._pid_save_awaiting:
+            # A previous Save/Apply is still waiting on a response - sending another
+            # copy on top of it is exactly how a delayed first response ends up
+            # clobbering a second, different edit. Let the in-flight one resolve
+            # (or time out) first instead of piling requests up.
+            self.pid_status_var.set("PID: save already in progress, please wait...")
+            return
+
         values = self._pid_values_from_ui()
         if values is None:
             return
 
-        # Firmware PID SET path applies and saves in one operation.
+        self._pid_save_awaiting = True
+        self.pid_apply_button.state(["disabled"])
+        self.pid_save_button.state(["disabled"])
+        self.pid_status_var.set("PID: saving...")
+
         cmd = "PID SET " + " ".join(f"{v:.6f}" for v in values)
         self.send_command(cmd)
+
+        if self._pid_save_timeout_id is not None:
+            try:
+                self.root.after_cancel(self._pid_save_timeout_id)
+            except Exception:
+                pass
+        self._pid_save_timeout_id = self.root.after(1500, self._pid_save_timeout)
+
+    def _pid_save_timeout(self) -> None:
+        self._pid_save_timeout_id = None
+        if not self._pid_save_awaiting:
+            return
+        self._pid_save_awaiting = False
+        self.pid_apply_button.state(["!disabled"])
+        self.pid_save_button.state(["!disabled"])
+        self.pid_status_var.set("PID: no response from board (link issue?) - click Save to retry")
+        # Deliberately leave pid_dirty as-is: the fields still hold the user's intended
+        # values and must not be silently reverted just because the board didn't answer.
+
+    def _pid_save_resolved(self, detail: str) -> None:
+        if self._pid_save_timeout_id is not None:
+            try:
+                self.root.after_cancel(self._pid_save_timeout_id)
+            except Exception:
+                pass
+            self._pid_save_timeout_id = None
+        self._pid_save_awaiting = False
+        self.pid_apply_button.state(["!disabled"])
+        self.pid_save_button.state(["!disabled"])
+        if detail == "OK":
+            self.pid_dirty = False
+            self.pid_status_var.set("PID: saved to flash")
+        elif detail == "OK_NO_SAVE":
+            # Applied to the active/running gains but NOT persisted - most commonly
+            # because the firmware refuses flash writes while armed (a save there would
+            # block the control loop for ~1-2s). The values are live in RAM right now,
+            # but a power cycle reverts to whatever was last actually saved - keep dirty
+            # so a stray telemetry line can't paper over that with a "looks saved" state.
+            self.pid_status_var.set("PID: applied but NOT saved to flash (disarm and Save again to persist)")
+        else:
+            # Keep dirty=True - the board rejected or didn't persist this attempt, so
+            # the fields must not be overwritten by unrelated telemetry until the user
+            # either retries successfully or explicitly reloads.
+            self.pid_status_var.set(f"PID: save FAILED ({detail}) - click Save to retry")
 
     def pid_load(self) -> None:
         self.send_command("PID LOAD")
