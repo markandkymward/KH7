@@ -17,6 +17,10 @@ extern UART_HandleTypeDef huart7;
 #define COMM_USB_TX_BUFFER_SIZE   192U
 #define COMM_USB_TX_TIMEOUT_MS    20U
 #define COMM_UART6_CMD_BUF_SIZE   192U
+/* Longest string in Communications_IsUart6AutoExecutableCommand()'s exact-match list
+ * ("MAG CAL START") is 13 chars - once the line has grown past that, it can never match
+ * anything in that list no matter what follows, so there is no need to keep checking. */
+#define COMM_UART6_AUTOEXEC_MAX_LEN 16U
 #define COMM_UART6_TX_TIMEOUT_MS  25U
 #define COMM_LOG_TO_UART6         1U
 #define COMM_ESCPT_UART_BUDGET    64U
@@ -474,8 +478,22 @@ void Communications_HandleUart6Byte(uint8_t byte)
     g_uart6_cmd_len = 0U;
   }
 
-  /* Match USB behavior: execute fixed commands even if sender omits CR/LF. */
-  if ((g_uart6_cmd_len > 0U) &&
+  /* Match USB behavior: execute fixed commands even if sender omits CR/LF.
+   *
+   * BUG FOUND (2026-08-18): this ran on every received byte regardless of line length,
+   * and Communications_IsUart6AutoExecutableCommand() does O(line length) work each
+   * call (whitespace scan + full uppercase copy + up to 14 strcmp calls). This function
+   * runs directly inside the USART6 RX interrupt (see HAL_UART_RxCpltCallback in
+   * receiver.c) - the peripheral isn't re-armed for the next byte until this handler
+   * returns, so growing per-byte ISR time on a long command (e.g. "PID SET " + 12 floats
+   * is ~118 chars) risked losing whatever byte arrived while still busy, with the drop
+   * point landing later in longer lines - consistent with a live-reported "PID SET"
+   * failure specifically on the 9th of 12 fields (~80 chars in). No entry in the
+   * auto-exec list exceeds COMM_UART6_AUTOEXEC_MAX_LEN chars, so once the line has grown
+   * past that it can never match anything in the list regardless of what follows -
+   * skipping the check there restores O(1) amortized ISR work per byte on any line
+   * length instead of O(n) per byte / O(n^2) per line. */
+  if ((g_uart6_cmd_len > 0U) && (g_uart6_cmd_len <= COMM_UART6_AUTOEXEC_MAX_LEN) &&
       (Communications_IsUart6AutoExecutableCommand(g_uart6_cmd_line, g_uart6_cmd_len) != 0U))
   {
     size_t n;
