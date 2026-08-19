@@ -118,6 +118,12 @@ uint8_t Nav_IsReferenceValid(void);
 /* Explicitly latch the local reference at the current position (used on
  * navigation-mode engagement per the safety spec - does not require disarmed). */
 void Nav_LatchReference(void);
+/* Clears reference_valid so the next disarmed period with a good GPS fix
+ * auto-latches a fresh reference (see Nav_Update()'s auto-latch block). Call
+ * this on arm->disarm transitions - otherwise a reference latched once per
+ * boot session never gets a chance to recover from a bad/borderline latch,
+ * and NAV_VELOCITY_BRAKE's arm gate can stay blocked until power-cycled. */
+void Nav_ResetReference(void);
 const char *Nav_InvalidReasonName(Nav_InvalidReason_t reason);
 
 /* ---- Named, independently-testable transformation functions (see tools/test_nav_math.py) ---- */

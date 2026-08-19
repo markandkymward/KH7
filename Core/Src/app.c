@@ -901,6 +901,7 @@ typedef enum
   APP_SDLOGCMD_STATUS,
   APP_SDLOGCMD_DUMP,
   APP_SDLOGCMD_DUMP_LAST,
+  APP_SDLOGCMD_DUMP_FROM,
   APP_SDLOGCMD_ERASE
 } App_SdLogCmd_t;
 
@@ -929,6 +930,7 @@ static volatile App_SdLogCmd_t g_sdlog_cmd_pending = APP_SDLOGCMD_NONE;
 static uint8_t g_sdlog_dump_active = 0U;
 static uint32_t g_sdlog_dump_block = 0U;
 static uint32_t g_sdlog_dump_end_block = 0U;
+static uint32_t g_sdlog_dump_from_requested_block = 0U;
 
 void App_RequestSdLogStatus(void)
 {
@@ -943,6 +945,16 @@ void App_RequestSdLogDump(void)
 void App_RequestSdLogDumpLast(void)
 {
   g_sdlog_cmd_pending = APP_SDLOGCMD_DUMP_LAST;
+}
+
+/* Dumps from an arbitrary caller-supplied block through the current write
+ * pointer - lets tooling pull "everything since block X" (e.g. the last N
+ * flights, using an X recovered from a prior dump's SDLOG_DUMP[START]
+ * header) without re-streaming the whole card like plain SDLOG DUMP does. */
+void App_RequestSdLogDumpFrom(uint32_t block)
+{
+  g_sdlog_dump_from_requested_block = block;
+  g_sdlog_cmd_pending = APP_SDLOGCMD_DUMP_FROM;
 }
 
 void App_RequestSdLogErase(void)
@@ -1002,7 +1014,7 @@ static void App_ServiceSdLog(void)
         printf("SDLOG_ERASE[OK]\r\n");
       }
     }
-    else if ((cmd == APP_SDLOGCMD_DUMP) || (cmd == APP_SDLOGCMD_DUMP_LAST))
+    else if ((cmd == APP_SDLOGCMD_DUMP) || (cmd == APP_SDLOGCMD_DUMP_LAST) || (cmd == APP_SDLOGCMD_DUMP_FROM))
     {
       if (g_glog_armed_state != 0U)
       {
@@ -1012,12 +1024,33 @@ static void App_ServiceSdLog(void)
       {
         printf("SDLOG_DUMP[EMPTY]\r\n");
       }
+      else if ((cmd == APP_SDLOGCMD_DUMP_FROM) &&
+               ((g_sdlog_dump_from_requested_block < 1U) ||
+                (g_sdlog_dump_from_requested_block > (g_sdlog_next_free_block - 1U))))
+      {
+        printf("SDLOG_DUMP[BAD_BLOCK requested=%lu valid=[1,%lu]]\r\n",
+               (unsigned long)g_sdlog_dump_from_requested_block,
+               (unsigned long)(g_sdlog_next_free_block - 1U));
+      }
       else
       {
         /* DUMP LAST starts at the most recent flight's first block instead of
          * block 1, so pulling recent data doesn't re-stream the entire card's
-         * history every time (that grows every arm and never gets shorter). */
-        g_sdlog_dump_block = (cmd == APP_SDLOGCMD_DUMP_LAST) ? g_sdlog_last_flight_start_block : 1U;
+         * history every time (that grows every arm and never gets shorter).
+         * DUMP FROM lets a caller pick any earlier checkpoint block (e.g. the
+         * first block of a previously-dumped flight) to pull everything since. */
+        if (cmd == APP_SDLOGCMD_DUMP_LAST)
+        {
+          g_sdlog_dump_block = g_sdlog_last_flight_start_block;
+        }
+        else if (cmd == APP_SDLOGCMD_DUMP_FROM)
+        {
+          g_sdlog_dump_block = g_sdlog_dump_from_requested_block;
+        }
+        else
+        {
+          g_sdlog_dump_block = 1U;
+        }
         g_sdlog_dump_end_block = g_sdlog_next_free_block - 1U;
         g_sdlog_dump_active = 1U;
         printf("SDLOG_DUMP[START first=%lu last=%lu record_bytes=%u]\r\n",
@@ -2287,6 +2320,9 @@ void App_Update(void)
   static uint8_t motors_armed = 0U;
   static uint8_t trim_captured = 0U;
   static uint32_t arm_hold_start_ms = 0U;
+  /* Throttles the ARM_BLOCKED[...] print below to once/sec instead of every 2ms loop
+   * while the pilot holds the arm switch against a blocked gate. */
+  static uint32_t last_arm_nav_block_print_ms = 0U;
   static uint8_t disarm_condition_active = 0U;
   static uint32_t disarm_condition_start_ms = 0U;
   static uint8_t startup_safety_checked = 0U;
@@ -3029,6 +3065,17 @@ void App_Update(void)
         pid_state_initialized = 0U;
         nav_brake_active = 0U;
         nav_brake_disqualified_latch = 0U;
+
+        if (was_armed != 0U)
+        {
+          /* Force a fresh GPS reference latch before the next arm attempt -
+           * a reference latched once per boot session never re-latches
+           * otherwise (see Nav_ResetReference()), which could leave
+           * NAV_VELOCITY_BRAKE's arm gate stuck blocked until power-cycled.
+           * Gated on the armed->disarmed edge (not every disarmed-loop
+           * iteration) so it doesn't thrash the reference while idle. */
+          Nav_ResetReference();
+        }
       }
 
       Motors_SetOutputEnabled(1U);
@@ -3045,7 +3092,24 @@ void App_Update(void)
             (arm_switch_high != 0U) &&
             (throttle_low != 0U))
         {
-          if (arm_hold_start_ms == 0U)
+          /* NAVBRAKE has no meaning without a valid nav solution - it would just sit
+           * disqualified the moment it engaged. Every other mode is pure body-frame
+           * control and doesn't touch nav_state at all, so they stay ungated - this
+           * must not block arming for RATE/ATTITUDE/ALTHOLD indoors or anywhere else
+           * GPS isn't locked. */
+          uint8_t nav_arm_ok = (uint8_t)((flight_mode != APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE) ||
+                                         (nav_state.valid != 0U));
+
+          if (nav_arm_ok == 0U)
+          {
+            arm_hold_start_ms = 0U;
+            if ((now_ms - last_arm_nav_block_print_ms) >= 1000U)
+            {
+              printf("ARM_BLOCKED[reason=NAV_INVALID mode=NAVBRAKE]\r\n");
+              last_arm_nav_block_print_ms = now_ms;
+            }
+          }
+          else if (arm_hold_start_ms == 0U)
           {
             arm_hold_start_ms = now_ms;
           }

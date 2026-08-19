@@ -56,7 +56,21 @@ void Attitude_Init(void)
  * below) so thrust vibration/transients (which grow with throttle) cannot
  * drag the attitude estimate away from true level. */
 #define ATTITUDE_ACCEL_TRUST_MIN_DEV_G 0.10f
-#define ATTITUDE_ACCEL_TRUST_MAX_DEV_G 0.60f
+/* Was 0.60f - a secured (props-on, airframe restrained so it physically
+ * cannot rotate) bench test on 2026-08-18 proved a throttle ramp alone
+ * produces a ~5deg false pitch/roll estimate with gyro confirming zero real
+ * rotation the whole time: a sustained (non-vibration-frequency) thrust
+ * transient passes right through the 5Hz g_accel_mag_filt_g LPF, so
+ * accel_dev_g climbs into this gating band for a couple of seconds and even
+ * a partially-trusted (let alone floor-weighted) correction at kp=3.0 is
+ * enough to drag the estimate off if there's any transverse-axis coupling
+ * during the transient (frame flex, mounting tolerance, vibration harmonics
+ * shifting with RPM - anything not perfectly axial with true thrust).
+ * Halving this reaches the ATTITUDE_ACCEL_TRUST_MIN_WEIGHT floor at half the
+ * deviation, shrinking the window a throttle-ramp-scale disturbance still
+ * gets meaningful accelerometer weight, without touching MIN_DEV_G (leaves
+ * steady-hover trust behavior, which was never the reported problem, alone). */
+#define ATTITUDE_ACCEL_TRUST_MAX_DEV_G 0.30f
 /* Gyro bias is only re-calibrated on the ground (see App_UpdateGyroBias() in
  * app.c) - once armed and flying, the frozen ground bias is all that's
  * subtracted, so any bias drift or shift caused by heat/vibration once props

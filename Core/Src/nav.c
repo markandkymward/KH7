@@ -441,3 +441,8 @@ uint8_t Nav_IsReferenceValid(void)
 {
   return g_nav.reference_valid;
 }
+
+void Nav_ResetReference(void)
+{
+  g_nav.reference_valid = 0U;
+}

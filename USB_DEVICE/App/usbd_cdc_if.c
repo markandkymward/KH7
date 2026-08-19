@@ -557,6 +557,14 @@ void CDC_ProcessCommandLine(const char *line)
     return;
   }
 
+  prefix = "SDLOG DUMP FROM ";
+  if (strncmp(line, prefix, strlen(prefix)) == 0)
+  {
+    uint32_t block = (uint32_t)strtoul(line + strlen(prefix), NULL, 10);
+    App_RequestSdLogDumpFrom(block);
+    return;
+  }
+
   if (strcmp(line, "SDLOG ERASE") == 0)
   {
     App_RequestSdLogErase();

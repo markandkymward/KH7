@@ -63,6 +63,7 @@ void App_RequestSdWriteBlock(uint32_t block);
 void App_RequestSdLogStatus(void);
 void App_RequestSdLogDump(void);
 void App_RequestSdLogDumpLast(void);
+void App_RequestSdLogDumpFrom(uint32_t block);
 void App_RequestSdLogErase(void);
 void App_RequestArmedTelemetryEnabled(uint8_t enabled);
 void App_PrintArmedTelemetryStatus(void);
