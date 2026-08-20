@@ -7,13 +7,24 @@
 extern "C" {
 #endif
 
-/* Matek M10Q-5883 (u-blox SAM-M10Q) on USART3, 9600 baud 8N1, reconfigured to
- * UBX-only output (NAV-PVT). Module has no dataflash - GPS_Init() must be
- * re-run every boot, it is not a one-time factory setting.
+/* SoloGood M10-180C (u-blox M10 chipset) on USART3, 115200 baud 8N1 (module's
+ * factory default - was a Matek M10Q-5883 at 9600 until the module failed and
+ * was swapped 2026-08-19; same wiring/pins, different default baud), UBX+NMEA
+ * in / UBX-only out. Module has no dataflash - GPS_Init() must be re-run every
+ * boot, it is not a one-time factory setting.
  * GPS_Init() also sends UBX-CFG-RATE to raise the nav solution rate from the
  * module's 1Hz default to GPS_NAV_RATE_HZ (see gps.c) - the velocity-brake
  * controller needs fresher-than-1Hz GPS velocity to be usable. */
 HAL_StatusTypeDef GPS_Init(void);
+/* Manual bench diagnostic - probes common baud rates for a valid checksummed
+ * UBX or NMEA frame and leaves huart3 set to whichever one worked (see
+ * gps.c). Blocks for ~3s - only call while disarmed. */
+void GPS_ScanBaud(void);
+/* Manual bench diagnostic - broadcasts a UBX-CFG-CFG clear-to-default +
+ * UBX-CFG-RST cold-start across the same baud candidates GPS_ScanBaud() uses
+ * (see gps.c). Cannot confirm the module received it without a working RX
+ * path - follow up with GPS_ScanBaud() to check for a response. */
+void GPS_FactoryReset(void);
 uint8_t GPS_IsConfigured(void);
 /* Per-stage ACK result from the most recent GPS_Init() attempt, for diagnostics. */
 uint8_t GPS_GetLastPrtAcked(void);

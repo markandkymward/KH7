@@ -455,6 +455,8 @@ static volatile uint16_t g_glog_count = 0U;
 static volatile uint8_t g_glog_capturing = 0U;
 static volatile uint8_t g_glog_dump_pending = 0U;
 static volatile uint8_t g_glog_armed_state = 0U;
+static volatile uint8_t g_gps_scan_pending = 0U;
+static volatile uint8_t g_gps_factory_reset_pending = 0U;
 /* Runtime toggle for the high-volume bench IMU/NAV telemetry stream while armed (blocking
  * UART6 writes add control-loop latency, so this defaults off/safe for real flight and is
  * only turned on for prop-off bench diagnostics via App_RequestArmedTelemetryEnabled()). */
@@ -931,6 +933,16 @@ static uint8_t g_sdlog_dump_active = 0U;
 static uint32_t g_sdlog_dump_block = 0U;
 static uint32_t g_sdlog_dump_end_block = 0U;
 static uint32_t g_sdlog_dump_from_requested_block = 0U;
+
+void App_RequestGpsScan(void)
+{
+  g_gps_scan_pending = 1U;
+}
+
+void App_RequestGpsFactoryReset(void)
+{
+  g_gps_factory_reset_pending = 1U;
+}
 
 void App_RequestSdLogStatus(void)
 {
@@ -2596,6 +2608,37 @@ void App_Update(void)
              (unsigned int)GPS_GetLastMsgAcked());
     }
     last_gps_retry_ms = now_ms;
+  }
+
+  if (g_gps_scan_pending != 0U)
+  {
+    g_gps_scan_pending = 0U;
+    if (g_glog_armed_state != 0U)
+    {
+      printf("GPS_SCAN[FAIL armed]\r\n");
+    }
+    else
+    {
+      GPS_ScanBaud();
+      /* Let the normal retry logic above re-attempt the real GPS_Init()
+       * handshake on the very next iteration, at whatever baud the scan
+       * settled huart3 on. */
+      last_gps_retry_ms = 0U;
+    }
+  }
+
+  if (g_gps_factory_reset_pending != 0U)
+  {
+    g_gps_factory_reset_pending = 0U;
+    if (g_glog_armed_state != 0U)
+    {
+      printf("GPS_FACTORY_RESET[FAIL armed]\r\n");
+    }
+    else
+    {
+      GPS_FactoryReset();
+      last_gps_retry_ms = 0U;
+    }
   }
 
   if ((now_ms - last_mag_sample_ms) >= APP_MAG_UPDATE_MS)

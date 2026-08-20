@@ -1,5 +1,6 @@
 #include "gps.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #define GPS_UART_TX_TIMEOUT_MS   50U
@@ -21,6 +22,7 @@
 #define GPS_UBX_ID_CFG_MSG       0x01U
 #define GPS_UBX_ID_CFG_RATE      0x08U
 #define GPS_UBX_ID_CFG_CFG       0x09U
+#define GPS_UBX_ID_CFG_RST       0x04U
 /* Raise the nav solution rate from the module's 1Hz default - the velocity-brake
  * controller needs fresher GPS velocity than 1Hz to be useful. 5Hz (200ms) is well
  * within the SAM-M10Q's supported single-GNSS nav rate. */
@@ -334,14 +336,15 @@ HAL_StatusTypeDef GPS_Init(void)
   (void)HAL_UART_AbortReceive(&huart3);
   GPS_ResetParser();
 
-  /* UBX-CFG-PRT: UART1 (module-internal), 8N1, baud unchanged (9600), UBX+NMEA
+  /* UBX-CFG-PRT: UART1 (module-internal), 8N1, baud unchanged (115200), UBX+NMEA
    * in, UBX-only out. */
   memset(cfg_prt_payload, 0, sizeof(cfg_prt_payload));
   cfg_prt_payload[0] = 1U;                 /* portID = UART1 */
   cfg_prt_payload[4] = 0xD0U;              /* mode = 0x000008D0 (8N1), LE */
   cfg_prt_payload[5] = 0x08U;
-  cfg_prt_payload[8] = 0x80U;               /* baudRate = 9600, LE */
-  cfg_prt_payload[9] = 0x25U;
+  cfg_prt_payload[8] = 0x00U;               /* baudRate = 115200, LE */
+  cfg_prt_payload[9] = 0xC2U;
+  cfg_prt_payload[10] = 0x01U;
   cfg_prt_payload[12] = 0x03U;               /* inProtoMask = UBX+NMEA */
   cfg_prt_payload[14] = 0x01U;               /* outProtoMask = UBX only */
   GPS_SendUbx(GPS_UBX_CLASS_CFG, GPS_UBX_ID_CFG_PRT, cfg_prt_payload, sizeof(cfg_prt_payload));
@@ -387,6 +390,228 @@ HAL_StatusTypeDef GPS_Init(void)
    * gate g_configured on it, just report it via GPS_GetLastRateAcked() for diagnostics. */
   g_configured = (uint8_t)((prt_acked != 0U) && (msg_acked != 0U));
   return (g_configured != 0U) ? HAL_OK : HAL_ERROR;
+}
+
+#define GPS_SCAN_CANDIDATE_COUNT 6U
+static const uint32_t GPS_SCAN_BAUD_CANDIDATES[GPS_SCAN_CANDIDATE_COUNT] =
+{
+  4800U, 9600U, 19200U, 38400U, 57600U, 115200U
+};
+
+/* Broadcasts a UBX-CFG-CFG "clear all sections to firmware default, load
+ * defaults into active config" + UBX-CFG-RST "cold start" at every candidate
+ * baud in turn, since we don't know (and this may be called precisely
+ * because we can't determine) which baud the module is currently listening
+ * at. No way to confirm the module actually received any of this without a
+ * working RX path - follow up with GPS_ScanBaud()/"GPS SCAN" afterward and
+ * judge success by whether valid frames start showing up. This module has no
+ * Flash/EEPROM (deviceMask targets BBR only), and BBR itself is very likely
+ * not battery-backed on a board this size, so a plain power-cycle achieves
+ * the same reset - this exists for the case comms can be established but a
+ * power-cycle isn't convenient/possible right now. */
+void GPS_FactoryReset(void)
+{
+  uint8_t cfg_cfg_payload[13];
+  uint8_t cfg_rst_payload[4];
+  uint16_t i;
+
+  (void)HAL_UART_AbortReceive(&huart3);
+
+  memset(cfg_cfg_payload, 0, sizeof(cfg_cfg_payload));
+  cfg_cfg_payload[0] = 0xFFU;                 /* clearMask = all sections, LE */
+  cfg_cfg_payload[1] = 0xFFU;
+  cfg_cfg_payload[2] = 0xFFU;
+  cfg_cfg_payload[3] = 0xFFU;
+  cfg_cfg_payload[8] = 0xFFU;                 /* loadMask = all sections, LE */
+  cfg_cfg_payload[9] = 0xFFU;
+  cfg_cfg_payload[10] = 0xFFU;
+  cfg_cfg_payload[11] = 0xFFU;
+  cfg_cfg_payload[12] = 0x01U;                /* deviceMask = BBR only */
+
+  memset(cfg_rst_payload, 0, sizeof(cfg_rst_payload));
+  cfg_rst_payload[0] = 0xFFU;                 /* navBbrMask = 0xFFFF, cold start, LE */
+  cfg_rst_payload[1] = 0xFFU;
+  cfg_rst_payload[2] = 0x01U;                 /* resetMode = controlled software reset */
+
+  for (i = 0U; i < GPS_SCAN_CANDIDATE_COUNT; i++)
+  {
+    uint32_t baud = GPS_SCAN_BAUD_CANDIDATES[i];
+
+    huart3.Init.BaudRate = baud;
+    if (HAL_UART_Init(&huart3) != HAL_OK)
+    {
+      printf("GPS_FACTORY_RESET[baud=%lu ERROR reinit_failed]\r\n", (unsigned long)baud);
+      continue;
+    }
+    GPS_SendUbx(GPS_UBX_CLASS_CFG, GPS_UBX_ID_CFG_CFG, cfg_cfg_payload, sizeof(cfg_cfg_payload));
+    HAL_Delay(50U);
+    GPS_SendUbx(GPS_UBX_CLASS_CFG, GPS_UBX_ID_CFG_RST, cfg_rst_payload, sizeof(cfg_rst_payload));
+    HAL_Delay(50U);
+    printf("GPS_FACTORY_RESET[baud=%lu sent]\r\n", (unsigned long)baud);
+  }
+
+  huart3.Init.BaudRate = 115200U;
+  (void)HAL_UART_Init(&huart3);
+  g_configured = 0U;
+  GPS_ResetParser();
+  (void)HAL_UART_Receive_IT(&huart3, &g_gps_rx_byte, 1U);
+  printf("GPS_FACTORY_RESET[DONE re-run GPS SCAN to check for a response]\r\n");
+}
+
+#define GPS_SCAN_WINDOW_MS  500U
+#define GPS_SCAN_BUF_SIZE   300U
+
+/* Independent of the live UBX parser/state (GPS_HandleByte/GPS_ProcessFrame)
+ * so probing at the wrong baud can never corrupt real GPS_Get*() state -
+ * bytes received during a scan are only ever looked at here, never fed to
+ * the real parser. */
+static uint8_t GPS_ScanLooksLikeUbxFrame(const uint8_t *buf, uint16_t count, uint16_t start_idx)
+{
+  uint16_t payload_len;
+  uint16_t frame_end;
+  uint8_t ck_a = 0U;
+  uint8_t ck_b = 0U;
+  uint16_t k;
+
+  if ((uint32_t)start_idx + 8U > (uint32_t)count)
+  {
+    return 0U;
+  }
+  if (buf[start_idx + 1U] != GPS_UBX_SYNC2)
+  {
+    return 0U;
+  }
+  payload_len = (uint16_t)((uint16_t)buf[start_idx + 4U] | ((uint16_t)buf[start_idx + 5U] << 8));
+  if (payload_len > GPS_MAX_PAYLOAD)
+  {
+    return 0U;
+  }
+  frame_end = (uint16_t)(start_idx + 6U + payload_len + 2U);
+  if (frame_end > count)
+  {
+    return 0U;
+  }
+  for (k = (uint16_t)(start_idx + 2U); k < (uint16_t)(start_idx + 6U + payload_len); k++)
+  {
+    ck_a = (uint8_t)(ck_a + buf[k]);
+    ck_b = (uint8_t)(ck_b + ck_a);
+  }
+  return (uint8_t)((ck_a == buf[start_idx + 6U + payload_len]) &&
+                    (ck_b == buf[start_idx + 7U + payload_len]));
+}
+
+/* Looks for '$'...<hex><hex>\r\n within a short window - a checksummed NMEA
+ * sentence, which a fresh/never-configured module may emit by default even
+ * before GPS_Init() has told it to switch to UBX-only output. */
+static uint8_t GPS_ScanLooksLikeNmeaSentence(const uint8_t *buf, uint16_t count, uint16_t start_idx)
+{
+  uint16_t j;
+  uint16_t max_j = (uint16_t)(start_idx + 90U);
+
+  if (max_j > count)
+  {
+    max_j = count;
+  }
+  for (j = (uint16_t)(start_idx + 1U); (uint32_t)(j + 4U) < (uint32_t)max_j; j++)
+  {
+    if (buf[j] == '*')
+    {
+      uint8_t c1 = buf[j + 1U];
+      uint8_t c2 = buf[j + 2U];
+      uint8_t is_hex1 = (uint8_t)(((c1 >= '0') && (c1 <= '9')) || ((c1 >= 'A') && (c1 <= 'F')));
+      uint8_t is_hex2 = (uint8_t)(((c2 >= '0') && (c2 <= '9')) || ((c2 >= 'A') && (c2 <= 'F')));
+      return (uint8_t)(is_hex1 && is_hex2 && (buf[j + 3U] == '\r') && (buf[j + 4U] == '\n'));
+    }
+    if ((buf[j] < 0x20U) || (buf[j] > 0x7EU))
+    {
+      return 0U;
+    }
+  }
+  return 0U;
+}
+
+/* Manual bench diagnostic (see "GPS SCAN" command) - tries each candidate
+ * baud in turn, listens for a short window, and reports which one(s) produced
+ * a valid checksummed frame. Leaves huart3 configured at the best candidate
+ * found (or 115200, this module's factory default, if none matched) and
+ * leaves g_configured=0 so the normal GPS_Init() retry path re-attempts the
+ * real handshake at whatever baud this settles on. Blocks for up to
+ * GPS_SCAN_CANDIDATE_COUNT*GPS_SCAN_WINDOW_MS (~3s) - caller must only invoke
+ * this while disarmed. */
+void GPS_ScanBaud(void)
+{
+  static uint8_t buf[GPS_SCAN_BUF_SIZE];
+  uint32_t found_baud = 0U;
+  uint16_t i;
+
+  (void)HAL_UART_AbortReceive(&huart3);
+
+  for (i = 0U; i < GPS_SCAN_CANDIDATE_COUNT; i++)
+  {
+    uint32_t baud = GPS_SCAN_BAUD_CANDIDATES[i];
+    uint32_t start_ms;
+    uint16_t count = 0U;
+    uint16_t ubx_frames = 0U;
+    uint16_t nmea_sentences = 0U;
+    uint16_t j;
+
+    huart3.Init.BaudRate = baud;
+    if (HAL_UART_Init(&huart3) != HAL_OK)
+    {
+      printf("GPS_SCAN[baud=%lu ERROR reinit_failed]\r\n", (unsigned long)baud);
+      continue;
+    }
+
+    start_ms = HAL_GetTick();
+    while ((HAL_GetTick() - start_ms) < GPS_SCAN_WINDOW_MS)
+    {
+      uint8_t byte;
+      if (HAL_UART_Receive(&huart3, &byte, 1U, 20U) == HAL_OK)
+      {
+        if (count < GPS_SCAN_BUF_SIZE)
+        {
+          buf[count] = byte;
+          count++;
+        }
+      }
+    }
+
+    for (j = 0U; j < count; j++)
+    {
+      if ((buf[j] == GPS_UBX_SYNC1) && (GPS_ScanLooksLikeUbxFrame(buf, count, j) != 0U))
+      {
+        ubx_frames++;
+      }
+      if ((buf[j] == '$') && (GPS_ScanLooksLikeNmeaSentence(buf, count, j) != 0U))
+      {
+        nmea_sentences++;
+      }
+    }
+
+    printf("GPS_SCAN[baud=%lu bytes=%u ubx_frames=%u nmea_sentences=%u]\r\n",
+           (unsigned long)baud, (unsigned int)count, (unsigned int)ubx_frames,
+           (unsigned int)nmea_sentences);
+
+    if (((ubx_frames > 0U) || (nmea_sentences > 0U)) && (found_baud == 0U))
+    {
+      found_baud = baud;
+    }
+  }
+
+  huart3.Init.BaudRate = (found_baud != 0U) ? found_baud : 115200U;
+  (void)HAL_UART_Init(&huart3);
+  if (found_baud != 0U)
+  {
+    printf("GPS_SCAN[DONE best_baud=%lu]\r\n", (unsigned long)found_baud);
+  }
+  else
+  {
+    printf("GPS_SCAN[DONE no_valid_baud_found fell_back=115200]\r\n");
+  }
+
+  g_configured = 0U;
+  GPS_ResetParser();
+  (void)HAL_UART_Receive_IT(&huart3, &g_gps_rx_byte, 1U);
 }
 
 uint8_t GPS_IsConfigured(void)

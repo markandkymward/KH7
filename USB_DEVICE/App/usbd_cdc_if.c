@@ -557,6 +557,20 @@ void CDC_ProcessCommandLine(const char *line)
     return;
   }
 
+  if (strcmp(line, "GPS SCAN") == 0)
+  {
+    App_RequestGpsScan();
+    printf("GPS_SCAN[QUEUED]\r\n");
+    return;
+  }
+
+  if (strcmp(line, "GPS FACTORY RESET") == 0)
+  {
+    App_RequestGpsFactoryReset();
+    printf("GPS_FACTORY_RESET[QUEUED]\r\n");
+    return;
+  }
+
   prefix = "SDLOG DUMP FROM ";
   if (strncmp(line, prefix, strlen(prefix)) == 0)
   {
