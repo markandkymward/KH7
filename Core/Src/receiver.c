@@ -15,6 +15,36 @@
 #define CRSF_RC_PAYLOAD_SIZE           22U
 #define CRSF_LINK_TIMEOUT_MS           250U
 #define CRSF_ADDRESS_FLIGHT_CONTROLLER 0xC8U
+/* Battery sensor telemetry TX (FC -> RX -> transmitter), so the radio's own
+ * (usually voice-alarm-capable) telemetry display gets battery voltage
+ * instead of relying solely on the aircraft's own onboard piezo, which is
+ * easy to miss over prop noise/distance. Standard CRSF frame per
+ * github.com/tbs-fpv/tbs-crsf-spec: payload is voltage(u16 BE, 0.1V),
+ * current(u16 BE, 0.1A), capacity_used(u24 BE, mAh), remaining(u8, percent) -
+ * verified 2026-08-21 against Betaflight's crsfFrameBatterySensor(). This FC
+ * has no current/capacity sensing, so those fields are always sent as 0;
+ * voltage is the field radio-side alarms actually key off. huart4 is
+ * configured UART_MODE_TX_RX (full duplex, separate TX/RX wiring assumed,
+ * not single-wire half-duplex) - if the RX's telemetry pad isn't physically
+ * wired to this MCU's UART4_TX pin, this is a harmless no-op. */
+#define CRSF_FRAMETYPE_BATTERY_SENSOR      0x08U
+#define CRSF_BATTERY_SENSOR_PAYLOAD_SIZE   8U
+#define CRSF_FRAME_LENGTH_TYPE_CRC         2U /* type + crc bytes, added to payload size for the length field */
+
+/* GPS/Attitude/Vario/Flight-mode telemetry TX, matching iNavFlight/inav's
+ * src/main/telemetry/crsf.c payload formats exactly (verified 2026-08-21
+ * against that source) so EdgeTX's standard iNav telemetry LUA script reads
+ * this FC the same way it reads a real iNav flight controller, even though
+ * this isn't iNav - the wire format is just the shared CRSF spec, iNav's
+ * script doesn't care what firmware produced it. */
+#define CRSF_FRAMETYPE_GPS                 0x02U
+#define CRSF_GPS_PAYLOAD_SIZE              15U /* lat i32, lon i32, speed u16, heading u16, alt u16, sats u8 */
+#define CRSF_FRAMETYPE_VARIO               0x07U
+#define CRSF_VARIO_PAYLOAD_SIZE            2U  /* vertical speed i16, cm/s */
+#define CRSF_FRAMETYPE_ATTITUDE            0x1EU
+#define CRSF_ATTITUDE_PAYLOAD_SIZE         6U  /* pitch/roll/yaw i16 each, rad*10000 */
+#define CRSF_FRAMETYPE_FLIGHT_MODE         0x21U
+#define CRSF_DEG_TO_RAD                    0.0174532925f
 
 /* Highest-priority safety net: the instant a CRSF frame shows the arm switch in
  * the disarm position, force motors to idle right here in the UART4 RX ISR -
@@ -67,6 +97,136 @@ static uint8_t Receiver_Crc8(const uint8_t *data, uint8_t length)
   }
 
   return crc;
+}
+
+void Receiver_SendBatteryTelemetry(float voltage_v)
+{
+  uint8_t frame[3U + CRSF_BATTERY_SENSOR_PAYLOAD_SIZE + 1U]; /* sync+length+type + payload + crc */
+  uint16_t voltage_decivolts;
+
+  if (voltage_v < 0.0f)
+  {
+    voltage_v = 0.0f;
+  }
+  else if (voltage_v > 6553.5f)
+  {
+    voltage_v = 6553.5f;
+  }
+  voltage_decivolts = (uint16_t)((voltage_v * 10.0f) + 0.5f);
+
+  frame[0] = CRSF_ADDRESS_FLIGHT_CONTROLLER;
+  frame[1] = (uint8_t)(CRSF_BATTERY_SENSOR_PAYLOAD_SIZE + CRSF_FRAME_LENGTH_TYPE_CRC);
+  frame[2] = CRSF_FRAMETYPE_BATTERY_SENSOR;
+  frame[3] = (uint8_t)(voltage_decivolts >> 8);
+  frame[4] = (uint8_t)(voltage_decivolts & 0xFFU);
+  frame[5] = 0U; /* current hi - no current sensing on this board */
+  frame[6] = 0U; /* current lo */
+  frame[7] = 0U; /* capacity used [23:16] mAh - no capacity tracking */
+  frame[8] = 0U; /* capacity used [15:8] */
+  frame[9] = 0U; /* capacity used [7:0] */
+  frame[10] = 0U; /* remaining percent - not computed */
+  frame[11] = Receiver_Crc8(&frame[2], (uint8_t)(CRSF_BATTERY_SENSOR_PAYLOAD_SIZE + 1U));
+
+  (void)HAL_UART_Transmit(&huart4, frame, sizeof(frame), 10U);
+}
+
+void Receiver_SendGpsTelemetry(float lat_deg, float lon_deg, float alt_m,
+                               float ground_speed_mps, float heading_deg, uint8_t num_satellites)
+{
+  uint8_t frame[3U + CRSF_GPS_PAYLOAD_SIZE + 1U];
+  int32_t lat_i = (int32_t)((double)lat_deg * 10000000.0);
+  int32_t lon_i = (int32_t)((double)lon_deg * 10000000.0);
+  uint16_t speed_kmh_x10 = (uint16_t)((ground_speed_mps * 36.0f) + 0.5f); /* m/s -> km/h*10 */
+  uint16_t heading_x100;
+  int32_t alt_encoded = (int32_t)alt_m + 1000; /* iNav's -1000m offset encoding */
+
+  if (heading_deg < 0.0f)
+  {
+    heading_deg += 360.0f;
+  }
+  heading_x100 = (uint16_t)((heading_deg * 100.0f) + 0.5f);
+
+  if (alt_encoded < 0) { alt_encoded = 0; }
+  if (alt_encoded > 65535) { alt_encoded = 65535; }
+
+  frame[0] = CRSF_ADDRESS_FLIGHT_CONTROLLER;
+  frame[1] = (uint8_t)(CRSF_GPS_PAYLOAD_SIZE + CRSF_FRAME_LENGTH_TYPE_CRC);
+  frame[2] = CRSF_FRAMETYPE_GPS;
+  frame[3] = (uint8_t)((uint32_t)lat_i >> 24);
+  frame[4] = (uint8_t)((uint32_t)lat_i >> 16);
+  frame[5] = (uint8_t)((uint32_t)lat_i >> 8);
+  frame[6] = (uint8_t)((uint32_t)lat_i);
+  frame[7] = (uint8_t)((uint32_t)lon_i >> 24);
+  frame[8] = (uint8_t)((uint32_t)lon_i >> 16);
+  frame[9] = (uint8_t)((uint32_t)lon_i >> 8);
+  frame[10] = (uint8_t)((uint32_t)lon_i);
+  frame[11] = (uint8_t)(speed_kmh_x10 >> 8);
+  frame[12] = (uint8_t)(speed_kmh_x10 & 0xFFU);
+  frame[13] = (uint8_t)(heading_x100 >> 8);
+  frame[14] = (uint8_t)(heading_x100 & 0xFFU);
+  frame[15] = (uint8_t)((uint16_t)alt_encoded >> 8);
+  frame[16] = (uint8_t)((uint16_t)alt_encoded & 0xFFU);
+  frame[17] = num_satellites;
+  frame[18] = Receiver_Crc8(&frame[2], (uint8_t)(CRSF_GPS_PAYLOAD_SIZE + 1U));
+
+  (void)HAL_UART_Transmit(&huart4, frame, sizeof(frame), 10U);
+}
+
+void Receiver_SendVarioTelemetry(float climb_rate_mps)
+{
+  uint8_t frame[3U + CRSF_VARIO_PAYLOAD_SIZE + 1U];
+  int16_t vspeed_cms = (int16_t)(climb_rate_mps * 100.0f);
+
+  frame[0] = CRSF_ADDRESS_FLIGHT_CONTROLLER;
+  frame[1] = (uint8_t)(CRSF_VARIO_PAYLOAD_SIZE + CRSF_FRAME_LENGTH_TYPE_CRC);
+  frame[2] = CRSF_FRAMETYPE_VARIO;
+  frame[3] = (uint8_t)(((uint16_t)vspeed_cms) >> 8);
+  frame[4] = (uint8_t)(((uint16_t)vspeed_cms) & 0xFFU);
+  frame[5] = Receiver_Crc8(&frame[2], (uint8_t)(CRSF_VARIO_PAYLOAD_SIZE + 1U));
+
+  (void)HAL_UART_Transmit(&huart4, frame, sizeof(frame), 10U);
+}
+
+void Receiver_SendAttitudeTelemetry(float pitch_deg, float roll_deg, float yaw_deg)
+{
+  uint8_t frame[3U + CRSF_ATTITUDE_PAYLOAD_SIZE + 1U];
+  int16_t pitch_i = (int16_t)(pitch_deg * CRSF_DEG_TO_RAD * 10000.0f);
+  int16_t roll_i = (int16_t)(roll_deg * CRSF_DEG_TO_RAD * 10000.0f);
+  int16_t yaw_i = (int16_t)(yaw_deg * CRSF_DEG_TO_RAD * 10000.0f);
+
+  frame[0] = CRSF_ADDRESS_FLIGHT_CONTROLLER;
+  frame[1] = (uint8_t)(CRSF_ATTITUDE_PAYLOAD_SIZE + CRSF_FRAME_LENGTH_TYPE_CRC);
+  frame[2] = CRSF_FRAMETYPE_ATTITUDE;
+  frame[3] = (uint8_t)(((uint16_t)pitch_i) >> 8);
+  frame[4] = (uint8_t)(((uint16_t)pitch_i) & 0xFFU);
+  frame[5] = (uint8_t)(((uint16_t)roll_i) >> 8);
+  frame[6] = (uint8_t)(((uint16_t)roll_i) & 0xFFU);
+  frame[7] = (uint8_t)(((uint16_t)yaw_i) >> 8);
+  frame[8] = (uint8_t)(((uint16_t)yaw_i) & 0xFFU);
+  frame[9] = Receiver_Crc8(&frame[2], (uint8_t)(CRSF_ATTITUDE_PAYLOAD_SIZE + 1U));
+
+  (void)HAL_UART_Transmit(&huart4, frame, sizeof(frame), 10U);
+}
+
+void Receiver_SendFlightModeTelemetry(const char *mode_name)
+{
+  uint8_t frame[3U + 16U + 1U]; /* generous cap for a short mode string + null + crc */
+  uint8_t payload_len;
+  uint8_t i;
+
+  for (i = 0U; (mode_name[i] != '\0') && (i < 15U); i++)
+  {
+    frame[3U + i] = (uint8_t)mode_name[i];
+  }
+  frame[3U + i] = 0U; /* null terminator */
+  payload_len = (uint8_t)(i + 1U);
+
+  frame[0] = CRSF_ADDRESS_FLIGHT_CONTROLLER;
+  frame[1] = (uint8_t)(payload_len + CRSF_FRAME_LENGTH_TYPE_CRC);
+  frame[2] = CRSF_FRAMETYPE_FLIGHT_MODE;
+  frame[3U + payload_len] = Receiver_Crc8(&frame[2], (uint8_t)(payload_len + 1U));
+
+  (void)HAL_UART_Transmit(&huart4, frame, (uint16_t)(3U + payload_len + 1U), 10U);
 }
 
 static void Receiver_ResetParser(void)

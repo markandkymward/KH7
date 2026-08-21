@@ -20,6 +20,26 @@ extern SPI_HandleTypeDef hspi4;
 static IMU_TypeDef g_imu_type = IMU_TYPE_UNKNOWN;
 static uint8_t g_imu_whoami = 0U;
 
+/* IMU_ReadRawAligned() runs unconditionally every control-loop iteration with
+ * no health-gate skip (unlike mag/baro), so a wedged SPI peripheral here is
+ * the single highest-risk hang candidate in the main loop. HAL_SPI_Transmit/
+ * TransmitReceive already bound each call to IMU_SPI_TIMEOUT_MS, but a known
+ * STM32 HAL behavior is that a timed-out transfer can leave hspi4.State stuck
+ * at BUSY_TX/BUSY_TX_RX - every subsequent call then fails immediately without
+ * even touching the bus, since HAL_SPI_* refuses to start a transfer unless
+ * State==READY, and nothing else in this single-threaded loop can clear that.
+ * A full DeInit/Init on any failure forces the peripheral back to a known
+ * state so a transient glitch self-heals on the next iteration instead of
+ * wedging permanently (found 2026-08-21, after two crashes whose SD logs both
+ * showed the main loop going unresponsive mid-flight with no violent event
+ * recorded right before the cutoff). */
+static void IMU_SpiRecover(void)
+{
+  HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
+  (void)HAL_SPI_DeInit(&hspi4);
+  (void)HAL_SPI_Init(&hspi4);
+}
+
 static HAL_StatusTypeDef IMU_WriteReg(uint8_t reg, uint8_t value)
 {
   uint8_t frame[2] = {reg, value};
@@ -27,6 +47,7 @@ static HAL_StatusTypeDef IMU_WriteReg(uint8_t reg, uint8_t value)
   if (HAL_SPI_Transmit(&hspi4, frame, 2U, IMU_SPI_TIMEOUT_MS) != HAL_OK)
   {
     HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
+    IMU_SpiRecover();
     return HAL_ERROR;
   }
   HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
@@ -51,6 +72,7 @@ static HAL_StatusTypeDef IMU_ReadRegs(uint8_t reg, uint8_t *data, uint16_t len)
   if (HAL_SPI_TransmitReceive(&hspi4, tx, rx, (uint16_t)(len + 1U), IMU_SPI_TIMEOUT_MS) != HAL_OK)
   {
     HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
+    IMU_SpiRecover();
     return HAL_ERROR;
   }
   HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);

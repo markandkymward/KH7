@@ -95,15 +95,34 @@ static int32_t Baro_SignExtend(uint32_t raw, uint8_t bits)
   return (int32_t)((raw ^ sign_bit) - sign_bit);
 }
 
+/* I2C1 is shared with mag.c - see mag.c's I2C1_Recover() for why a failed
+ * transfer here resets the whole peripheral rather than just this driver's
+ * state (2026-08-21). */
+static void I2C1_Recover(void)
+{
+  (void)HAL_I2C_DeInit(&hi2c1);
+  (void)HAL_I2C_Init(&hi2c1);
+}
+
 static HAL_StatusTypeDef Baro_ReadRegs(uint8_t reg, uint8_t *data, uint16_t len)
 {
-  return HAL_I2C_Mem_Read(&hi2c1, g_i2c_addr, reg, I2C_MEMADD_SIZE_8BIT, data, len, BARO_I2C_TIMEOUT_MS);
+  HAL_StatusTypeDef status = HAL_I2C_Mem_Read(&hi2c1, g_i2c_addr, reg, I2C_MEMADD_SIZE_8BIT, data, len, BARO_I2C_TIMEOUT_MS);
+  if (status != HAL_OK)
+  {
+    I2C1_Recover();
+  }
+  return status;
 }
 
 static HAL_StatusTypeDef Baro_WriteReg(uint8_t reg, uint8_t value)
 {
   uint8_t val = value;
-  return HAL_I2C_Mem_Write(&hi2c1, g_i2c_addr, reg, I2C_MEMADD_SIZE_8BIT, &val, 1U, BARO_I2C_TIMEOUT_MS);
+  HAL_StatusTypeDef status = HAL_I2C_Mem_Write(&hi2c1, g_i2c_addr, reg, I2C_MEMADD_SIZE_8BIT, &val, 1U, BARO_I2C_TIMEOUT_MS);
+  if (status != HAL_OK)
+  {
+    I2C1_Recover();
+  }
+  return status;
 }
 
 static HAL_StatusTypeDef Baro_ProbeAddress(uint16_t addr)

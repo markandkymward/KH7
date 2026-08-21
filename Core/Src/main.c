@@ -20,6 +20,7 @@
 #include "main.h"
 #include "app.h"
 #include "usb_device.h"
+#include "fault_record.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -63,6 +64,8 @@ UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
 UART_HandleTypeDef huart6;
 
+IWDG_HandleTypeDef hiwdg1;
+
 /* USER CODE BEGIN PV */
 
 /* USER CODE END PV */
@@ -86,6 +89,7 @@ static void MX_USART3_UART_Init(void);
 static void MX_USART6_UART_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
+static void MX_IWDG1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -118,6 +122,17 @@ int main(void)
   /* Latch reset cause before clearing, so it can be reported once UART6 is up. */
   g_reset_cause_flags = RCC->RSR;
   __HAL_RCC_CLEAR_RESET_FLAGS();
+
+  /* Also persist it to RAM_D3 (survives any reset that isn't a true power
+   * loss) so "RESET STATUS" can answer this later even when nobody was
+   * connected live to see the one-time printf below - see fault_record.h. */
+  {
+    volatile ResetInfo_t *reset_info = RESET_INFO;
+    uint32_t boot_count = (reset_info->magic == RESET_INFO_MAGIC) ? (reset_info->boot_count + 1U) : 1U;
+    reset_info->magic = RESET_INFO_MAGIC;
+    reset_info->reset_cause_flags = g_reset_cause_flags;
+    reset_info->boot_count = boot_count;
+  }
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -158,6 +173,15 @@ int main(void)
          (unsigned long)g_reset_cause_flags);
 
   App_Init();
+  /* IWDG disabled again 2026-08-20: re-enabling it to stop losing crash data to
+   * manual power-cycles reintroduced the exact hazard it was originally disabled
+   * for - a main-loop hang leaves the aircraft fully unresponsive (including to
+   * disarm) for up to the 4.0s reload period, then forces an uncontrolled
+   * full-system reset in the air, which is worse than the hang alone. The
+   * underlying cause of the hang itself is still unfixed; don't re-enable this
+   * until that's found - RAM_D3 fault_record.h/blackbox already capture
+   * HardFault-class crashes without needing the watchdog at all. */
+  /* MX_IWDG1_Init(); */
 
   /* USER CODE END 2 */
 
@@ -169,6 +193,7 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     App_Update();
+    /* HAL_IWDG_Refresh(&hiwdg1); */ /* IWDG disabled - see note above MX_IWDG1_Init() */
   }
   /* USER CODE END 3 */
 }
@@ -878,6 +903,37 @@ static void MX_USART2_UART_Init(void)
 
   /* USER CODE END USART2_Init 2 */
 
+}
+
+/**
+  * @brief IWDG1 Initialization Function
+  * @param None
+  * @retval None
+  *
+  * RE-ENABLED (2026-08-20) after being disabled following spurious in-flight
+  * resets - root-caused to HAL_FLASHEx_Erase() (PID gain save, mag-cal-stop)
+  * blocking the control loop for ~1-2s on an H7 sector erase, which a
+  * shorter-than-that timeout would trip on every single gain save. 4.0s
+  * (prescaler /32, reload 3999, LSI nominally 32kHz) is comfortably above
+  * that window while still catching a genuine hang - see watchdog-disabled
+  * memory. Fed once per main-loop iteration in main()'s while(1), after
+  * App_Update() - a hang anywhere in App_Update() (the only thing the loop
+  * does) stops feeding and trips this within one timeout period, triggering
+  * a reset instead of requiring a manual power-cycle. Critically, an
+  * IWDG-triggered reset (unlike a power-cycle) preserves RAM_D3, so the
+  * full-rate black-box ring buffer (see App_BlackboxCapture()/
+  * App_BlackboxDumpIfPresent() in app.c) survives and auto-recovers on the
+  * next boot instead of being lost. */
+static void MX_IWDG1_Init(void)
+{
+  hiwdg1.Instance = IWDG1;
+  hiwdg1.Init.Prescaler = IWDG_PRESCALER_32;
+  hiwdg1.Init.Reload = 3999;
+  hiwdg1.Init.Window = IWDG_WINDOW_DISABLE;
+  if (HAL_IWDG_Init(&hiwdg1) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
 /**

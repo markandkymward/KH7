@@ -51,11 +51,12 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 RECORD_STRUCT = struct.Struct(
     "<I9hHHHHBBhhhhhhhhHhH"  # original fields (54 bytes)
+    "B"                       # mag_field_dev_pct
     "BBBB"                    # nav_flags, nav_invalid_reason, nav_fix_type, nav_num_sv
     "HHHHH"                   # nav_h_acc_cm, nav_age_ms, nav_update_period_ms, nav_consecutive_valid, nav_dropout_count
     + "h" * 16                # nav north/east/vel(raw,filt,desired,error)/accel(n,e,fwd,right) + pilot stick, all int16
 )
-RECORD_SIZE = RECORD_STRUCT.size  # 100 bytes, matches App_SdLogRecord_t in Core/Src/app.c
+RECORD_SIZE = RECORD_STRUCT.size  # 101 bytes, matches App_SdLogRecord_t in Core/Src/app.c
 FIELD_NAMES = (
     "time_ms",
     "setpoint_roll_dps", "setpoint_pitch_dps", "setpoint_yaw_dps",
@@ -69,6 +70,7 @@ FIELD_NAMES = (
     "throttle_cmd_us", "throttle_actual_us",
     "arm_us",
     "yaw_deg_x10", "mag_heading_x10",
+    "mag_field_dev_pct",
     "nav_flags", "nav_invalid_reason", "nav_fix_type", "nav_num_sv",
     "nav_h_acc_cm", "nav_age_ms", "nav_update_period_ms", "nav_consecutive_valid", "nav_dropout_count",
     "nav_north_m_x10", "nav_east_m_x10",
@@ -82,6 +84,7 @@ FIELD_NAMES = (
 )
 APP_SDLOG_FLAG_LINK_ACTIVE = 0x08  # bit set when receiver_state.link_active was true
 APP_SDLOG_FLAG_MAG_HEALTHY = 0x10  # bit set when Mag_IsHealthy() was true
+APP_SDLOG_FLAG_MAG_NUDGE_GATED = 0x20  # bit set when the field-deviation interference gate suppressed the nudge this sample
 APP_SDLOG_NAV_FLAG_REQUESTED = 0x01
 APP_SDLOG_NAV_FLAG_ACTIVE = 0x02
 APP_SDLOG_NAV_FLAG_TILT_LIMITED = 0x04
@@ -144,30 +147,52 @@ class _TcpLineSource:
         self.close()
 
 
-def collect_raw(port: str, baud: int, idle_timeout_s: float, max_timeout_s: float,
-                 save_raw_path: Optional[str], full: bool = False,
-                 host: Optional[str] = None, tcp_port: int = 3333) -> str:
-    conn = _TcpLineSource(host, tcp_port) if host else serial.Serial(port, baud, timeout=1.0)
+CONNECT_RETRIES = 6          # matches the manual retry loops this tool used to require by hand
+CONNECT_RETRY_DELAY_S = 4.0
+RESUME_ATTEMPTS = 8          # cap on stall->resume cycles before giving up, so a genuinely dead
+                              # board/bridge fails loudly instead of looping forever
+
+
+def _open_connection(port: str, baud: int, host: Optional[str], tcp_port: int):
+    """(Re)connects with retry/backoff - the WiFi bridge in particular has proven to drop
+    for 10s of seconds to over a minute at a time, previously requiring a human to notice
+    and manually re-run a probe loop before every real attempt (2026-08-21)."""
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, CONNECT_RETRIES + 1):
+        try:
+            if host:
+                return _TcpLineSource(host, tcp_port)
+            return serial.Serial(port, baud, timeout=1.0)
+        except (OSError, serial.SerialException) as exc:
+            last_exc = exc
+            print(f"  connect attempt {attempt}/{CONNECT_RETRIES} failed ({exc}), "
+                  f"retrying in {CONNECT_RETRY_DELAY_S:.0f}s...", file=sys.stderr)
+            if attempt < CONNECT_RETRIES:
+                time.sleep(CONNECT_RETRY_DELAY_S)
+    raise RuntimeError(f"Could not connect after {CONNECT_RETRIES} attempts: {last_exc}")
+
+
+def _dump_session(conn, command: bytes, idle_timeout_s: float, deadline: float,
+                   blocks: dict, err_blocks: set) -> Tuple[bool, Optional[int]]:
+    """Runs one SDLOG DUMP/DUMP FROM session against an already-open connection, filling
+    `blocks` (block_num -> hex str) and `err_blocks` in place. Returns (completed, total_blocks) -
+    completed=True only if DUMP[END] was actually seen (a real stall/timeout returns False even
+    if every block happened to arrive, since END is what confirms the board agrees it's done)."""
     with conn as ser:
         ser.reset_input_buffer()
-        # LAST only streams the most recent flight (fast) - the card's full history
-        # only grows over time and is rarely what you actually want to re-pull.
-        ser.write(b"SDLOG DUMP\r\n" if full else b"SDLOG DUMP LAST\r\n")
+        ser.write(command)
 
-        lines: List[str] = []
         started = False
         total_blocks = None
-        blocks_done = 0
         last_progress = time.time()
         last_report = time.time()
-        deadline = time.time() + max_timeout_s
 
         while time.time() < deadline:
             raw = ser.readline()
             if not raw:
                 if started and (time.time() - last_progress) > idle_timeout_s:
                     print("Warning: no data for a while, stopping early.", file=sys.stderr)
-                    break
+                    return False, total_blocks
                 continue
 
             line = raw.decode(errors="replace").strip()
@@ -187,27 +212,73 @@ def collect_raw(port: str, baud: int, idle_timeout_s: float, max_timeout_s: floa
                 print(line)
                 continue
 
-            if BLOCK_RE.match(line) or DUMP_ERR_RE.match(line):
-                lines.append(line)
+            block_match = BLOCK_RE.match(line)
+            if block_match:
+                blocks[int(block_match.group(1))] = block_match.group(2)
                 last_progress = time.time()
-                blocks_done += 1
-                # Progress is the only sign of life during a multi-minute dump - without it,
-                # a slow-but-healthy transfer is indistinguishable from a hung one.
                 if (time.time() - last_report) > 2.0:
                     last_report = time.time()
                     if total_blocks:
-                        print(f"  ...{blocks_done}/{total_blocks} blocks", file=sys.stderr)
+                        print(f"  ...{len(blocks)}/{total_blocks} blocks", file=sys.stderr)
                     else:
-                        print(f"  ...{blocks_done} blocks", file=sys.stderr)
+                        print(f"  ...{len(blocks)} blocks", file=sys.stderr)
+                continue
+
+            err_match = DUMP_ERR_RE.match(line)
+            if err_match:
+                err_blocks.add(int(err_match.group(1)))
+                last_progress = time.time()
                 continue
 
             if DUMP_END_RE.match(line):
-                lines.append(line)
-                break
+                return True, total_blocks
 
         if not started:
             raise RuntimeError("No SDLOG_DUMP response - is the board connected and the "
                                 "firmware SD card logger built in?")
+    return False, total_blocks
+
+
+def collect_raw(port: str, baud: int, idle_timeout_s: float, max_timeout_s: float,
+                 save_raw_path: Optional[str], full: bool = False,
+                 host: Optional[str] = None, tcp_port: int = 3333) -> str:
+    # LAST only streams the most recent flight (fast) - the card's full history
+    # only grows over time and is rarely what you actually want to re-pull.
+    first_command = b"SDLOG DUMP\r\n" if full else b"SDLOG DUMP LAST\r\n"
+    blocks: dict = {}
+    err_blocks: set = set()
+    deadline = time.time() + max_timeout_s
+    command = first_command
+    completed = False
+    total_blocks = None
+
+    for resume_attempt in range(1, RESUME_ATTEMPTS + 1):
+        conn = _open_connection(port, baud, host, tcp_port)
+        completed, total_blocks = _dump_session(conn, command, idle_timeout_s, deadline,
+                                                 blocks, err_blocks)
+        if completed:
+            break
+        if time.time() >= deadline:
+            print("Warning: overall timeout reached, giving up on resuming further.",
+                  file=sys.stderr)
+            break
+        # Resume from just past the highest block actually received - a stall never skips
+        # blocks out of order, so this is safe even though a handful of blocks from an
+        # earlier failed attempt could in principle still be missing from the low end.
+        resume_block = (max(blocks) + 1) if blocks else 1
+        print(f"Stalled after {len(blocks)} blocks - resuming from block {resume_block} "
+              f"(attempt {resume_attempt + 1}/{RESUME_ATTEMPTS})...", file=sys.stderr)
+        command = f"SDLOG DUMP FROM {resume_block}\r\n".encode()
+
+    if not completed:
+        print(f"Warning: dump did not complete cleanly after {RESUME_ATTEMPTS} attempts "
+              f"({len(blocks)}/{total_blocks or '?'} blocks) - working with what was received.",
+              file=sys.stderr)
+
+    lines: List[str] = [f"SDLOG[{b}]={blocks[b]}" for b in sorted(blocks)]
+    lines.extend(f"SDLOG_DUMP[READ_ERR block={b}]" for b in sorted(err_blocks))
+    if completed:
+        lines.append("SDLOG_DUMP[END]")
 
     text = "\n".join(lines)
     if save_raw_path:
@@ -215,6 +286,32 @@ def collect_raw(port: str, baud: int, idle_timeout_s: float, max_timeout_s: floa
             f.write(text)
         print(f"Saved raw dump: {save_raw_path}")
     return text
+
+
+def erase_sdlog(port: str, baud: int, host: Optional[str], tcp_port: int) -> None:
+    """Sends SDLOG ERASE after a successful pull so the next dump only has to
+    fetch the one new flight instead of re-downloading the whole accumulated
+    history from block 1 every time (found 2026-08-21 - dumps were getting
+    slower every flight because nothing was ever clearing the card). The
+    firmware already refuses this while armed (see app.c APP_SDLOGCMD_ERASE),
+    so this is safe to fire automatically."""
+    conn = _TcpLineSource(host, tcp_port) if host else serial.Serial(port, baud, timeout=1.0)
+    with conn as ser:
+        ser.reset_input_buffer()
+        ser.write(b"SDLOG ERASE\r\n")
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            raw = ser.readline()
+            if not raw:
+                continue
+            line = raw.decode(errors="replace").strip()
+            if line == "SDLOG_ERASE[OK]":
+                print("SD card erased for next flight.")
+                return
+            if line == "SDLOG_ERASE[FAIL armed]":
+                print("Warning: SD erase skipped - board reports armed.", file=sys.stderr)
+                return
+    print("Warning: no SDLOG_ERASE response - card may not have been erased.", file=sys.stderr)
 
 
 def parse_records(text: str) -> List[dict]:
@@ -426,6 +523,12 @@ def print_summary(a: dict) -> None:
             print(f"  while commanding yaw (stick active, {int(mask_active.sum())} samples): "
                   f"tracking err rms={np.sqrt(np.mean(err_a ** 2)):.1f} peak={np.max(np.abs(err_a)):.1f}deg")
 
+        nudge_gated = (a["flags"].astype(int) & APP_SDLOG_FLAG_MAG_NUDGE_GATED) != 0
+        dev_pct = a["mag_field_dev_pct"]
+        print(f"  mag field deviation from boot ref: mean={dev_pct.mean():.1f}% max={dev_pct.max():.0f}%  "
+              f"nudge gated (interference) {100.0 * np.mean(nudge_gated):.0f}% of samples "
+              f"({int(nudge_gated.sum())}/{n})")
+
     nav_flags = a["nav_flags"].astype(int)
     nav_requested = (nav_flags & APP_SDLOG_NAV_FLAG_REQUESTED) != 0
     nav_active = (nav_flags & APP_SDLOG_NAV_FLAG_ACTIVE) != 0
@@ -568,6 +671,9 @@ def main() -> None:
     parser.add_argument("--idle-timeout", type=float, default=8.0)
     parser.add_argument("--max-timeout", type=float, default=900.0)
     parser.add_argument("--no-open", action="store_true", help="don't display the plot window(s)")
+    parser.add_argument("--no-erase", action="store_true",
+                         help="skip the automatic SDLOG ERASE after a successful pull "
+                              "(default: erase, so the next dump doesn't re-fetch the whole card)")
     args = parser.parse_args()
 
     if args.raw_in:
@@ -587,6 +693,9 @@ def main() -> None:
 
     records = parse_records(text)
     flights = segment_flights(records)
+
+    if not args.raw_in and not args.no_erase:
+        erase_sdlog(args.port, args.baud, host, args.tcp_port)
 
     if args.list:
         list_flights(records, flights)

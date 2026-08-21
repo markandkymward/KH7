@@ -178,15 +178,37 @@ static uint8_t Mag_CalSave(void)
   return 1U;
 }
 
+/* I2C1 is shared with baro.c. A timed-out transfer can leave hi2c1.State stuck
+ * (HAL refuses to start a new transfer unless State==READY), which would wedge
+ * both devices on the bus, not just this one - so recover on any failure here
+ * rather than just marking this sensor unhealthy and leaving the peripheral in
+ * a bad state for baro's next attempt too. See imu.c's IMU_SpiRecover() for the
+ * same pattern on the SPI4/IMU side (2026-08-21). */
+static void I2C1_Recover(void)
+{
+  (void)HAL_I2C_DeInit(&hi2c1);
+  (void)HAL_I2C_Init(&hi2c1);
+}
+
 static HAL_StatusTypeDef Mag_ReadRegs(uint8_t reg, uint8_t *data, uint16_t len)
 {
-  return HAL_I2C_Mem_Read(&hi2c1, QMC5883L_I2C_ADDR, reg, I2C_MEMADD_SIZE_8BIT, data, len, MAG_I2C_TIMEOUT_MS);
+  HAL_StatusTypeDef status = HAL_I2C_Mem_Read(&hi2c1, QMC5883L_I2C_ADDR, reg, I2C_MEMADD_SIZE_8BIT, data, len, MAG_I2C_TIMEOUT_MS);
+  if (status != HAL_OK)
+  {
+    I2C1_Recover();
+  }
+  return status;
 }
 
 static HAL_StatusTypeDef Mag_WriteReg(uint8_t reg, uint8_t value)
 {
   uint8_t val = value;
-  return HAL_I2C_Mem_Write(&hi2c1, QMC5883L_I2C_ADDR, reg, I2C_MEMADD_SIZE_8BIT, &val, 1U, MAG_I2C_TIMEOUT_MS);
+  HAL_StatusTypeDef status = HAL_I2C_Mem_Write(&hi2c1, QMC5883L_I2C_ADDR, reg, I2C_MEMADD_SIZE_8BIT, &val, 1U, MAG_I2C_TIMEOUT_MS);
+  if (status != HAL_OK)
+  {
+    I2C1_Recover();
+  }
+  return status;
 }
 
 HAL_StatusTypeDef Mag_Init(void)

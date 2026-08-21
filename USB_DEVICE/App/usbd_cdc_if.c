@@ -22,9 +22,11 @@
 #include "usbd_cdc_if.h"
 
 /* USER CODE BEGIN INCLUDE */
+#include "main.h"
 #include "app.h"
 #include "communications.h"
 #include "telemetry.h"
+#include "fault_record.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -568,6 +570,37 @@ void CDC_ProcessCommandLine(const char *line)
   {
     App_RequestGpsFactoryReset();
     printf("GPS_FACTORY_RESET[QUEUED]\r\n");
+    return;
+  }
+
+  if (strcmp(line, "I2C SCAN") == 0)
+  {
+    App_RequestI2c1Scan();
+    printf("I2C1_SCAN[QUEUED]\r\n");
+    return;
+  }
+
+  if (strcmp(line, "RESET STATUS") == 0)
+  {
+    volatile ResetInfo_t *reset_info = RESET_INFO;
+
+    if (reset_info->magic != RESET_INFO_MAGIC)
+    {
+      printf("RESET_STATUS[none]\r\n");
+    }
+    else
+    {
+      uint32_t flags = reset_info->reset_cause_flags;
+      printf("RESET_STATUS[boot_count=%lu cause=%s%s%s%s%s%s raw=0x%08lX]\r\n",
+             (unsigned long)reset_info->boot_count,
+             (flags & RCC_RSR_IWDG1RSTF) ? "IWDG " : "",
+             (flags & RCC_RSR_WWDG1RSTF) ? "WWDG " : "",
+             (flags & RCC_RSR_BORRSTF) ? "BOR " : "",
+             (flags & RCC_RSR_PINRSTF) ? "PIN " : "",
+             (flags & RCC_RSR_PORRSTF) ? "POR " : "",
+             (flags & RCC_RSR_SFTRSTF) ? "SOFT " : "",
+             (unsigned long)flags);
+    }
     return;
   }
 

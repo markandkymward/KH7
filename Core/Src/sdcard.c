@@ -71,6 +71,23 @@ static void SD_SpiReconfigure(uint32_t prescaler)
   (void)HAL_SPI_Init(&hspi1);
 }
 
+/* This is the most vibration-exposed SPI peripheral in the firmware (writes
+ * every ~30ms during flight, right where mechanical stress is highest), and
+ * shares the same STM32 HAL risk already found and fixed on hspi4/hi2c1: a
+ * timed-out transfer can leave the peripheral's internal state stuck at BUSY,
+ * so every subsequent call fails immediately without ever touching the bus -
+ * silently killing SD logging for the rest of the boot with zero effect on
+ * flight control (motors/receiver/disarm don't depend on write success).
+ * That matches the single most consistent symptom across this investigation:
+ * every recovered flight's SD log stops mid-armed partway through, regardless
+ * of watchdog state. A DeInit/Init on any failure clears that stuck state so
+ * a transient glitch self-heals instead of permanently wedging (2026-08-21). */
+static void SD_SpiRecover(void)
+{
+  (void)HAL_SPI_DeInit(&hspi1);
+  SD_SpiReconfigure(hspi1.Init.BaudRatePrescaler);
+}
+
 static HAL_StatusTypeDef SD_SpiTxRx(const uint8_t *tx, uint8_t *rx, uint16_t len)
 {
   uint8_t tx_fill[32];
@@ -96,6 +113,7 @@ static HAL_StatusTypeDef SD_SpiTxRx(const uint8_t *tx, uint8_t *rx, uint16_t len
                                      SD_SPI_TIMEOUT_MS);
     if (status != HAL_OK)
     {
+      SD_SpiRecover();
       return status;
     }
     offset = (uint16_t)(offset + chunk_len);

@@ -47,6 +47,48 @@
 #define APP_ARM_HOLD_MS        300U
 #define APP_BEEPER_TOGGLE_MS   150U
 #define APP_STARTUP_BEEP_MS    120U
+/* Low-battery beeper: fast triple-chirp every 2s, audibly distinct from the
+ * continuous arm-blocked toggle and the single startup-ready chirp. Warns from
+ * the aircraft's onboard piezo only - this firmware has no OSD and no
+ * bidirectional CRSF telemetry back to the transmitter, so there is no
+ * in-goggles/on-radio alert path, only what's audible near the aircraft.
+ * Threshold is 3.5V/cell: comfortably above both typical ESC low-voltage
+ * cutoff (~3.0-3.3V/cell) and the ~2.6V/cell the pack was flown down to on
+ * 2026-08-21 (10.3-10.5V on a 4S), so there's real time to land before either
+ * an ESC LVC event or genuine cell damage. Cell count is inferred once from
+ * the first post-boot reading (smallest N with N*4.25V >= reading), mirroring
+ * tools/sdlog_analyze.py's infer_nominal_battery_v(). */
+#define APP_LOW_BATTERY_WARN_CELL_V    3.5f
+#define APP_LOW_BATTERY_MAX_CHARGE_CELL_V 4.25f
+#define APP_LOW_BATTERY_BEEP_CYCLE_MS  2000U
+#define APP_LOW_BATTERY_BEEP_ON_MS     80U
+#define APP_LOW_BATTERY_BEEP_GAP_MS    160U
+/* Tiered low-battery response (2026-08-21, after a deep-discharge test flight
+ * bottomed at ~2.6V/cell with no working local warning at the time):
+ *   1. APP_LOW_BATTERY_WARN_CELL_V (3.5V/cell)     -> beeper + CRSF telemetry
+ *      alarm only, no flight-behavior change.
+ *   2. APP_LOW_BATTERY_CRITICAL_CELL_V (3.2V/cell)  -> throttle ceiling clamp
+ *      (see APP_LOW_BATTERY_THROTTLE_CEILING_US) - pilot keeps full
+ *      roll/pitch/yaw authority, but can no longer sustain hover/climb
+ *      indefinitely, forcing a gradual controlled descent instead of an
+ *      abrupt cutoff or uncontrolled ESC low-voltage-cutoff event.
+ *   3. APP_LOW_BATTERY_DISARM_CELL_V (3.0V/cell)    -> hard auto-disarm via
+ *      the existing debounced clean-disarm path (same as RX-loss/arm-switch),
+ *      as a last-resort backstop if the pilot hasn't landed by then. Still
+ *      above the ~2.6V/cell danger zone that flight reached, and above
+ *      typical ESC LVC thresholds so it should trip well before either. */
+#define APP_LOW_BATTERY_CRITICAL_CELL_V     3.2f
+#define APP_LOW_BATTERY_CRITICAL_HYST_V     0.1f /* release margin, avoids rapid on/off right at the boundary */
+#define APP_LOW_BATTERY_DISARM_CELL_V       3.0f
+/* Well above this session's observed hover throttle (~1230-1290us) so the
+ * pilot keeps meaningful climb/maneuver margin, well below APP_THROTTLE_MAX_US
+ * (1880) so aggressive full-power draws are no longer possible. */
+#define APP_LOW_BATTERY_THROTTLE_CEILING_US 1500U
+#define APP_CRSF_BATTERY_TELEM_MS      1000U /* radio-side alarm only needs a slow update rate */
+#define APP_CRSF_ATTITUDE_TELEM_MS     100U  /* ~10Hz, smooth-ish display */
+#define APP_CRSF_VARIO_TELEM_MS        200U  /* ~5Hz */
+#define APP_CRSF_FLIGHTMODE_TELEM_MS   500U  /* ~2Hz - changes rarely */
+#define APP_CRSF_GPS_TELEM_MS          500U  /* ~2Hz - position doesn't need to be fast */
 #define APP_ATTITUDE_ZERO_SETTLE_MS 2000U
 #define APP_ATTITUDE_ZERO_AVG_MS 300U
 #define APP_USB_TEST_ARM_DELAY_MS 2000U
@@ -76,7 +118,26 @@
  * ground, which otherwise makes the Vz damping term above rapidly flip sign/saturate
  * right at liftoff (audible motor thrust jitter) - suppress it until climbed clear. */
 #define APP_BARO_VZ_DAMP_MIN_ALT_M       1.0f
-/* ALTHOLD reuses ATTITUDE-mode roll/pitch/yaw angle stabilization. The pilot's raw
+/* REVERTED 2026-08-21: a same-day attempt to map the full throttle stick range to
+ * a commanded climb rate (fixing "Z axis very sensitive to throttle") caused a
+ * real in-flight uncontrolled climb. Root cause: althold_center_throttle_us is a
+ * fragile one-shot latch that can lock onto a transient, lower-than-intended
+ * value during a dynamic liftoff. In this original design that's benign - being
+ * "outside the deadband" just falls back to direct manual throttle. In the
+ * full-range redesign it meant a PERSISTENT climb-rate command with no natural
+ * way for the pilot to get back into the deadband (their normal hover throttle
+ * permanently read as "above center"). Reverted to known-safe raw-passthrough
+ * behavior. See memory kh7-althold-throttle-incident for the full writeup.
+ *
+ * Same day, separately: also widened the deadband (was 40U) and reset the
+ * hover-throttle reference fresh on every arm (see the arm-transition block
+ * above) and decoupled the reference tracking itself from the ground-effect
+ * altitude gate (see where althold_settle_ref_us/althold_center_throttle_us are
+ * updated below) - a stale/wrong reference was the most likely explanation for
+ * "altitude is very difficult to hold" even in this unmodified raw-passthrough
+ * design, independent of the incident above.
+ *
+ * ALTHOLD reuses ATTITUDE-mode roll/pitch/yaw angle stabilization. The pilot's raw
  * stick throttle is ALWAYS the primary/dominant throttle signal (exactly like
  * ATTITUDE mode) - ALTHOLD only ever ADDS a small bounded trim on top of it while
  * the stick sits near center, to hold the altitude captured the instant it
@@ -85,7 +146,7 @@
  * wound-up integral can only ever nudge the output by APP_ALTHOLD_TRIM_LIMIT_US - it
  * can never freeze the motors at idle or run away independent of the stick. Falls
  * back to plain manual throttle (like ATTITUDE mode) if the baro is unhealthy. */
-#define APP_ALTHOLD_THROTTLE_DEADBAND_US   40U
+#define APP_ALTHOLD_THROTTLE_DEADBAND_US   100U
 /* The hold-throttle reference re-latches to wherever the stick has genuinely
  * settled (within this small window) for this long - NOT just once at mode
  * entry (which can freeze on an unrepresentative value, e.g. idle throttle
@@ -207,9 +268,26 @@
  * noise on the heading itself. No gain has been flight-validated as safe yet
  * - zeroing both constants disables the nudge entirely (vector-based math and
  * sign fixes stay in place) until this gets properly tuned against real
- * flight data, not more bench guesses. */
-#define APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG 0.0f
-#define APP_MAG_YAW_NUDGE_MAX_DPS        0.0f
+ * flight data, not more bench guesses.
+ *
+ * RE-ENABLED (2026-08-19), conservative gain: the 2026-08-18 real-flight
+ * finding that motivated urgency here (a confirmed +15.3dps sustained
+ * rightward yaw-rate bias with genuinely centered stick) did NOT reproduce in
+ * a clean 100%-centered-stick 55.7s retest the same week (full-flight mean
+ * +1.29dps, wandering -3.35..+4.80dps across 5s windows - ordinary noise, not
+ * a fixed torque imbalance) - see kh7-yaw-system-state memory. That removes
+ * the "fighting a large, real, sustained disturbance" scenario the 2.5/90
+ * gain got amplified by. Picked well below that failed gain rather than
+ * re-attempting anything close to it: ~10x the original too-weak 0.05/2.0
+ * pair (which under-corrected because it saturated at just 2.0dps against
+ * real drift, not because 0.05 itself was necessarily wrong), but only ~1/5
+ * the Kp and ~1/6 the cap of the gain that amplified vibration noise. Treat
+ * this as a first real-flight data point, not a final value - re-check
+ * compass-vs-yaw tracking error (sdlog_analyze.py's mag_delta/tracking-err
+ * stats) on the next flight before trusting it further, same as every
+ * previous change to this correction. */
+#define APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG 0.5f
+#define APP_MAG_YAW_NUDGE_MAX_DPS        15.0f
 /* Slew-limits the APPLIED nudge (not the target) so it ramps smoothly even
  * across a fast target change, rather than stepping instantly - a general
  * control-loop courtesy, not a workaround (the vector-based error above has
@@ -298,6 +376,21 @@
 #define APP_RATE_KFF_PITCH_DEFAULT_US_PER_DPS_PER_S 0.00f
 #define APP_RATE_KFF_YAW_DEFAULT_US_PER_DPS_PER_S  0.00f
 #define APP_RATE_TERM_LIMIT_US      320
+/* Fallback integral clamp used when ki is too small (including exactly 0, the
+ * shipped default on all three axes as of 2026-08-20) for the normal
+ * APP_RATE_TERM_LIMIT_US/ki bound to be computed - previously the whole
+ * clamp block was skipped in that case, leaving the integral completely
+ * unbounded. Purely a numeric-safety ceiling (nowhere close to the
+ * dps*s magnitude any legitimate flight condition would reach) - if a single
+ * bad (non-finite) value ever entered the integral from an upstream glitch,
+ * an unbounded integral let it persist forever (NaN/Inf poison the running
+ * sum permanently); this makes sure the integral always has SOME bound to
+ * fall back into. Confirmed via SD log forensics 2026-08-20: pitch's rate-PID
+ * output went to exactly 0 for the remainder of a flight starting mid-flight,
+ * consistent with ki(=0) * Inf/NaN integral = NaN, (int32_t)NaN == 0 on this
+ * ARM FPU - root trigger for the initial non-finite value still not
+ * identified, see APP_PITCH_NONFINITE_DEBUG below. */
+#define APP_RATE_INTEGRAL_SAFETY_LIMIT_DPS_S 10000.0f
 #define APP_RATE_KP_MIN_US_PER_DPS  0.0f
 #define APP_RATE_KP_MAX_US_PER_DPS  4.0f
 #define APP_RATE_KI_MIN_US_PER_DPS_S 0.0f
@@ -440,6 +533,7 @@ static uint32_t g_gyro_bias_stationary_sample_count = 0U;
 static uint8_t g_gyro_bias_ready = 0U;
 
 extern ADC_HandleTypeDef hadc1;
+extern I2C_HandleTypeDef hi2c1;
 
 #define APP_BOOT_LOG_SIZE 2048U
 static char g_boot_log_buffer[APP_BOOT_LOG_SIZE];
@@ -457,6 +551,7 @@ static volatile uint8_t g_glog_dump_pending = 0U;
 static volatile uint8_t g_glog_armed_state = 0U;
 static volatile uint8_t g_gps_scan_pending = 0U;
 static volatile uint8_t g_gps_factory_reset_pending = 0U;
+static volatile uint8_t g_i2c1_scan_pending = 0U;
 /* Runtime toggle for the high-volume bench IMU/NAV telemetry stream while armed (blocking
  * UART6 writes add control-loop latency, so this defaults off/safe for real flight and is
  * only turned on for prop-off bench diagnostics via App_RequestArmedTelemetryEnabled()). */
@@ -577,11 +672,28 @@ static void App_ServiceSdCommands(void)
  * attitude transients in flight logs - no longer blocks App_Update(). */
 #define APP_SDLOG_MAGIC 0x4B484C47UL /* "KHLG" */
 #define APP_SDLOG_DECIMATION 10U /* every 10th 2ms control tick -> 50Hz log rate */
+/* How often to sync g_sdlog_next_free_block to the superblock DURING an active
+ * flight, not just at a clean disarm - see App_SdLogSaveSuperblock() call in
+ * App_Update()'s armed logging path. Without this, a crash that never reaches
+ * a clean disarm (App_SdLogFlushFlight()) leaves the superblock's next_free_block
+ * pointing at wherever the PREVIOUS flight ended - the real data from the
+ * crashed flight is still physically written to the card, but SDLOG DUMP/DUMP
+ * LAST only ever read up to next_free_block, so it's invisible, AND the next
+ * arm event resets the write cursor back to that same stale point and starts
+ * overwriting it. This bit three real incidents in one session (confirmed via
+ * manual per-block SD RBLOCK reads recovering real flight data - severe
+ * battery sag, real motor PWM - well past the stale next_free_block). 1s
+ * throttle bounds the worst-case unindexed/overwritable window to ~1s of
+ * flight instead of the entire flight; SD_WriteBlock() here is a small
+ * (512B) synchronous write, acceptable at this rate even from the armed
+ * control-loop path. */
+#define APP_SDLOG_SUPERBLOCK_SYNC_MS 1000U
 #define APP_SDLOG_FLAG_ARMED 0x01U
 #define APP_SDLOG_FLAG_MODE_SHIFT 1U
 #define APP_SDLOG_FLAG_MODE_MASK 0x06U
 #define APP_SDLOG_FLAG_LINK_ACTIVE 0x08U /* receiver_state.link_active, to tell a switch glitch apart from an RF link dropout */
 #define APP_SDLOG_FLAG_MAG_HEALTHY 0x10U
+#define APP_SDLOG_FLAG_MAG_NUDGE_GATED 0x20U /* field-deviation interference gate was suppressing the nudge this sample */
 
 #define APP_SDLOG_NAV_FLAG_REQUESTED    0x01U
 #define APP_SDLOG_NAV_FLAG_ACTIVE       0x02U
@@ -623,6 +735,7 @@ typedef struct __attribute__((packed))
   uint16_t arm_us;
   int16_t yaw_deg_x10;
   uint16_t mag_heading_x10;
+  uint8_t mag_field_dev_pct; /* |field| deviation from the boot reference, percent (see APP_MAG_TRUST_MAX_MAG_DEVIATION_FRAC) */
   /* --- GPS navigation foundation / NAV_VELOCITY_BRAKE fields (added with the
    * GPS nav phase-1 feature) --- */
   uint8_t nav_flags;             /* APP_SDLOG_NAV_FLAG_* bits */
@@ -942,6 +1055,11 @@ void App_RequestGpsScan(void)
 void App_RequestGpsFactoryReset(void)
 {
   g_gps_factory_reset_pending = 1U;
+}
+
+void App_RequestI2c1Scan(void)
+{
+  g_i2c1_scan_pending = 1U;
 }
 
 void App_RequestSdLogStatus(void)
@@ -2341,6 +2459,17 @@ void App_Update(void)
   static uint8_t startup_arm_blocked = 0U;
   static uint8_t beeper_on = 0U;
   static uint32_t last_beeper_toggle_ms = 0U;
+  static uint8_t low_battery_cells_known = 0U;
+  static uint8_t low_battery_cell_count = 0U;
+  static uint8_t low_battery_beeper_on = 0U;
+  static uint8_t low_battery_warned_once = 0U;
+  static uint8_t low_battery_critical_active = 0U; /* throttle ceiling - can release (hysteresis) if voltage recovers */
+  static uint8_t low_battery_disarm_active = 0U;   /* hard floor - one-way latch for the rest of this boot */
+  static uint32_t last_crsf_battery_telem_ms = 0U;
+  static uint32_t last_crsf_attitude_telem_ms = 0U;
+  static uint32_t last_crsf_vario_telem_ms = 0U;
+  static uint32_t last_crsf_flightmode_telem_ms = 0U;
+  static uint32_t last_crsf_gps_telem_ms = 0U;
   static uint32_t sdlog_decim_counter = 0U;
   static uint16_t roll_center_us = APP_PWM_MID_US;
   static uint16_t pitch_center_us = APP_PWM_MID_US;
@@ -2354,6 +2483,15 @@ void App_Update(void)
   static float roll_integral_dps_s = 0.0f;
   static float pitch_integral_dps_s = 0.0f;
   static float yaw_integral_dps_s = 0.0f;
+  /* Diagnostic-only, see the isfinite() checks near pitch_term_f below - not
+   * a control-behavior fix, just catches and reports which rate-PID input
+   * first goes non-finite so the actual upstream trigger can be identified
+   * (root cause not yet found as of 2026-08-20 - see kh7-yaw-system-state-
+   * adjacent notes). One report per arm session so a recurring fault doesn't
+   * flood telemetry. */
+  static uint8_t roll_nonfinite_reported = 0U;
+  static uint8_t pitch_nonfinite_reported = 0U;
+  static uint8_t yaw_nonfinite_reported = 0U;
   static float dterm_filt_roll_rate_dps = 0.0f;
   static float dterm_filt_pitch_rate_dps = 0.0f;
   static float dterm_filt_yaw_rate_dps = 0.0f;
@@ -2393,6 +2531,12 @@ void App_Update(void)
   static float mag_heading_at_ref_deg = 0.0f;
   static float mag_ref_field_g = 0.0f;
   static float mag_yaw_nudge_dps = 0.0f;
+  /* Logged to SD (see mag_field_dev_pct/APP_SDLOG_FLAG_MAG_NUDGE_GATED below)
+   * so a captured flight shows directly whether/how much the field-strength
+   * interference gate is suppressing the nudge, instead of having to infer it
+   * indirectly from noisy mag_heading_deg jumps after the fact. */
+  static uint8_t mag_field_dev_pct = 0U;
+  static uint8_t mag_nudge_gated = 0U;
   /* Reference-capture averaging state (see APP_MAG_REF_AVG_MS below) - heading is
    * circular, so this averages unit vectors (sin/cos sums), not raw degrees, to
    * avoid a wraparound-crossing average being wrong the same way a single bad
@@ -2409,6 +2553,7 @@ void App_Update(void)
   static uint32_t last_baro_sample_ms = 0U;
   static uint32_t last_baro_retry_ms = 0U;
   static uint32_t last_gps_retry_ms = 0U;
+  static uint32_t last_sdlog_superblock_sync_ms = 0U;
   static uint32_t last_mag_sample_ms = 0U;
   static uint32_t last_mag_retry_ms = 0U;
   static uint8_t liftoff_ramp_active = 0U;
@@ -2426,6 +2571,13 @@ void App_Update(void)
    * is the currently selected mode - updated wherever flight_mode is (re)computed
    * below, so it always reflects the mode switch with at most one iteration of lag. */
   static App_FlightMode_t last_known_flight_mode = APP_FLIGHT_MODE_RATE;
+  /* pitch_deg/roll_deg/yaw_deg are computed fresh inside whichever of the two
+   * IMU-read branches below actually runs this iteration, so they aren't
+   * safely readable from the single common call site the CRSF attitude
+   * telemetry send lives at - mirrors last_known_flight_mode's role above. */
+  static float last_known_pitch_deg = 0.0f;
+  static float last_known_roll_deg = 0.0f;
+  static float last_known_yaw_deg = 0.0f;
   int32_t althold_trim_us;
   uint32_t liftoff_ramp_elapsed_ms;
   float liftoff_ramp_factor;
@@ -2573,6 +2725,147 @@ void App_Update(void)
   App_ServiceSdCommands();
   App_ServiceSdLog();
 
+  /* Low-battery beeper - see APP_LOW_BATTERY_WARN_CELL_V above. Runs whether
+   * armed or disarmed; yields to the arm-blocked beeper (startup_arm_blocked)
+   * rather than fighting it for the same GPIO pin. */
+  if ((low_battery_cells_known != 0U) && (startup_arm_blocked == 0U) &&
+      (battery_voltage_filtered_v > 1.0f) &&
+      (battery_voltage_filtered_v < (((float)low_battery_cell_count) * APP_LOW_BATTERY_WARN_CELL_V)))
+  {
+    uint32_t phase_ms = now_ms % APP_LOW_BATTERY_BEEP_CYCLE_MS;
+    uint32_t slot_ms = phase_ms % (APP_LOW_BATTERY_BEEP_ON_MS + APP_LOW_BATTERY_BEEP_GAP_MS);
+    uint8_t want_on = ((phase_ms < (3U * (APP_LOW_BATTERY_BEEP_ON_MS + APP_LOW_BATTERY_BEEP_GAP_MS))) &&
+                       (slot_ms < APP_LOW_BATTERY_BEEP_ON_MS)) ? 1U : 0U;
+
+    if (want_on != low_battery_beeper_on)
+    {
+      low_battery_beeper_on = want_on;
+      HAL_GPIO_WritePin(BEEPER_GPIO_Port, BEEPER_Pin, (want_on != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    }
+    if (low_battery_warned_once == 0U)
+    {
+      low_battery_warned_once = 1U;
+      printf("LOW_BATTERY[cells=%u v=%.2f threshold=%.2f]\r\n",
+             (unsigned int)low_battery_cell_count, (double)battery_voltage_filtered_v,
+             (double)(((float)low_battery_cell_count) * APP_LOW_BATTERY_WARN_CELL_V));
+    }
+  }
+  else if (low_battery_beeper_on != 0U)
+  {
+    low_battery_beeper_on = 0U;
+    HAL_GPIO_WritePin(BEEPER_GPIO_Port, BEEPER_Pin, GPIO_PIN_RESET);
+  }
+
+  /* Common-location fallback/correction for cell-count inference - found
+   * 2026-08-21 that the two duplicated IMU-branch battery-read blocks had
+   * silently diverged (a replace_all edit only matched one of them), so
+   * whichever branch actually ran determined whether inference happened at
+   * all - if the unpatched one ran, low_battery_cells_known never got set
+   * and every tier below stayed permanently disabled all boot, with no
+   * warning, no clamp, no disarm, despite the pack reaching ~2.98V/cell.
+   * This location is NOT duplicated, runs every iteration regardless of
+   * which IMU branch executed, and both (a) catches cases where neither
+   * per-branch inference ran and (b) re-infers if the current reading is no
+   * longer plausible for the previously-inferred cell count (guards against
+   * a bad one-off first sample, a separate risk from the duplication bug). */
+  if ((low_battery_cells_known != 0U) &&
+      (battery_voltage_filtered_v > ((((float)low_battery_cell_count) * APP_LOW_BATTERY_MAX_CHARGE_CELL_V) + 1.0f)))
+  {
+    printf("LOW_BATTERY_REINFER[was_cells=%u v=%.2f]\r\n",
+           (unsigned int)low_battery_cell_count, (double)battery_voltage_filtered_v);
+    low_battery_cells_known = 0U;
+  }
+  if ((low_battery_cells_known == 0U) && (battery_voltage_valid != 0U) && (battery_voltage_filtered_v > 1.0f))
+  {
+    uint8_t cells;
+    for (cells = 1U; cells < 13U; cells++)
+    {
+      if (battery_voltage_filtered_v <= (((float)cells) * APP_LOW_BATTERY_MAX_CHARGE_CELL_V))
+      {
+        break;
+      }
+    }
+    low_battery_cell_count = cells;
+    low_battery_cells_known = 1U;
+    printf("LOW_BATTERY_CELLS[inferred=%u v=%.2f]\r\n",
+           (unsigned int)low_battery_cell_count, (double)battery_voltage_filtered_v);
+  }
+
+  /* Tiers 2/3 of the low-battery response - see the defines above for the
+   * full rationale. Evaluated here (common to every mode) so the flags are
+   * already current by the time the throttle clamp and disarm-condition
+   * checks below consume them. */
+  if ((low_battery_cells_known != 0U) && (battery_voltage_filtered_v > 1.0f))
+  {
+    float critical_v = ((float)low_battery_cell_count) * APP_LOW_BATTERY_CRITICAL_CELL_V;
+    float critical_release_v = critical_v + (((float)low_battery_cell_count) * APP_LOW_BATTERY_CRITICAL_HYST_V);
+
+    if (low_battery_critical_active == 0U)
+    {
+      if (battery_voltage_filtered_v < critical_v)
+      {
+        low_battery_critical_active = 1U;
+        printf("LOW_BATTERY_CRITICAL[on v=%.2f threshold=%.2f]\r\n",
+               (double)battery_voltage_filtered_v, (double)critical_v);
+      }
+    }
+    else if (battery_voltage_filtered_v >= critical_release_v)
+    {
+      low_battery_critical_active = 0U;
+      printf("LOW_BATTERY_CRITICAL[off v=%.2f]\r\n", (double)battery_voltage_filtered_v);
+    }
+
+    if ((low_battery_disarm_active == 0U) &&
+        (battery_voltage_filtered_v < (((float)low_battery_cell_count) * APP_LOW_BATTERY_DISARM_CELL_V)))
+    {
+      low_battery_disarm_active = 1U;
+      printf("LOW_BATTERY_DISARM[triggered v=%.2f]\r\n", (double)battery_voltage_filtered_v);
+    }
+  }
+
+  if (battery_voltage_valid != 0U &&
+      ((now_ms - last_crsf_battery_telem_ms) >= APP_CRSF_BATTERY_TELEM_MS))
+  {
+    Receiver_SendBatteryTelemetry(battery_voltage_filtered_v);
+    last_crsf_battery_telem_ms = now_ms;
+  }
+
+  /* Remaining iNav-compatible CRSF telemetry frames, at roughly iNav's own
+   * rates (attitude fast/smooth, GPS/flight-mode slow since they change
+   * rarely) - see the frame builder comments in receiver.c for exact wire
+   * format sourcing. */
+  if ((now_ms - last_crsf_attitude_telem_ms) >= APP_CRSF_ATTITUDE_TELEM_MS)
+  {
+    /* Roll negated here only - confirmed inverted on the EdgeTX iNav widget's
+     * display 2026-08-21 (this FC's own roll_deg sign convention is otherwise
+     * unrelated to and independently correct for flight control; this flip is
+     * purely to match what the telemetry display expects). Pitch/yaw matched
+     * fine, so left as-is (pitch was initially misreported as reversed and
+     * flipped, then corrected back once roll was identified as the actual
+     * culprit). */
+    Receiver_SendAttitudeTelemetry(last_known_pitch_deg, -last_known_roll_deg, last_known_yaw_deg);
+    last_crsf_attitude_telem_ms = now_ms;
+  }
+
+  if ((now_ms - last_crsf_vario_telem_ms) >= APP_CRSF_VARIO_TELEM_MS)
+  {
+    Receiver_SendVarioTelemetry(Baro_GetClimbRateMps());
+    last_crsf_vario_telem_ms = now_ms;
+  }
+
+  if ((now_ms - last_crsf_flightmode_telem_ms) >= APP_CRSF_FLIGHTMODE_TELEM_MS)
+  {
+    Receiver_SendFlightModeTelemetry(App_FlightModeName(last_known_flight_mode));
+    last_crsf_flightmode_telem_ms = now_ms;
+  }
+
+  if ((now_ms - last_crsf_gps_telem_ms) >= APP_CRSF_GPS_TELEM_MS)
+  {
+    Receiver_SendGpsTelemetry(GPS_GetLatitudeDeg(), GPS_GetLongitudeDeg(), GPS_GetAltitudeM(),
+                              GPS_GetGroundSpeedMps(), GPS_GetCourseDeg(), GPS_GetNumSatellites());
+    last_crsf_gps_telem_ms = now_ms;
+  }
+
   if ((now_ms - last_baro_sample_ms) >= APP_BARO_UPDATE_MS)
   {
     if ((Baro_IsInitialized() == 0U) && ((now_ms - last_baro_retry_ms) >= APP_BARO_RETRY_MS))
@@ -2624,6 +2917,39 @@ void App_Update(void)
        * handshake on the very next iteration, at whatever baud the scan
        * settled huart3 on. */
       last_gps_retry_ms = 0U;
+    }
+  }
+
+  if (g_i2c1_scan_pending != 0U)
+  {
+    g_i2c1_scan_pending = 0U;
+    if (g_glog_armed_state != 0U)
+    {
+      printf("I2C1_SCAN[FAIL armed]\r\n");
+    }
+    else
+    {
+      /* Raw 7-bit address sweep of I2C1 (shared by mag.c's QMC5883L at 0x0D
+       * and baro.c's SPL06-family chip at 0x76/0x77) - answers "is the address
+       * wrong" directly instead of inferring it from FAIL/chip_id=0xFF, which
+       * is ambiguous (0xFF is also the QMC5883L's genuine chip-ID value, and
+       * also g_last_chip_id's untouched default - see mag.c). Skips the
+       * reserved 0x00-0x07/0x78-0x7F ranges per the I2C spec. Added 2026-08-21
+       * after the mag (and later baro, on the same bus) went unresponsive
+       * post-crash. */
+      uint8_t addr7;
+      uint8_t found_count = 0U;
+      printf("I2C1_SCAN[start]\r\n");
+      for (addr7 = 0x08U; addr7 <= 0x77U; addr7++)
+      {
+        if (HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(addr7 << 1), 2U, 5U) == HAL_OK)
+        {
+          printf("I2C1_SCAN[found addr7=0x%02X addr8=0x%02X]\r\n", (unsigned int)addr7,
+                 (unsigned int)(addr7 << 1));
+          found_count++;
+        }
+      }
+      printf("I2C1_SCAN[done count=%u]\r\n", (unsigned int)found_count);
     }
   }
 
@@ -2739,6 +3065,20 @@ void App_Update(void)
         {
           battery_voltage_filtered_v = battery_voltage_v;
           battery_voltage_valid = 1U;
+
+          if ((low_battery_cells_known == 0U) && (battery_voltage_v > 1.0f))
+          {
+            uint8_t cells;
+            for (cells = 1U; cells < 13U; cells++)
+            {
+              if (battery_voltage_v <= (((float)cells) * APP_LOW_BATTERY_MAX_CHARGE_CELL_V))
+              {
+                break;
+              }
+            }
+            low_battery_cell_count = cells;
+            low_battery_cells_known = 1U;
+          }
         }
         else
         {
@@ -2854,6 +3194,9 @@ void App_Update(void)
       roll_deg = Attitude_WrapAngle180(roll_deg - startup_roll_offset_deg);
       pitch_deg = Attitude_WrapAngle180(pitch_deg - startup_pitch_offset_deg);
       yaw_deg = Attitude_WrapAngle180(yaw_deg - startup_yaw_offset_deg);
+      last_known_pitch_deg = pitch_deg;
+      last_known_roll_deg = roll_deg;
+      last_known_yaw_deg = yaw_deg;
 
       /* Compute the next iteration's slow yaw drift-correction nudge here (see
        * APP_MAG_YAW_NUDGE_* above) - compares the compass's own rotation-since-ref
@@ -3063,7 +3406,7 @@ void App_Update(void)
         HAL_GPIO_WritePin(BEEPER_GPIO_Port, BEEPER_Pin, GPIO_PIN_RESET);
       }
 
-      if ((receiver_state.link_active == 0U) || (arm_switch_high == 0U))
+      if ((receiver_state.link_active == 0U) || (arm_switch_high == 0U) || (low_battery_disarm_active != 0U))
       {
         if (disarm_condition_active == 0U)
         {
@@ -3080,7 +3423,8 @@ void App_Update(void)
           ((now_ms - disarm_condition_start_ms) >= APP_DISARM_DEBOUNCE_MS))
       {
         uint8_t was_armed = motors_armed;
-        const char *disarm_reason = (receiver_state.link_active == 0U) ? "RX_LINK_LOST" : "ARM_SWITCH_LOW";
+        const char *disarm_reason = (receiver_state.link_active == 0U) ? "RX_LINK_LOST" :
+                                    (arm_switch_high == 0U) ? "ARM_SWITCH_LOW" : "LOW_BATTERY";
 
         motors_armed = 0U;
         g_glog_armed_state = 0U;
@@ -3106,6 +3450,9 @@ void App_Update(void)
         pitch_integral_dps_s = 0.0f;
         yaw_integral_dps_s = 0.0f;
         pid_state_initialized = 0U;
+        roll_nonfinite_reported = 0U;
+        pitch_nonfinite_reported = 0U;
+        yaw_nonfinite_reported = 0U;
         nav_brake_active = 0U;
         nav_brake_disqualified_latch = 0U;
 
@@ -3163,6 +3510,24 @@ void App_Update(void)
             g_glog_count = 0U;
             g_glog_capturing = 1U;
             App_SdLogArmStart();
+            /* Reset ALTHOLD's hover-throttle reference fresh on every arm - these
+             * are `static` and previously carried over unchanged from whatever the
+             * last flight (possibly a different battery/loadout, hours earlier)
+             * left them at. A stale reference here was the root cause of a real
+             * uncontrolled-climb incident (2026-08-21) and is also the most likely
+             * explanation for altitude being "very difficult to hold" even in the
+             * unmodified raw-passthrough design - if the reference is wrong, the
+             * pilot may rarely/never land inside the deadband long enough to
+             * actually engage hold. APP_PWM_MID_US is just a safe, predictable,
+             * known-neutral starting point - the settle-latch (now untouched by
+             * this reset) re-converges it to the real hover throttle within
+             * APP_ALTHOLD_STICK_SETTLE_MS of the stick settling, same as always. */
+            althold_center_throttle_us = APP_PWM_MID_US;
+            althold_settle_ref_us = (uint16_t)throttle_us;
+            althold_settle_start_ms = now_ms;
+            althold_holding = 0U;
+            althold_integral_us = 0.0f;
+            althold_trim_filtered_us = 0.0f;
           }
         }
         else
@@ -3388,29 +3753,59 @@ void App_Update(void)
         pitch_integral_dps_s += pitch_rate_error_dps * dt_s;
         yaw_integral_dps_s += yaw_rate_error_dps * dt_s;
 
-        if (active_pid_gains.roll.ki > 0.000001f)
+        /* App_ClampFloat() alone cannot recover an already-non-finite value -
+         * NaN fails both its comparisons and passes straight through unchanged
+         * - so a NaN/Inf that reaches the integral needs an explicit isfinite()
+         * reset here, not just a magnitude bound, or it stays poisoned forever
+         * regardless of the clamp below. */
+        if (isfinite(roll_integral_dps_s) == 0)
         {
-          integral_limit_roll = ((float)APP_RATE_TERM_LIMIT_US) / active_pid_gains.roll.ki;
-          roll_integral_dps_s = App_ClampFloat(roll_integral_dps_s, -integral_limit_roll, integral_limit_roll);
+          roll_integral_dps_s = 0.0f;
         }
+        integral_limit_roll = (active_pid_gains.roll.ki > 0.000001f) ?
+                              (((float)APP_RATE_TERM_LIMIT_US) / active_pid_gains.roll.ki) :
+                              APP_RATE_INTEGRAL_SAFETY_LIMIT_DPS_S;
+        roll_integral_dps_s = App_ClampFloat(roll_integral_dps_s, -integral_limit_roll, integral_limit_roll);
 
-        if (active_pid_gains.pitch.ki > 0.000001f)
+        if (isfinite(pitch_integral_dps_s) == 0)
         {
-          integral_limit_pitch = ((float)APP_RATE_TERM_LIMIT_US) / active_pid_gains.pitch.ki;
-          pitch_integral_dps_s = App_ClampFloat(pitch_integral_dps_s, -integral_limit_pitch, integral_limit_pitch);
+          pitch_integral_dps_s = 0.0f;
         }
+        integral_limit_pitch = (active_pid_gains.pitch.ki > 0.000001f) ?
+                               (((float)APP_RATE_TERM_LIMIT_US) / active_pid_gains.pitch.ki) :
+                               APP_RATE_INTEGRAL_SAFETY_LIMIT_DPS_S;
+        pitch_integral_dps_s = App_ClampFloat(pitch_integral_dps_s, -integral_limit_pitch, integral_limit_pitch);
 
-        if (active_pid_gains.yaw.ki > 0.000001f)
+        if (isfinite(yaw_integral_dps_s) == 0)
         {
-          integral_limit_yaw = ((float)APP_RATE_TERM_LIMIT_US) / active_pid_gains.yaw.ki;
-          yaw_integral_dps_s = App_ClampFloat(yaw_integral_dps_s, -integral_limit_yaw, integral_limit_yaw);
+          yaw_integral_dps_s = 0.0f;
         }
+        integral_limit_yaw = (active_pid_gains.yaw.ki > 0.000001f) ?
+                             (((float)APP_RATE_TERM_LIMIT_US) / active_pid_gains.yaw.ki) :
+                             APP_RATE_INTEGRAL_SAFETY_LIMIT_DPS_S;
+        yaw_integral_dps_s = App_ClampFloat(yaw_integral_dps_s, -integral_limit_yaw, integral_limit_yaw);
 
         /* D term uses its own low-pass-filtered rate signal so raw gyro noise/spikes don't kick it. */
         dterm_lpf_alpha = App_LpfAlpha(dt_s, APP_DTERM_LPF_HZ);
         dterm_filt_roll_rate_dps += dterm_lpf_alpha * (measured_roll_rate_dps - dterm_filt_roll_rate_dps);
         dterm_filt_pitch_rate_dps += dterm_lpf_alpha * (measured_pitch_rate_dps - dterm_filt_pitch_rate_dps);
         dterm_filt_yaw_rate_dps += dterm_lpf_alpha * (measured_yaw_rate_dps - dterm_filt_yaw_rate_dps);
+
+        /* Same permanent-poisoning risk as the integrals above - these are also
+         * running EMA accumulators (x += alpha*(new-x)), so one non-finite
+         * input keeps them non-finite forever after with no other recovery path. */
+        if (isfinite(dterm_filt_roll_rate_dps) == 0)
+        {
+          dterm_filt_roll_rate_dps = measured_roll_rate_dps;
+        }
+        if (isfinite(dterm_filt_pitch_rate_dps) == 0)
+        {
+          dterm_filt_pitch_rate_dps = measured_pitch_rate_dps;
+        }
+        if (isfinite(dterm_filt_yaw_rate_dps) == 0)
+        {
+          dterm_filt_yaw_rate_dps = measured_yaw_rate_dps;
+        }
 
         roll_rate_derivative_dps_per_s = -(dterm_filt_roll_rate_dps - prev_dterm_filt_roll_rate_dps) / dt_s;
         pitch_rate_derivative_dps_per_s = -(dterm_filt_pitch_rate_dps - prev_dterm_filt_pitch_rate_dps) / dt_s;
@@ -3425,6 +3820,19 @@ void App_Update(void)
         ff_filt_cmd_roll_rate_dps += ff_lpf_alpha * (cmd_roll_rate_dps - ff_filt_cmd_roll_rate_dps);
         ff_filt_cmd_pitch_rate_dps += ff_lpf_alpha * (cmd_pitch_rate_dps - ff_filt_cmd_pitch_rate_dps);
         ff_filt_cmd_yaw_rate_dps += ff_lpf_alpha * (cmd_yaw_rate_dps - ff_filt_cmd_yaw_rate_dps);
+
+        if (isfinite(ff_filt_cmd_roll_rate_dps) == 0)
+        {
+          ff_filt_cmd_roll_rate_dps = cmd_roll_rate_dps;
+        }
+        if (isfinite(ff_filt_cmd_pitch_rate_dps) == 0)
+        {
+          ff_filt_cmd_pitch_rate_dps = cmd_pitch_rate_dps;
+        }
+        if (isfinite(ff_filt_cmd_yaw_rate_dps) == 0)
+        {
+          ff_filt_cmd_yaw_rate_dps = cmd_yaw_rate_dps;
+        }
 
         roll_rate_ff_dps_per_s = (ff_filt_cmd_roll_rate_dps - prev_ff_filt_cmd_roll_rate_dps) / dt_s;
         pitch_rate_ff_dps_per_s = (ff_filt_cmd_pitch_rate_dps - prev_ff_filt_cmd_pitch_rate_dps) / dt_s;
@@ -3447,6 +3855,38 @@ void App_Update(void)
                      (active_pid_gains.yaw.kd * yaw_rate_derivative_dps_per_s) +
                      (active_pid_gains.yaw.kff * yaw_rate_ff_dps_per_s);
 
+        /* Diagnostic only - identifies which specific upstream value first went
+         * non-finite, once per arm session, without changing control behavior
+         * (the isfinite() resets above already keep the integral/filter states
+         * themselves safe regardless of whether this fires). Checked in
+         * causal order: the two raw rate inputs first (pins it to either the
+         * attitude/command side or the gyro/measurement side), then each of
+         * the four term contributors. */
+        if ((pitch_nonfinite_reported == 0U) && (isfinite(pitch_term_f) == 0))
+        {
+          pitch_nonfinite_reported = 1U;
+          printf("PID_NONFINITE[axis=pitch cmd=%.2f meas=%.2f err=%.2f int=%.2f deriv=%.2f ff=%.2f term_f=%.2f t=%lu]\r\n",
+                 (double)cmd_pitch_rate_dps, (double)measured_pitch_rate_dps, (double)pitch_rate_error_dps,
+                 (double)pitch_integral_dps_s, (double)pitch_rate_derivative_dps_per_s,
+                 (double)pitch_rate_ff_dps_per_s, (double)pitch_term_f, (unsigned long)now_ms);
+        }
+        if ((roll_nonfinite_reported == 0U) && (isfinite(roll_term_f) == 0))
+        {
+          roll_nonfinite_reported = 1U;
+          printf("PID_NONFINITE[axis=roll cmd=%.2f meas=%.2f err=%.2f int=%.2f deriv=%.2f ff=%.2f term_f=%.2f t=%lu]\r\n",
+                 (double)cmd_roll_rate_dps, (double)measured_roll_rate_dps, (double)roll_rate_error_dps,
+                 (double)roll_integral_dps_s, (double)roll_rate_derivative_dps_per_s,
+                 (double)roll_rate_ff_dps_per_s, (double)roll_term_f, (unsigned long)now_ms);
+        }
+        if ((yaw_nonfinite_reported == 0U) && (isfinite(yaw_term_f) == 0))
+        {
+          yaw_nonfinite_reported = 1U;
+          printf("PID_NONFINITE[axis=yaw cmd=%.2f meas=%.2f err=%.2f int=%.2f deriv=%.2f ff=%.2f term_f=%.2f t=%lu]\r\n",
+                 (double)cmd_yaw_rate_dps, (double)measured_yaw_rate_dps, (double)yaw_rate_error_dps,
+                 (double)yaw_integral_dps_s, (double)yaw_rate_derivative_dps_per_s,
+                 (double)yaw_rate_ff_dps_per_s, (double)yaw_term_f, (unsigned long)now_ms);
+        }
+
         /* Higher pack voltage yields more real thrust/torque per PID microsecond,
          * so scale authority down (or up on sag) to keep response consistent. */
         voltage_comp_factor = (battery_voltage_valid != 0U) ?
@@ -3460,17 +3900,17 @@ void App_Update(void)
         yaw_term = App_ClampControlTerm((int32_t)yaw_term_f, APP_RATE_TERM_LIMIT_US);
         baro_healthy_now = Baro_IsHealthy();
         althold_trim_us = 0;
-        if (((flight_mode == APP_FLIGHT_MODE_ALTHOLD) || (flight_mode == APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE)) &&
-            (baro_healthy_now != 0U) &&
-            (Baro_GetAltitudeM() >= APP_BARO_VZ_DAMP_MIN_ALT_M))
+        if ((flight_mode == APP_FLIGHT_MODE_ALTHOLD) || (flight_mode == APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE))
         {
-          /* Also gated on altitude (same APP_BARO_VZ_DAMP_MIN_ALT_M ground-effect
-           * threshold already used for baro Vz damping above) - without this, a
-           * brief natural pause in the pilot's throttle push during liftoff/climb-
-           * out (routine - throttle is rarely pushed in one perfectly smooth
-           * motion) could satisfy the settle timer and latch a hold target while
-           * altitude/climb-rate readings are still ground-effect-noisy, producing
-           * a jumpy unwanted correction right at liftoff instead of a clean climb. */
+          /* Hover-throttle reference tracking runs UNCONDITIONALLY in ALTHOLD/
+           * NAVBRAKE now (decoupled from the altitude/baro-health gate below on
+           * 2026-08-21) - this only watches the pilot's stick, it never touches
+           * the baro, so ground-effect noise has no bearing on it. Previously this
+           * was gated the same as the trim computation, which meant the reference
+           * could go stale for an entire low-altitude liftoff and then suddenly
+           * get used against a real trim correction the instant altitude cleared
+           * the gate - root cause of a real uncontrolled-climb incident. See
+           * memory kh7-althold-throttle-incident for the full writeup. */
           /* Re-latch the hover-throttle reference to wherever the stick has
            * genuinely SETTLED (stayed within a small window for a while), not
            * a fixed APP_PWM_MID_US=1500 (real hover throttle is wherever this
@@ -3478,7 +3918,9 @@ void App_Update(void)
            * nowhere near mid-stick) and not just once at mode entry (which can
            * freeze on an unrepresentative value like idle throttle before
            * liftoff, and then never update again once the stick moves outside
-           * the deadband of that bad reference). */
+           * the deadband of that bad reference). Also reset fresh on every arm
+           * (see the arm-transition block above) so it can't carry a stale value
+           * across flights either. */
           throttle_offset_us = (int32_t)throttle_us - (int32_t)althold_settle_ref_us;
           if ((throttle_offset_us > (int32_t)APP_ALTHOLD_STICK_STABLE_WINDOW_US) ||
               (throttle_offset_us < -(int32_t)APP_ALTHOLD_STICK_STABLE_WINDOW_US))
@@ -3493,8 +3935,19 @@ void App_Update(void)
 
           throttle_offset_us = (int32_t)throttle_us - (int32_t)althold_center_throttle_us;
           if ((throttle_offset_us > -(int32_t)APP_ALTHOLD_THROTTLE_DEADBAND_US) &&
-              (throttle_offset_us < (int32_t)APP_ALTHOLD_THROTTLE_DEADBAND_US))
+              (throttle_offset_us < (int32_t)APP_ALTHOLD_THROTTLE_DEADBAND_US) &&
+              (baro_healthy_now != 0U) &&
+              (Baro_GetAltitudeM() >= APP_BARO_VZ_DAMP_MIN_ALT_M))
           {
+            /* Centered AND clear of ground effect (same APP_BARO_VZ_DAMP_MIN_ALT_M
+             * threshold used for baro Vz damping below) - this is the only gate
+             * that still depends on altitude/baro health, and only guards the
+             * actual trim correction, not the reference tracking above. Without
+             * some ground-effect gate here, a brief natural pause in the pilot's
+             * throttle push during liftoff/climb-out (routine) could latch a hold
+             * target while altitude/climb-rate readings are still noisy, producing
+             * a jumpy unwanted correction right at liftoff instead of a clean
+             * climb. */
             if (althold_holding == 0U)
             {
               althold_target_alt_m = Baro_GetAltitudeM();
@@ -3519,11 +3972,13 @@ void App_Update(void)
           }
           else
           {
-            /* Pilot is actively commanding a climb/descend - give full manual
-             * authority over raw throttle_us, no hold trim fighting the stick.
-             * The settle-tracking above will re-latch althold_center_throttle_us
-             * once the stick genuinely stops here, so hold resumes at the new
-             * altitude without needing to return to the old reference. */
+            /* Either off-center (pilot actively commanding a climb/descend - full
+             * manual authority over raw throttle_us, no hold trim fighting the
+             * stick) or centered but too low/baro-unhealthy for a trustworthy
+             * correction. Either way, no trim. The settle-tracking above will
+             * re-latch althold_center_throttle_us once the stick genuinely stops
+             * here, so hold resumes at the new altitude without needing to
+             * return to the old reference. */
             althold_holding = 0U;
             althold_integral_us = 0.0f;
           }
@@ -3564,9 +4019,15 @@ void App_Update(void)
         {
           throttle_term = APP_MOTOR_IDLE_US;
         }
+        /* Tier 2 of the low-battery response (see APP_LOW_BATTERY_CRITICAL_CELL_V
+         * above): lower the ceiling instead of the floor, so pitch/roll/yaw
+         * authority and the idle floor are completely unaffected - only the
+         * ability to sustain a high-power climb/hover is removed. */
         throttle_term = App_ClampInt32(throttle_term,
                                        (int32_t)APP_MOTOR_IDLE_US,
-                                       (int32_t)APP_THROTTLE_MAX_US);
+                                       (low_battery_critical_active != 0U) ?
+                                         (int32_t)APP_LOW_BATTERY_THROTTLE_CEILING_US :
+                                         (int32_t)APP_THROTTLE_MAX_US);
 
         /* Keep startup spool-up symmetric: suppress attitude/yaw correction
          * very close to idle so one motor does not start noticeably earlier. */
@@ -3579,6 +4040,9 @@ void App_Update(void)
           pitch_integral_dps_s = 0.0f;
           yaw_integral_dps_s = 0.0f;
           pid_state_initialized = 0U;
+          roll_nonfinite_reported = 0U;
+          pitch_nonfinite_reported = 0U;
+          yaw_nonfinite_reported = 0U;
           liftoff_ramp_active = 1U;
           liftoff_ramp_start_ms = now_ms;
         }
@@ -3695,7 +4159,8 @@ void App_Update(void)
           sdlog_rec.flags = (uint8_t)(APP_SDLOG_FLAG_ARMED |
                                       (((uint8_t)flight_mode << APP_SDLOG_FLAG_MODE_SHIFT) & APP_SDLOG_FLAG_MODE_MASK) |
                                       ((receiver_state.link_active != 0U) ? APP_SDLOG_FLAG_LINK_ACTIVE : 0U) |
-                                      ((Mag_IsHealthy() != 0U) ? APP_SDLOG_FLAG_MAG_HEALTHY : 0U));
+                                      ((Mag_IsHealthy() != 0U) ? APP_SDLOG_FLAG_MAG_HEALTHY : 0U) |
+                                      ((mag_nudge_gated != 0U) ? APP_SDLOG_FLAG_MAG_NUDGE_GATED : 0U));
           sdlog_rec.pitch_deg_x10 = (int16_t)(pitch_deg * 10.0f);
           sdlog_rec.roll_deg_x10 = (int16_t)(roll_deg * 10.0f);
           /* target_roll/pitch_deg are only meaningful (set this iteration) in an angle-mode branch. */
@@ -3717,6 +4182,7 @@ void App_Update(void)
           sdlog_rec.arm_us = arm_us;
           sdlog_rec.yaw_deg_x10 = (int16_t)(yaw_deg * 10.0f);
           sdlog_rec.mag_heading_x10 = (uint16_t)(Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg) * 10.0f);
+          sdlog_rec.mag_field_dev_pct = mag_field_dev_pct;
 
           sdlog_rec.nav_flags = (uint8_t)((nav_brake_requested != 0U ? APP_SDLOG_NAV_FLAG_REQUESTED : 0U) |
                                           (nav_brake_active != 0U ? APP_SDLOG_NAV_FLAG_ACTIVE : 0U) |
@@ -3759,6 +4225,13 @@ void App_Update(void)
           {
             App_SdLogAppendRecord(&sdlog_rec);
           }
+
+          if ((now_ms - last_sdlog_superblock_sync_ms) >= APP_SDLOG_SUPERBLOCK_SYNC_MS)
+          {
+            g_sdlog_next_free_block = g_sdlog_flight_next_block;
+            App_SdLogSaveSuperblock();
+            last_sdlog_superblock_sync_ms = now_ms;
+          }
         }
       }
     }
@@ -3799,6 +4272,20 @@ void App_Update(void)
       {
         battery_voltage_filtered_v = battery_voltage_v;
         battery_voltage_valid = 1U;
+
+        if ((low_battery_cells_known == 0U) && (battery_voltage_v > 1.0f))
+        {
+          uint8_t cells;
+          for (cells = 1U; cells < 13U; cells++)
+          {
+            if (battery_voltage_v <= (((float)cells) * APP_LOW_BATTERY_MAX_CHARGE_CELL_V))
+            {
+              break;
+            }
+          }
+          low_battery_cell_count = cells;
+          low_battery_cells_known = 1U;
+        }
       }
       else
       {
@@ -3921,6 +4408,9 @@ void App_Update(void)
     roll_deg = Attitude_WrapAngle180(roll_deg - startup_roll_offset_deg);
     pitch_deg = Attitude_WrapAngle180(pitch_deg - startup_pitch_offset_deg);
     yaw_deg = Attitude_WrapAngle180(yaw_deg - startup_yaw_offset_deg);
+    last_known_pitch_deg = pitch_deg;
+    last_known_roll_deg = roll_deg;
+    last_known_yaw_deg = yaw_deg;
 
     /* Compute the next iteration's slow yaw drift-correction nudge here (see
      * APP_MAG_YAW_NUDGE_* above) - compares the compass's own rotation-since-ref
@@ -3930,6 +4420,14 @@ void App_Update(void)
       float mag_field_now_g = sqrtf((Mag_GetXGauss() * Mag_GetXGauss()) +
                                      (Mag_GetYGauss() * Mag_GetYGauss()) +
                                      (Mag_GetZGauss() * Mag_GetZGauss()));
+
+      if (mag_ref_field_g > 0.01f)
+      {
+        float dev_frac = fabsf(mag_field_now_g - mag_ref_field_g) / mag_ref_field_g;
+        float dev_pct_f = dev_frac * 100.0f;
+
+        mag_field_dev_pct = (uint8_t)((dev_pct_f > 255.0f) ? 255.0f : dev_pct_f);
+      }
 
       if (mag_yaw_ref_captured == 0U)
       {
@@ -3952,11 +4450,13 @@ void App_Update(void)
           mag_yaw_ref_captured = 1U;
           mag_yaw_nudge_dps = 0.0f;
         }
+        mag_nudge_gated = 0U;
       }
       else if ((mag_ref_field_g > 0.01f) &&
                (fabsf(mag_field_now_g - mag_ref_field_g) / mag_ref_field_g > APP_MAG_TRUST_MAX_MAG_DEVIATION_FRAC))
       {
         mag_yaw_nudge_dps = 0.0f; /* field strength shifted too much - likely motor/ESC current interference */
+        mag_nudge_gated = 1U;
       }
       else
       {
@@ -3977,6 +4477,7 @@ void App_Update(void)
 
         mag_yaw_nudge_dps += App_ClampFloat(mag_yaw_nudge_target_dps - mag_yaw_nudge_dps,
                                              -mag_yaw_nudge_max_step_dps, mag_yaw_nudge_max_step_dps);
+        mag_nudge_gated = 0U;
       }
     }
     else
@@ -3984,8 +4485,12 @@ void App_Update(void)
       mag_yaw_nudge_dps = 0.0f;
     }
 
-    /* Stream while disarmed, or while armed with bench telemetry toggled on. */
+    /* Stream while disarmed, or while armed with bench telemetry toggled on -
+     * but not while an SDLOG DUMP is draining, since this bundle competes with
+     * the dump's own block lines for the same UART6 link and was found
+     * (2026-08-21) to badly slow down post-crash log recovery. */
     if ((APP_ENABLE_IMU_RUNTIME_TELEMETRY || (g_armed_test_telemetry_enabled != 0U) || (motors_armed == 0U)) &&
+        (g_sdlog_dump_active == 0U) &&
         ((now_ms - last_imu_telemetry_ms) >= APP_IMU_TELEMETRY_MS))
     {
       Telemetry_PrintImuState(ax_g,

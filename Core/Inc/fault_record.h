@@ -27,4 +27,26 @@ typedef struct __attribute__((packed))
 
 #define FAULT_RECORD ((volatile FaultRecord_t *)FAULT_RECORD_ADDR)
 
+/* Every boot's RCC->RSR reset-cause flags (IWDG/WWDG/BOR/PIN/POR/SOFT), stashed
+ * in RAM_D3 unconditionally - not just on a crash - so "RESET STATUS" can
+ * answer "why did the last boot happen" on demand, even when nobody had a
+ * terminal open live and main.c's one-time boot printf was never seen. Added
+ * 2026-08-21 chasing repeated in-flight hangs that leave the SD log stopped
+ * mid-armed with no disarm ever recorded: a hard brown-out reset (BOR) from a
+ * battery-sag-under-load event would produce exactly that signature and is a
+ * genuine STM32-silicon-level failure mode, entirely independent of IWDG -
+ * see watchdog_disabled.md. Placed well clear of FAULT_RECORD_ADDR (used up to
+ * ~40 bytes) and below APP_BLACKBOX_RING_ADDR (0x38000200) in app.c. */
+#define RESET_INFO_ADDR  0x38000080UL
+#define RESET_INFO_MAGIC 0x524B5354u /* 'RKST' */
+
+typedef struct __attribute__((packed))
+{
+  uint32_t magic;
+  uint32_t reset_cause_flags; /* RCC->RSR from the boot that just happened */
+  uint32_t boot_count;        /* increments every boot since RAM_D3 last lost power */
+} ResetInfo_t;
+
+#define RESET_INFO ((volatile ResetInfo_t *)RESET_INFO_ADDR)
+
 #endif /* FAULT_RECORD_H */

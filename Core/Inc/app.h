@@ -66,6 +66,7 @@ void App_RequestSdLogDumpLast(void);
 void App_RequestSdLogDumpFrom(uint32_t block);
 void App_RequestGpsScan(void);
 void App_RequestGpsFactoryReset(void);
+void App_RequestI2c1Scan(void);
 void App_RequestSdLogErase(void);
 void App_RequestArmedTelemetryEnabled(uint8_t enabled);
 void App_PrintArmedTelemetryStatus(void);
