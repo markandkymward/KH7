@@ -17,6 +17,11 @@ void Attitude_GetBoardAnglesDeg(float *pitch_deg,
                                 float *roll_deg,
                                 float *yaw_deg);
 float Attitude_WrapAngle180(float angle_deg);
+/* Net (gravity-removed) earth-frame vertical acceleration in m/s^2, positive
+ * = accelerating upward - see the doc comment at its definition in
+ * attitude.c. Uses the CURRENT AHRS attitude estimate internally, so call
+ * this after Attitude_UpdateIMU() for the same sample. */
+float Attitude_GetVerticalAccelMps2(float ax_g, float ay_g, float az_g);
 
 #ifdef __cplusplus
 }

@@ -343,6 +343,14 @@ void Telemetry_PrintMagState(uint8_t healthy,
          (long)z_mg);
 }
 
+void Telemetry_PrintMagTiltState(float tilt_roll_deg, float tilt_pitch_deg)
+{
+  int32_t roll_d10 = (int32_t)(tilt_roll_deg * 10.0f);
+  int32_t pitch_d10 = (int32_t)(tilt_pitch_deg * 10.0f);
+
+  printf("MAGTILT[roll_x10 pitch_x10]=[%ld %ld]\r\n", (long)roll_d10, (long)pitch_d10);
+}
+
 void Telemetry_PrintNavState(uint8_t valid,
                              uint8_t reference_valid,
                              uint8_t invalid_reason,

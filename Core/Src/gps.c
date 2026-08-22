@@ -387,8 +387,18 @@ HAL_StatusTypeDef GPS_Init(void)
   g_last_msg_acked = msg_acked;
   g_last_rate_acked = rate_acked;
   /* CFG-RATE failing is not fatal (module still works at its default 1Hz) - don't
-   * gate g_configured on it, just report it via GPS_GetLastRateAcked() for diagnostics. */
-  g_configured = (uint8_t)((prt_acked != 0U) && (msg_acked != 0U));
+   * gate g_configured on it, just report it via GPS_GetLastRateAcked() for diagnostics.
+   * CFG-PRT given the same treatment 2026-08-21 after the HGLRC M100 Pro (a newer
+   * u-blox-M10-class module, replacing the SoloGood M10-180C this payload was
+   * originally written against) never ACKed it while still correctly ACKing
+   * CFG-MSG on the same link - a firmware quirk on this specific module, not a
+   * comms failure (round-trip UBX ACK/NACK demonstrably works via CFG-MSG, and
+   * "SD RBLOCK"/GPS_ScanBaud() confirms real UBX frames at 115200, this module's
+   * documented default - so the port is very likely already exactly what CFG-PRT
+   * was asking for, which is plausibly why it saw no state change to ACK). Still
+   * sent every init for modules that DO need/honor it; just no longer required
+   * for g_configured, matching the CFG-RATE precedent above. */
+  g_configured = (msg_acked != 0U);
   return (g_configured != 0U) ? HAL_OK : HAL_ERROR;
 }
 

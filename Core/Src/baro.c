@@ -41,10 +41,34 @@
  * right after init/power-up, before altitude/climb-rate readings are trusted. */
 #define BARO_GROUND_REF_SAMPLES  50U
 
-/* Climb-rate low-pass cutoff - smooths BMP280 sample-to-sample pressure noise
- * (amplified by differentiation) without lagging a real climb/descent too much. */
-#define BARO_VZ_LPF_HZ           2.0f
 #define BARO_ALT_LPF_HZ          5.0f
+
+/* Propwash-induced altitude bias, as a function of motor PWM above idle -
+ * bench-characterized 2026-08-21 (restrained ground run, props on, secured
+ * stationary): a real, systematic ~8m APPARENT altitude drop appeared as
+ * throttle rose from idle to ~1420us, confirmed via a quadratic least-squares
+ * fit (n=240 armed samples) - meaningfully better residual than a linear fit
+ * (43% lower SSE), consistent with an aerodynamic effect scaling roughly with
+ * airspeed/RPM^2 rather than linearly with PWM. Subtracted from the raw
+ * altitude before filtering, same "compensate the raw measurement" approach
+ * used for the magnetometer's motor-current fix in mag.c. */
+#define BARO_PROPWASH_ALT_A_M_PER_US2 -0.0000000245759f
+#define BARO_PROPWASH_ALT_B_M_PER_US  -0.0000134765f
+#define BARO_PROPWASH_ALT_C_M          -0.001635f
+
+/* Complementary filter time constant for climb rate: fuses accelerometer-
+ * integrated vertical velocity (fast/low-lag short-term response, but drifts
+ * over time from accel bias/integration error) with the baro-derived raw
+ * climb rate (accurate long-term/DC, but noisy - differentiating a noisy
+ * altitude signal amplifies that noise, and low-pass-filtering the result
+ * alone trades noise for lag). This is the standard technique used across
+ * real flight controllers for exactly this reason - added 2026-08-21 after a
+ * restrained ground run showed the pure-baro-derivative approach swinging
+ * wildly (over 1000cm/s peak-to-peak) even while completely stationary.
+ * Larger tau = more accel-trust/less baro-correction (smoother but slower to
+ * correct accel drift); smaller tau = more baro-trust (noisier but tighter
+ * long-term accuracy). A few seconds is a typical, reasonable starting point. */
+#define BARO_VZ_COMPL_FILTER_TAU_S 2.0f
 
 typedef struct
 {
@@ -265,7 +289,7 @@ HAL_StatusTypeDef Baro_Init(void)
   return HAL_OK;
 }
 
-HAL_StatusTypeDef Baro_Update(void)
+HAL_StatusTypeDef Baro_Update(float motor_power_delta_us, float vertical_accel_mps2)
 {
   uint8_t raw[6];
   int32_t raw_p;
@@ -274,6 +298,7 @@ HAL_StatusTypeDef Baro_Update(void)
   float t_sc;
   double pressure_pa;
   float altitude_m;
+  float propwash_bias_m;
   float dt_s;
   float alpha;
   uint32_t now_ms;
@@ -318,6 +343,14 @@ HAL_StatusTypeDef Baro_Update(void)
 
   altitude_m = 44330.0f * (1.0f - powf((float)(pressure_pa / (double)g_ground_pressure_pa), 0.1902949571836346f));
 
+  /* Propwash compensation - subtract the bench-characterized bias from the
+   * RAW altitude before any filtering, same as the mag.c motor-current fix -
+   * see the constants' comment above. */
+  propwash_bias_m = (BARO_PROPWASH_ALT_A_M_PER_US2 * motor_power_delta_us * motor_power_delta_us) +
+                     (BARO_PROPWASH_ALT_B_M_PER_US * motor_power_delta_us) +
+                     BARO_PROPWASH_ALT_C_M;
+  altitude_m -= propwash_bias_m;
+
   dt_s = ((float)(now_ms - g_last_update_ms)) * 0.001f;
   if (dt_s < 0.001f)
   {
@@ -329,9 +362,14 @@ HAL_StatusTypeDef Baro_Update(void)
 
   if (g_have_prev_alt != 0U)
   {
+    /* Complementary filter: accelerometer-integrated vertical velocity for
+     * fast/low-lag short-term response, corrected toward the raw
+     * baro-derived climb rate (noisy, but accurate long-term/DC) at a rate
+     * set by BARO_VZ_COMPL_FILTER_TAU_S - see that constant's comment. */
     float raw_vz_mps = (altitude_m - g_prev_alt_m) / dt_s;
-    float vz_alpha = Baro_LpfAlpha(dt_s, BARO_VZ_LPF_HZ);
-    g_vz_filt_mps += vz_alpha * (raw_vz_mps - g_vz_filt_mps);
+    float compl_alpha = BARO_VZ_COMPL_FILTER_TAU_S / (BARO_VZ_COMPL_FILTER_TAU_S + dt_s);
+    float vz_predicted_mps = g_vz_filt_mps + (vertical_accel_mps2 * dt_s);
+    g_vz_filt_mps = (compl_alpha * vz_predicted_mps) + ((1.0f - compl_alpha) * raw_vz_mps);
   }
   g_prev_alt_m = altitude_m;
   g_have_prev_alt = 1U;

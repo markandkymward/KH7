@@ -27,21 +27,40 @@ float Mag_GetZGauss(void);
  * reference attitude. Reduces to the old flat atan2(X,Y) formula exactly at
  * roll=pitch=0. See mag.c for the mounting-orientation derivation and the one
  * remaining unverified assumption (magnetometer Z-axis sign - Z was never
- * referenced before this, only X/Y). */
-float Mag_GetHeadingDeg(float roll_deg, float pitch_deg);
+ * referenced before this, only X/Y).
+ *
+ * motor_power_delta_us: average commanded motor PWM minus idle (e.g.
+ * s1..s4_us averaged, minus APP_MOTOR_IDLE_US) - compensates a real,
+ * bench-characterized motor-current-induced heading bias (see mag.c). Pass
+ * 0.0f if unknown/not applicable (disarmed, no motor context). */
+float Mag_GetHeadingDeg(float roll_deg, float pitch_deg, float motor_power_delta_us);
 
-/* Hard/soft-iron calibration: call Mag_CalStart(), slowly rotate the vehicle
- * a full 360 degrees in yaw (kept level), then call Mag_CalStop() - it computes
- * offset/scale from the recorded min/max and saves to flash. Mag_CalStop()
- * does a blocking flash erase (~1-2s) - caller must not invoke it while armed. */
+/* Full 3D (X/Y/Z) hard/soft-iron calibration: call Mag_CalStart(), then
+ * physically tumble the vehicle through a variety of orientations for several
+ * seconds - NOT just a flat 360-degree yaw spin, it needs real roll/pitch
+ * tilting too so all three axes sweep their full range (Mag_CalStop() rejects
+ * the capture if any single axis didn't move enough - see
+ * MAG_CAL_MIN_RANGE_GAUSS in mag.c). Then call Mag_CalStop() - it fits a
+ * general ellipsoid (least squares over every sample collected, not just
+ * per-axis min/max) to get a center point and a full 3x3 soft-iron correction
+ * matrix, corrects for cross-axis coupling that a simple independent
+ * per-axis offset/scale cannot (see the version-4 flash comment in mag.c -
+ * bench data showed real heading errors up to ~90deg without this).
+ * Mag_CalStop() does a blocking flash erase (~1-2s) - caller must not invoke
+ * it while armed. */
 void Mag_CalStart(void);
 uint8_t Mag_CalStop(void);
 uint8_t Mag_IsCalActive(void);
 uint8_t Mag_IsCalibrated(void);
-float Mag_GetCalOffsetX(void);
-float Mag_GetCalOffsetY(void);
-float Mag_GetCalScaleX(void);
-float Mag_GetCalScaleY(void);
+float Mag_GetCalCenterX(void);
+float Mag_GetCalCenterY(void);
+float Mag_GetCalCenterZ(void);
+float Mag_GetCalMatrixXX(void);
+float Mag_GetCalMatrixYY(void);
+float Mag_GetCalMatrixZZ(void);
+float Mag_GetCalMatrixXY(void);
+float Mag_GetCalMatrixXZ(void);
+float Mag_GetCalMatrixYZ(void);
 
 #ifdef __cplusplus
 }

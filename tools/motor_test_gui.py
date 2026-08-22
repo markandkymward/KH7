@@ -1,4 +1,5 @@
 import json
+import math
 import queue
 import re
 import socket
@@ -43,7 +44,9 @@ MAG_LINE_RE = re.compile(
 MAG_INIT_LINE_RE = re.compile(r"MAG_INIT\[(OK|FAIL) chip_id=0x([0-9A-Fa-f]{2})\]")
 MAG_CAL_STARTED_RE = re.compile(r"MAG_CAL\[STARTED\]")
 MAG_CAL_OK_RE = re.compile(
-    r"MAG_CAL\[OK ox=(-?\d*\.?\d+) oy=(-?\d*\.?\d+) sx=(-?\d*\.?\d+) sy=(-?\d*\.?\d+)\]"
+    r"MAG_CAL\[OK cx=(-?\d*\.?\d+) cy=(-?\d*\.?\d+) cz=(-?\d*\.?\d+) "
+    r"wxx=(-?\d*\.?\d+) wyy=(-?\d*\.?\d+) wzz=(-?\d*\.?\d+) "
+    r"wxy=(-?\d*\.?\d+) wxz=(-?\d*\.?\d+) wyz=(-?\d*\.?\d+)\]"
 )
 MAG_CAL_FAIL_RE = re.compile(r"MAG_CAL\[FAIL([^\]]*)\]")
 NAV_LINE_RE = re.compile(
@@ -256,6 +259,16 @@ class Kh7GroundGui:
         self.mag_init_var = tk.StringVar(value="Mag init: waiting for boot message")
         self.mag_cal_status_var = tk.StringVar(value="Compass cal: not calibrated")
         self.mag_cal_active = False
+        # Orientation-coverage feedback during calibration (ArduPilot-style
+        # "cover the sphere" grid) - divides directions into a longitude x
+        # latitude grid and marks a cell filled once a raw MAG sample's
+        # direction falls in it. Uses RAW (uncalibrated) direction, which is
+        # all that's needed for coverage purposes - the point is to confirm
+        # you've physically pointed the sensor across the whole sphere, not
+        # to validate calibration accuracy itself.
+        self.MAG_CAL_LON_BINS = 12
+        self.MAG_CAL_LAT_BINS = 6
+        self.mag_cal_coverage = set()  # set of (lon_bin, lat_bin) tuples covered so far
 
         # Primary GPS line, styled after the field tester's display: just fix/sats/hAcc,
         # the fields that actually answer "is GPS usable right now" at a glance.
@@ -569,6 +582,16 @@ class Kh7GroundGui:
         ttk.Label(sensor_box, textvariable=self.mag_cal_status_var, foreground="#9aa6b2", wraplength=220).grid(
             row=6, column=4, columnspan=2, sticky="w", padx=(10, 4), pady=(0, 4)
         )
+        self.mag_cal_canvas = tk.Canvas(
+            sensor_box, width=224, height=112, bg="#1e1e1e", highlightthickness=1,
+            highlightbackground="#3a3a3a",
+        )
+        self.mag_cal_canvas.grid(row=7, column=4, columnspan=2, sticky="w", padx=(10, 4), pady=(0, 6))
+        self.mag_cal_coverage_var = tk.StringVar(value="")
+        ttk.Label(sensor_box, textvariable=self.mag_cal_coverage_var, foreground="#9aa6b2").grid(
+            row=8, column=4, columnspan=2, sticky="w", padx=(10, 4), pady=(0, 4)
+        )
+        self._redraw_mag_cal_coverage()
 
         # Layout mirrors the field tester display: one prominent GPS status line
         # (fix/sats/hAcc - "is GPS usable right now"), then Position/Velocity, then
@@ -2250,6 +2273,11 @@ class Kh7GroundGui:
             self.mag_heading_var.set(f"{heading_deg:.1f}")
             self._append_samples([("mag_heading", heading_deg)])
             self._redraw_strip_chart("mag")
+            if self.mag_cal_active:
+                mag_x = int(m_mag.group(3))
+                mag_y = int(m_mag.group(4))
+                mag_z = int(m_mag.group(5))
+                self._update_mag_cal_coverage(float(mag_x), float(mag_y), float(mag_z))
             return
 
         m_mag_init = MAG_INIT_LINE_RE.search(line)
@@ -2261,20 +2289,36 @@ class Kh7GroundGui:
             return
 
         if MAG_CAL_STARTED_RE.search(line) is not None:
-            self.mag_cal_status_var.set("Rotating... slowly spin 360 deg flat, then click Stop & Save")
+            self.mag_cal_status_var.set(
+                "Rotating... slowly TUMBLE through all orientations (not just a flat "
+                "spin - tilt/roll it too) until the grid below fills in green, then "
+                "click Stop & Save"
+            )
             return
 
         m_mag_cal_ok = MAG_CAL_OK_RE.search(line)
         if m_mag_cal_ok is not None:
-            ox, oy, sx, sy = m_mag_cal_ok.groups()
-            self.mag_cal_status_var.set(f"Calibrated OK (offset={ox},{oy} scale={sx},{sy})")
+            cx, cy, cz, wxx, wyy, wzz, wxy, wxz, wyz = m_mag_cal_ok.groups()
+            self.mag_cal_status_var.set(
+                f"Calibrated OK (center={cx},{cy},{cz} "
+                f"matrix diag={wxx},{wyy},{wzz} off-diag={wxy},{wxz},{wyz})"
+            )
             self.mag_cal_active = False
             self.mag_cal_button.configure(text="Calibrate")
             return
 
         m_mag_cal_fail = MAG_CAL_FAIL_RE.search(line)
         if m_mag_cal_fail is not None:
-            self.mag_cal_status_var.set(f"Calibration FAILED{m_mag_cal_fail.group(1)}")
+            reason = m_mag_cal_fail.group(1)
+            if "range_too_small" in reason:
+                reason = (
+                    " - not started, one axis (X/Y/Z) didn't sweep enough range, too few "
+                    "samples collected, or the fit was numerically degenerate. Make sure "
+                    "you're actually TILTING it through multiple orientations for several "
+                    "seconds (not just spinning flat) - Z needs real roll/pitch motion, and "
+                    "the fit needs a good number of samples spread across many orientations."
+                )
+            self.mag_cal_status_var.set(f"Calibration FAILED{reason}")
             self.mag_cal_active = False
             self.mag_cal_button.configure(text="Calibrate")
             return
@@ -2593,11 +2637,54 @@ class Kh7GroundGui:
             self.mag_cal_active = True
             self.mag_cal_button.configure(text="Stop & Save")
             self.mag_cal_status_var.set("Cal starting...")
+            self.mag_cal_coverage.clear()
+            self._redraw_mag_cal_coverage()
         else:
             self.send_command("MAG CAL STOP")
             self.mag_cal_active = False
             self.mag_cal_button.configure(text="Calibrate")
             self.mag_cal_status_var.set("Stopping, computing...")
+
+    def _update_mag_cal_coverage(self, x: float, y: float, z: float) -> None:
+        """Marks the orientation-coverage cell for a raw (uncalibrated) MAG
+        sample's direction. Only meaningful while a calibration is active -
+        caller is expected to check that first."""
+        mag = math.sqrt((x * x) + (y * y) + (z * z))
+        if mag < 1e-6:
+            return
+        lat = math.asin(max(-1.0, min(1.0, z / mag)))  # -pi/2..pi/2
+        lon = math.atan2(y, x)  # -pi..pi
+        lon_bin = int(((lon + math.pi) / (2 * math.pi)) * self.MAG_CAL_LON_BINS) % self.MAG_CAL_LON_BINS
+        lat_bin = int(((lat + (math.pi / 2)) / math.pi) * self.MAG_CAL_LAT_BINS)
+        lat_bin = max(0, min(self.MAG_CAL_LAT_BINS - 1, lat_bin))
+        cell = (lon_bin, lat_bin)
+        if cell not in self.mag_cal_coverage:
+            self.mag_cal_coverage.add(cell)
+            self._redraw_mag_cal_coverage()
+
+    def _redraw_mag_cal_coverage(self) -> None:
+        canvas = self.mag_cal_canvas
+        canvas.delete("all")
+        w = 224
+        h = 112
+        cell_w = w / self.MAG_CAL_LON_BINS
+        cell_h = h / self.MAG_CAL_LAT_BINS
+        total = self.MAG_CAL_LON_BINS * self.MAG_CAL_LAT_BINS
+        for lon_bin in range(self.MAG_CAL_LON_BINS):
+            for lat_bin in range(self.MAG_CAL_LAT_BINS):
+                x0 = lon_bin * cell_w
+                y0 = lat_bin * cell_h
+                covered = (lon_bin, lat_bin) in self.mag_cal_coverage
+                fill = "#3ddc71" if covered else "#3a3a3a"
+                canvas.create_rectangle(
+                    x0, y0, x0 + cell_w, y0 + cell_h,
+                    fill=fill, outline="#1e1e1e",
+                )
+        pct = (100 * len(self.mag_cal_coverage) / total) if total else 0.0
+        self.mag_cal_coverage_var.set(
+            f"Orientation coverage: {pct:.0f}% ({len(self.mag_cal_coverage)}/{total} cells) - "
+            "tumble to fill in the gray areas"
+        )
 
     def _on_pid_field_edited(self, *_args) -> None:
         # Fires on every StringVar .set(), including our own programmatic updates from

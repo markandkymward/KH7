@@ -2321,9 +2321,10 @@ static void App_ProcessPendingMagCalCommand(void)
 
   if (Mag_CalStop() != 0U)
   {
-    printf("MAG_CAL[OK ox=%.4f oy=%.4f sx=%.4f sy=%.4f]\r\n",
-           (double)Mag_GetCalOffsetX(), (double)Mag_GetCalOffsetY(),
-           (double)Mag_GetCalScaleX(), (double)Mag_GetCalScaleY());
+    printf("MAG_CAL[OK cx=%.4f cy=%.4f cz=%.4f wxx=%.4f wyy=%.4f wzz=%.4f wxy=%.4f wxz=%.4f wyz=%.4f]\r\n",
+           (double)Mag_GetCalCenterX(), (double)Mag_GetCalCenterY(), (double)Mag_GetCalCenterZ(),
+           (double)Mag_GetCalMatrixXX(), (double)Mag_GetCalMatrixYY(), (double)Mag_GetCalMatrixZZ(),
+           (double)Mag_GetCalMatrixXY(), (double)Mag_GetCalMatrixXZ(), (double)Mag_GetCalMatrixYZ());
   }
   else
   {
@@ -2531,6 +2532,25 @@ void App_Update(void)
   static float mag_heading_at_ref_deg = 0.0f;
   static float mag_ref_field_g = 0.0f;
   static float mag_yaw_nudge_dps = 0.0f;
+  /* Motor current (proxy: avg motor PWM above idle) feeds Mag_GetHeadingDeg()'s
+   * power-induced heading compensation - see mag.c. Updated once, right after
+   * motor mixing below (the only non-duplicated place all 4 motor outputs are
+   * known this iteration); read by every Mag_GetHeadingDeg() call site
+   * regardless of which of the two IMU-processing branches is active this
+   * pass, so it's always at most one iteration stale - negligible for a
+   * signal this slow-varying. Bench-characterized 2026-08-21: real, repeatable,
+   * reversible ~0.05deg heading shift per us of motor PWM above idle (props on,
+   * secured stationary, ~10deg observed at hover power - see mag.c). */
+  static float g_avg_motor_power_delta_us = 0.0f;
+  /* Most recent raw accelerometer reading (g's), updated right after each
+   * Attitude_UpdateIMU() call in either IMU-processing branch below - used to
+   * feed Attitude_GetVerticalAccelMps2() for the baro climb-rate
+   * complementary filter (see baro.c) at the Baro_Update() call site, which
+   * runs on its own separate schedule (not necessarily every IMU sample), so
+   * it needs a persisted "latest" value rather than a purely local one. */
+  static float g_last_ax_g = 0.0f;
+  static float g_last_ay_g = 0.0f;
+  static float g_last_az_g = 1.0f;
   /* Logged to SD (see mag_field_dev_pct/APP_SDLOG_FLAG_MAG_NUDGE_GATED below)
    * so a captured flight shows directly whether/how much the field-strength
    * interference gate is suppressing the nudge, instead of having to infer it
@@ -2880,7 +2900,8 @@ void App_Update(void)
       }
       last_baro_retry_ms = now_ms;
     }
-    (void)Baro_Update();
+    (void)Baro_Update(g_avg_motor_power_delta_us,
+                      Attitude_GetVerticalAccelMps2(g_last_ax_g, g_last_ay_g, g_last_az_g));
     last_baro_sample_ms = now_ms;
   }
 
@@ -3142,6 +3163,9 @@ void App_Update(void)
                          ay_g,
                          az_g,
                          ((float)APP_CONTROL_LOOP_MS) * 0.001f);
+      g_last_ax_g = ax_g;
+      g_last_ay_g = ay_g;
+      g_last_az_g = az_g;
       Attitude_GetBoardAnglesDeg(&pitch_deg, &roll_deg, &yaw_deg);
       mag_tilt_roll_deg = roll_deg;
       mag_tilt_pitch_deg = pitch_deg;
@@ -3209,7 +3233,7 @@ void App_Update(void)
 
         if (mag_yaw_ref_captured == 0U)
         {
-          float heading_now_rad = Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg) * RAD_PER_DEG;
+          float heading_now_rad = Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg, g_avg_motor_power_delta_us) * RAD_PER_DEG;
 
           if (mag_ref_avg_sample_count == 0U)
           {
@@ -3236,7 +3260,21 @@ void App_Update(void)
         }
         else
         {
-          float mag_delta_deg = Attitude_WrapAngle180(Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg) - mag_heading_at_ref_deg);
+          /* Negated 2026-08-21: bench-verified with real MAG+IMU telemetry that
+           * Mag_GetHeadingDeg()'s delta and yaw_deg's delta moved in OPPOSITE
+           * directions for the same physical rotation (magDelta +360deg vs
+           * yawDelta -257deg over the same turn - rms tracking error 90deg,
+           * peak 179.9deg, essentially maximally divergent, not just noisy).
+           * This nudge's sign was very likely tuned against the OLD, since-fixed
+           * mounting-rotation bug (see mag.c) that made the compass run
+           * backwards - now that the compass correctly increases with CW
+           * rotation, the nudge's assumed sign is mismatched again. Flipping
+           * mag_delta_deg here (not yaw_deg, which NAVBRAKE/telemetry/SD log all
+           * also depend on, and not Mag_GetHeadingDeg(), which is bench-verified
+           * correct against true rotation direction and magnetic north) is the
+           * minimal, localized fix. Re-verify with a fresh bench MAG+IMU capture
+           * before trusting this in flight. */
+          float mag_delta_deg = -Attitude_WrapAngle180(Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg, g_avg_motor_power_delta_us) - mag_heading_at_ref_deg);
           /* Cross-product-style error: sin() of the angle difference, not the
            * difference itself - matches a plain error for small angles (sin(x) ~= x
            * near 0) but tapers smoothly to zero at the antipodal point instead of a
@@ -3281,7 +3319,8 @@ void App_Update(void)
         Telemetry_PrintGpsState(GPS_IsConfigured(), GPS_IsHealthy(), GPS_GetFixType(), GPS_GetNumSatellites(),
                                GPS_GetLatitudeDeg(), GPS_GetLongitudeDeg(), GPS_GetAltitudeM());
         Telemetry_PrintMagState(Mag_IsHealthy(), Mag_GetXGauss(), Mag_GetYGauss(), Mag_GetZGauss(),
-                               Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg));
+                               Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg, g_avg_motor_power_delta_us));
+        Telemetry_PrintMagTiltState(mag_tilt_roll_deg, mag_tilt_pitch_deg);
         Telemetry_PrintNavState(nav_state.valid, nav_state.reference_valid, (uint8_t)nav_state.invalid_reason,
                                nav_state.fix_type, nav_state.num_sv, nav_state.h_acc_m,
                                nav_state.age_ms, nav_state.update_period_ms,
@@ -4134,6 +4173,9 @@ void App_Update(void)
         s3_us = App_ClampPulseUs(m_rear_right);
         s4_us = App_ClampPulseUs(m_rear_left);
 
+        g_avg_motor_power_delta_us = (((float)s1_us + (float)s2_us + (float)s3_us + (float)s4_us) * 0.25f) -
+                                     (float)APP_MOTOR_IDLE_US;
+
         /* Physical channels map as: CH1=LA, CH2=LF, CH3=RA, CH4=RF. */
         Motors_WriteUs(s4_us, s1_us, s3_us, s2_us);
 
@@ -4181,7 +4223,7 @@ void App_Update(void)
           sdlog_rec.throttle_actual_us = (int16_t)throttle_term;
           sdlog_rec.arm_us = arm_us;
           sdlog_rec.yaw_deg_x10 = (int16_t)(yaw_deg * 10.0f);
-          sdlog_rec.mag_heading_x10 = (uint16_t)(Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg) * 10.0f);
+          sdlog_rec.mag_heading_x10 = (uint16_t)(Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg, g_avg_motor_power_delta_us) * 10.0f);
           sdlog_rec.mag_field_dev_pct = mag_field_dev_pct;
 
           sdlog_rec.nav_flags = (uint8_t)((nav_brake_requested != 0U ? APP_SDLOG_NAV_FLAG_REQUESTED : 0U) |
@@ -4356,6 +4398,9 @@ void App_Update(void)
                        ay_g,
                        az_g,
                        dt_s);
+    g_last_ax_g = ax_g;
+    g_last_ay_g = ay_g;
+    g_last_az_g = az_g;
     Attitude_GetBoardAnglesDeg(&pitch_deg, &roll_deg, &yaw_deg);
     mag_tilt_roll_deg = roll_deg;
     mag_tilt_pitch_deg = pitch_deg;
@@ -4431,7 +4476,7 @@ void App_Update(void)
 
       if (mag_yaw_ref_captured == 0U)
       {
-        float heading_now_rad = Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg) * RAD_PER_DEG;
+        float heading_now_rad = Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg, g_avg_motor_power_delta_us) * RAD_PER_DEG;
 
         if (mag_ref_avg_sample_count == 0U)
         {
@@ -4460,7 +4505,21 @@ void App_Update(void)
       }
       else
       {
-        float mag_delta_deg = Attitude_WrapAngle180(Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg) - mag_heading_at_ref_deg);
+        /* Negated 2026-08-21: bench-verified with real MAG+IMU telemetry that
+         * Mag_GetHeadingDeg()'s delta and yaw_deg's delta moved in OPPOSITE
+         * directions for the same physical rotation (magDelta +360deg vs
+         * yawDelta -257deg over the same turn - rms tracking error 90deg,
+         * peak 179.9deg, essentially maximally divergent, not just noisy).
+         * This nudge's sign was very likely tuned against the OLD, since-fixed
+         * mounting-rotation bug (see mag.c) that made the compass run
+         * backwards - now that the compass correctly increases with CW
+         * rotation, the nudge's assumed sign is mismatched again. Flipping
+         * mag_delta_deg here (not yaw_deg, which NAVBRAKE/telemetry/SD log all
+         * also depend on, and not Mag_GetHeadingDeg(), which is bench-verified
+         * correct against true rotation direction and magnetic north) is the
+         * minimal, localized fix. Re-verify with a fresh bench MAG+IMU capture
+         * before trusting this in flight. */
+        float mag_delta_deg = -Attitude_WrapAngle180(Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg, g_avg_motor_power_delta_us) - mag_heading_at_ref_deg);
         /* Cross-product-style error: sin() of the angle difference, not the
          * difference itself - matches a plain error for small angles (sin(x) ~= x
          * near 0) but tapers smoothly to zero at the antipodal point instead of a
@@ -4510,7 +4569,8 @@ void App_Update(void)
       Telemetry_PrintGpsState(GPS_IsConfigured(), GPS_IsHealthy(), GPS_GetFixType(), GPS_GetNumSatellites(),
                              GPS_GetLatitudeDeg(), GPS_GetLongitudeDeg(), GPS_GetAltitudeM());
       Telemetry_PrintMagState(Mag_IsHealthy(), Mag_GetXGauss(), Mag_GetYGauss(), Mag_GetZGauss(),
-                             Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg));
+                             Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg, g_avg_motor_power_delta_us));
+      Telemetry_PrintMagTiltState(mag_tilt_roll_deg, mag_tilt_pitch_deg);
       Telemetry_PrintNavState(nav_state.valid, nav_state.reference_valid, (uint8_t)nav_state.invalid_reason,
                              nav_state.fix_type, nav_state.num_sv, nav_state.h_acc_m,
                              nav_state.age_ms, nav_state.update_period_ms,

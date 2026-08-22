@@ -189,6 +189,43 @@ void Attitude_UpdateIMU(float gx_rad_s,
   }
 }
 
+/* Net (gravity-removed) EARTH-frame vertical acceleration, in m/s^2,
+ * positive = accelerating upward. Added 2026-08-21 to feed a baro/accel
+ * complementary filter for climb rate (see Baro_Update()) - baro-derived
+ * climb rate alone is noisy (differentiation amplifies sample noise) and
+ * laggy (needs filtering to tame that noise, which adds delay); accelerometer
+ * integration is fast/low-lag short-term but drifts long-term, so blending
+ * the two (baro correcting the accel-integration drift) is standard practice
+ * and beats either alone.
+ *
+ * (g_x,g_y,g_z) below is the EXACT same "expected gravity direction in body
+ * frame" vector already computed in Attitude_GetBoardAnglesDeg() (and, before
+ * normalization, in Attitude_UpdateIMU()'s Mahony correction step) - for a
+ * unit vector v_body representing the earth Z axis expressed in body
+ * coordinates, the dot product v_body . a_body extracts exactly the
+ * earth-frame vertical component of any body-frame vector a_body, by the
+ * standard rotation-matrix-transpose identity (no separate matrix multiply or
+ * quaternion exposure needed - this reuses the same underlying math the
+ * attitude estimate itself depends on, so it can't disagree with it). Result
+ * is in g's until the final unit conversion; a level, stationary board reads
+ * ~1.0g "up" (accelerometer's normal reaction to gravity), so 1.0f is
+ * subtracted to get the NET (dynamic, non-gravity) component only. */
+float Attitude_GetVerticalAccelMps2(float ax_g, float ay_g, float az_g)
+{
+  float g_x;
+  float g_y;
+  float g_z;
+  float up_g;
+
+  g_x = 2.0f * ((g_ahrs.q1 * g_ahrs.q3) - (g_ahrs.q0 * g_ahrs.q2));
+  g_y = 2.0f * ((g_ahrs.q0 * g_ahrs.q1) + (g_ahrs.q2 * g_ahrs.q3));
+  g_z = (g_ahrs.q0 * g_ahrs.q0) - (g_ahrs.q1 * g_ahrs.q1) - (g_ahrs.q2 * g_ahrs.q2) + (g_ahrs.q3 * g_ahrs.q3);
+
+  up_g = (g_x * ax_g) + (g_y * ay_g) + (g_z * az_g);
+
+  return (up_g - 1.0f) * 9.80665f;
+}
+
 void Attitude_GetBoardAnglesDeg(float *pitch_deg,
                                 float *roll_deg,
                                 float *yaw_deg)

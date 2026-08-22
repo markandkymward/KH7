@@ -27,6 +27,7 @@
 #include "communications.h"
 #include "telemetry.h"
 #include "fault_record.h"
+#include "mag.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -475,6 +476,17 @@ void CDC_ProcessCommandLine(const char *line)
   {
     App_RequestMagCalStop();
     printf("MAG_CAL[QUEUED stop]\r\n");
+    return;
+  }
+
+  if (strcmp(line, "MAG CAL STATUS") == 0)
+  {
+    printf("MAG_CAL_STATUS[calibrated=%u cx=%.4f cy=%.4f cz=%.4f "
+           "wxx=%.4f wyy=%.4f wzz=%.4f wxy=%.4f wxz=%.4f wyz=%.4f]\r\n",
+           (unsigned int)Mag_IsCalibrated(),
+           (double)Mag_GetCalCenterX(), (double)Mag_GetCalCenterY(), (double)Mag_GetCalCenterZ(),
+           (double)Mag_GetCalMatrixXX(), (double)Mag_GetCalMatrixYY(), (double)Mag_GetCalMatrixZZ(),
+           (double)Mag_GetCalMatrixXY(), (double)Mag_GetCalMatrixXZ(), (double)Mag_GetCalMatrixYZ());
     return;
   }
 

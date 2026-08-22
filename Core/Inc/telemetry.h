@@ -52,6 +52,14 @@ void Telemetry_PrintMagState(uint8_t healthy,
 							 float y_g,
 							 float z_g,
 							 float heading_deg);
+/* Debug-only: the PRE-attitude-zero-offset roll/pitch actually fed into
+ * Mag_GetHeadingDeg() (mag_tilt_roll_deg/mag_tilt_pitch_deg in app.c) - NOT
+ * the same as the post-offset pitch/roll in IMU[...]. Added 2026-08-21 for
+ * bench mounting-rotation re-derivation work, where reconstructing the exact
+ * firmware heading computation from telemetry alone was unreliable without
+ * this (the post-offset IMU values don't match what Mag_GetHeadingDeg()
+ * actually used whenever there's a nonzero startup tilt offset). */
+void Telemetry_PrintMagTiltState(float tilt_roll_deg, float tilt_pitch_deg);
 void Telemetry_PrintNavState(uint8_t valid,
 							 uint8_t reference_valid,
 							 uint8_t invalid_reason,

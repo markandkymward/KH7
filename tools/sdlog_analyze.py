@@ -499,7 +499,14 @@ def print_summary(a: dict) -> None:
         first_idx = int(np.argmax(mag_healthy))
         mag_unwrapped = np.unwrap(a["mag_heading_deg"], period=360.0)
         yaw_unwrapped = np.unwrap(a["yaw_deg"], period=360.0)
-        mag_delta = mag_unwrapped - mag_unwrapped[first_idx]
+        # mag_heading_deg and yaw_deg have OPPOSITE native sign conventions
+        # (bench-verified 2026-08-21 with real MAG+IMU telemetry - a physical
+        # CW rotation increases mag_heading_deg but decreases yaw_deg). The
+        # firmware's own mag-yaw nudge negates its internal mag_delta_deg to
+        # account for this (see app.c) - negate here too so this comparison
+        # matches reality instead of reporting a near-maximal, opposite-sign
+        # "divergence" that isn't real.
+        mag_delta = -(mag_unwrapped - mag_unwrapped[first_idx])
         yaw_delta = yaw_unwrapped - yaw_unwrapped[first_idx]
         err_all = mag_delta - yaw_delta
         err = err_all[mag_healthy]
