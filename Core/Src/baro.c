@@ -67,8 +67,24 @@
  * wildly (over 1000cm/s peak-to-peak) even while completely stationary.
  * Larger tau = more accel-trust/less baro-correction (smoother but slower to
  * correct accel drift); smaller tau = more baro-trust (noisier but tighter
- * long-term accuracy). A few seconds is a typical, reasonable starting point. */
-#define BARO_VZ_COMPL_FILTER_TAU_S 2.0f
+ * long-term accuracy).
+ *
+ * Lowered from 2.0f to 0.5f on 2026-08-22: the vertical-accel input comes from
+ * the same gravity-direction vector the AHRS uses (Attitude_GetVerticalAccelMps2()),
+ * which transiently corrupts during hard maneuvering (large/fast pitch-roll
+ * changes couple real translational acceleration into what's supposed to be a
+ * pure-gravity reading). At tau=2.0s the filter trusted that corrupted
+ * prediction ~98-99%/sample and only corrected toward the honest baro trend
+ * over a ~2s window, so a hard maneuver could leave the reported climb rate
+ * sign-wrong for a couple of seconds afterward - confirmed directly in a real
+ * flight log: altitude climbing 1.0m->2.17m over ~2.5s (t=62-67s) while
+ * baro_vz_cms read NEGATIVE (-0.4 to -0.7 m/s) through most of that window,
+ * concurrent with large pitch/roll swings. That fed straight into ALTHOLD's
+ * climb_rate_error, meaning the trim could actively fight the wrong direction
+ * during real maneuvering - reported by the pilot as fighting the aircraft to
+ * hold altitude. 0.5s corrects back to the honest baro trend much faster,
+ * trading back some of the noise-smoothing tau=2.0s bought. */
+#define BARO_VZ_COMPL_FILTER_TAU_S 0.5f
 
 typedef struct
 {

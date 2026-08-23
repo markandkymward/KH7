@@ -49,6 +49,11 @@ MAG_CAL_OK_RE = re.compile(
     r"wxy=(-?\d*\.?\d+) wxz=(-?\d*\.?\d+) wyz=(-?\d*\.?\d+)\]"
 )
 MAG_CAL_FAIL_RE = re.compile(r"MAG_CAL\[FAIL([^\]]*)\]")
+MAG_CAL_STATUS_RE = re.compile(
+    r"MAG_CAL_STATUS\[calibrated=(\d+) cx=(-?\d*\.?\d+) cy=(-?\d*\.?\d+) cz=(-?\d*\.?\d+) "
+    r"wxx=(-?\d*\.?\d+) wyy=(-?\d*\.?\d+) wzz=(-?\d*\.?\d+) "
+    r"wxy=(-?\d*\.?\d+) wxz=(-?\d*\.?\d+) wyz=(-?\d*\.?\d+)\]"
+)
 NAV_LINE_RE = re.compile(
     r"NAV\[valid ref reason fix sats hacc_cm age_ms upd_ms cv ci dup rej drop\]=\["
     r"(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(-?\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\]"
@@ -180,11 +185,23 @@ class Kh7GroundGui:
         self.root.title("KH7 USB Ground Station")
         self.root.geometry("1080x780")
         self.root.resizable(True, True)
+        # Default to maximized (keeps title bar/taskbar, unlike borderless
+        # fullscreen) - a saved geometry from _apply_loaded_window_state() below
+        # still overrides this if the user previously resized/un-maximized.
+        try:
+            self.root.state("zoomed")
+        except tk.TclError:
+            pass
 
         self.serial_port = None
         self.tcp_socket = None
         self.tcp_rx_buffer = bytearray()
         self.wifi_connecting = False
+        # Last time ANY line was received over the current link, regardless of
+        # content - a general liveness signal distinct from rc_last_update_monotonic
+        # (which only tracks RC-specific telemetry). Used to detect a silently-dead
+        # half-open TCP connection (see _check_link_staleness()).
+        self.last_rx_monotonic = 0.0
         self.wifi_connect_queue = queue.Queue()
         self.motor_canvas = None
         self.pose_canvas = None
@@ -405,7 +422,19 @@ class Kh7GroundGui:
             return {}
 
     def _apply_loaded_window_state(self) -> None:
+        # Default (no saved state, or an old state file predating this key) is
+        # maximized - already set in __init__. Only a saved "normal" window_state
+        # means the user deliberately un-maximized last session, in which case
+        # honor their remembered geometry instead of forcing maximized again.
+        window_state = self._ui_state.get("window_state")
+        if window_state != "normal":
+            return
+
         geometry = self._ui_state.get("geometry")
+        try:
+            self.root.state("normal")
+        except tk.TclError:
+            pass
         if isinstance(geometry, str) and geometry:
             try:
                 match = re.match(r"^(\d+)x(\d+)([+-]\d+)?([+-]\d+)?$", geometry)
@@ -427,9 +456,14 @@ class Kh7GroundGui:
                 pass
 
     def _save_ui_state(self) -> None:
+        try:
+            window_state = self.root.state()
+        except tk.TclError:
+            window_state = "normal"
         state = {
             "version": GUI_STATE_VERSION,
             "geometry": self.root.geometry(),
+            "window_state": window_state,
             "motor_test_visible": self.motor_test_visible,
             "pid_panel_visible": self.pid_panel_visible,
             "transport": self.transport_var.get(),
@@ -1786,6 +1820,7 @@ class Kh7GroundGui:
 
         try:
             self.serial_port = serial.Serial(port, 115200, timeout=0.02, write_timeout=0.2)
+            self.last_rx_monotonic = time.monotonic()
             self.connected_var.set(f"Connected USB: {port}")
             self.bridge_ip_var.set("Bridge IP: USB")
             self.bridge_status_lines = []
@@ -1868,6 +1903,7 @@ class Kh7GroundGui:
         sock.setblocking(False)
         self.tcp_socket = sock
         self.tcp_rx_buffer = bytearray()
+        self.last_rx_monotonic = time.monotonic()
         peer_ip, peer_port = sock.getpeername()
         self.connected_var.set(f"Connected Wi-Fi: {host}:{port}")
         self.bridge_ip_var.set(f"Bridge IP: {peer_ip}:{peer_port}")
@@ -1878,6 +1914,7 @@ class Kh7GroundGui:
         self.pid_received_once = False
         self.start_pid_sync()
         self.att_read()
+        self._query_mag_cal_status()
 
     def connect(self, show_errors: bool = True) -> bool:
         if self.transport_var.get() == "USB":
@@ -1885,6 +1922,7 @@ class Kh7GroundGui:
             if connected:
                 self.start_pid_sync()
                 self.att_read()
+                self._query_mag_cal_status()
             return connected
 
         if self.tcp_socket is not None:
@@ -1892,6 +1930,26 @@ class Kh7GroundGui:
 
         self._connect_wifi(show_errors)
         return False
+
+    def _query_mag_cal_status(self, retries_left: int = 2) -> None:
+        """Asks the board for its PERSISTED mag calibration state on connect, so
+        the status label reflects reality instead of defaulting to "not
+        calibrated" every time the GUI (re)connects - added 2026-08-22 after a
+        real calibration from an earlier session was misreported as missing.
+        A couple retries cover the connect-just-happened window where the first
+        command can land before the link is fully ready; the response (parsed
+        via MAG_CAL_STATUS_RE in _parse_line) updates the label whenever it
+        arrives, so a dropped attempt here isn't otherwise harmful."""
+        if self.transport_var.get() == "USB":
+            connected = self.serial_port is not None and self.serial_port.is_open
+        else:
+            connected = self.tcp_socket is not None
+        if not connected:
+            return
+
+        self.send_command("MAG CAL STATUS")
+        if retries_left > 0:
+            self.root.after(500, lambda: self._query_mag_cal_status(retries_left - 1))
 
     def start_pid_sync(self) -> None:
         self.pid_received_once = False
@@ -1963,6 +2021,7 @@ class Kh7GroundGui:
         self.tcp_socket = None
         self.tcp_rx_buffer = bytearray()
         self.wifi_connecting = False
+        self.last_rx_monotonic = 0.0
         self.pid_received_once = False
         self.pid_sync_retries_left = 0
         self._cancel_att_verify()
@@ -2307,6 +2366,25 @@ class Kh7GroundGui:
             self.mag_cal_button.configure(text="Calibrate")
             return
 
+        m_mag_cal_status = MAG_CAL_STATUS_RE.search(line)
+        if m_mag_cal_status is not None:
+            calibrated, cx, cy, cz, wxx, wyy, wzz, wxy, wxz, wyz = m_mag_cal_status.groups()
+            # Response to the "MAG CAL STATUS" query sent on connect (see
+            # _query_mag_cal_status()) - reflects the firmware's PERSISTED
+            # calibration (survives reboots/reconnects), unlike MAG_CAL_OK above
+            # which only fires right after a live calibration run completes in
+            # this same GUI session. Without this, reconnecting or restarting the
+            # GUI always showed the "not calibrated" default even when a real
+            # calibration was saved from a previous session - added 2026-08-22.
+            if calibrated != "0":
+                self.mag_cal_status_var.set(
+                    f"Calibrated OK (from board, center={cx},{cy},{cz} "
+                    f"matrix diag={wxx},{wyy},{wzz} off-diag={wxy},{wxz},{wyz})"
+                )
+            else:
+                self.mag_cal_status_var.set("Compass cal: not calibrated")
+            return
+
         m_mag_cal_fail = MAG_CAL_FAIL_RE.search(line)
         if m_mag_cal_fail is not None:
             reason = m_mag_cal_fail.group(1)
@@ -2417,6 +2495,7 @@ class Kh7GroundGui:
             return
 
     def _consume_raw_line(self, raw: bytes) -> None:
+        self.last_rx_monotonic = time.monotonic()
         line = self._bytes_to_ascii(raw)
         if line:
             self._append_log_line(line)
@@ -2500,11 +2579,35 @@ class Kh7GroundGui:
         except OSError as exc:
             self._handle_link_loss(str(exc))
 
+    # The ESP32 bridge prints its own "[BRIDGE] STAT ..." heartbeat every 3s
+    # (see esp32_s3_uart6_wifi_bridge.ino) independent of anything the flight
+    # controller is doing, so ANY line (bridge heartbeat or FC telemetry) should
+    # arrive well within this window on a genuinely live link. A WiFi drop often
+    # leaves a half-open socket that raises no error and just stops delivering
+    # data - recv() on a non-blocking socket then looks identical to "no data
+    # right now", so _handle_link_loss() never fires and the existing
+    # _auto_connect_tick() reconnect loop never gets a chance to run. This
+    # watchdog closes that gap by forcing the same link-loss path once the link
+    # has been silent for too long to be real.
+    LINK_STALE_TIMEOUT_S = 7.0
+
+    def _check_link_staleness(self) -> None:
+        connected = (
+            (self.transport_var.get() == "USB" and self.serial_port is not None)
+            or (self.transport_var.get() != "USB" and self.tcp_socket is not None)
+        )
+        if not connected or self.last_rx_monotonic == 0.0:
+            return
+        if (time.monotonic() - self.last_rx_monotonic) > self.LINK_STALE_TIMEOUT_S:
+            self._handle_link_loss("No data received - link presumed dead")
+
     def _poll_io(self) -> None:
         if self.transport_var.get() == "USB":
             self._poll_usb()
         else:
             self._poll_wifi()
+
+        self._check_link_staleness()
 
         rc_data_stale = (
             self.rc_last_update_monotonic == 0.0

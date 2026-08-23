@@ -90,7 +90,27 @@
 #define APP_CRSF_FLIGHTMODE_TELEM_MS   500U  /* ~2Hz - changes rarely */
 #define APP_CRSF_GPS_TELEM_MS          500U  /* ~2Hz - position doesn't need to be fast */
 #define APP_ATTITUDE_ZERO_SETTLE_MS 2000U
-#define APP_ATTITUDE_ZERO_AVG_MS 300U
+/* Raised from 300ms on 2026-08-22: reproduced on 3 separate power-ons with the
+ * board sitting genuinely still and level the whole time - the DISPLAYED
+ * (offset-corrected) pitch read a consistent ~-10.8deg, while a live
+ * comparison against MAGTILT (which logs roll/pitch BEFORE this offset is
+ * subtracted) showed the RAW AHRS pitch had already settled to ~-0.4deg
+ * (correctly near level) by the time of the comparison, meaning the ~10.4deg
+ * baked into startup_pitch_offset_deg was captured before the AHRS had
+ * actually converged. Attitude_Init() (attitude.c) starts the Mahony filter
+ * from a level quaternion every boot regardless of true orientation, and a
+ * brief real disturbance during power-on handling/USB connection (or a noisy
+ * early accelerometer reading before the sensor electrically settles) can
+ * push it away from level for a couple of seconds before the proportional
+ * correction (two_kp=3.0) pulls it back - the old 300ms window, firing right
+ * at the gyro-bias-ready boundary (~2.3s post-boot per the 2026-08-17 fix
+ * above), was long enough to reliably land inside that recovery window every
+ * time, not just occasionally. A much longer average dilutes any such
+ * transient with many more genuinely-settled samples instead of trusting a
+ * brief snapshot. Does not reintroduce the 2026-08-17 bug - that fix was
+ * about WHEN the window starts (keyed off gyro-bias-ready, unchanged here),
+ * this only changes how long it runs once started. */
+#define APP_ATTITUDE_ZERO_AVG_MS 2000U
 #define APP_USB_TEST_ARM_DELAY_MS 2000U
 #define APP_IMU_TELEMETRY_MS    120U
 #define APP_ARM_TELEMETRY_MS    150U
@@ -114,10 +134,32 @@
  * signal is low-noise/low-latency enough to not fight stick throttle inputs. */
 #define APP_BARO_VZ_DAMP_GAIN_US_PER_MPS 15.0f
 #define APP_BARO_VZ_DAMP_LIMIT_US        60U
-/* Ground effect/propwash makes baro pressure very noisy within about a meter of the
- * ground, which otherwise makes the Vz damping term above rapidly flip sign/saturate
- * right at liftoff (audible motor thrust jitter) - suppress it until climbed clear. */
-#define APP_BARO_VZ_DAMP_MIN_ALT_M       1.0f
+/* Added 2026-08-22: this term is computed fresh every 2ms control-loop tick straight
+ * from the instantaneous climb-rate estimate with no smoothing of its own - unlike the
+ * ALTHOLD trim above it, which IS filtered (APP_ALTHOLD_TRIM_LPF_HZ) before reaching the
+ * motors. That raw pass-through got noticeably noisier the same night after
+ * BARO_VZ_COMPL_FILTER_TAU_S was shortened 2.0s->0.5s (see baro.c) to fix climb-rate sign
+ * lag during maneuvers - trading noise-smoothing for faster correction there directly
+ * shows up here, since this term applies that faster/noisier signal unfiltered. A light
+ * dedicated LPF here cuts the sample-to-sample jitter this term itself contributes to
+ * throttle without touching the underlying climb-rate estimate (which other consumers,
+ * e.g. ALTHOLD's trim integrator, still see raw/fast). Kept well above the ALTHOLD trim's
+ * 1.5Hz since this term's whole purpose is reacting quickly to counter thrust-response
+ * lag - only enough smoothing to cut obvious per-sample chatter, not to slow it down. */
+#define APP_BARO_VZ_DAMP_LPF_HZ           5.0f
+/* Ground effect/propwash makes baro pressure noisy close to the ground, which
+ * otherwise makes the Vz damping term above (and the ALTHOLD trim gate that reuses
+ * this same threshold) rapidly flip sign/saturate right at liftoff (audible motor
+ * thrust jitter) - suppress both until climbed clear. Lowered from 1.0m on
+ * 2026-08-22: with the baro propwash altitude compensation added the same night
+ * (see baro.c), readings are trustworthy much closer to the ground, and 1.0m was
+ * gating ALTHOLD assistance off for 43-54% of two real flights whose median hover
+ * altitude was ~1.0m - confirmed via a host-side replay of the ALTHOLD control law
+ * against those flights' logged baro data, which showed the trim itself staying
+ * small/well-damped (nowhere near its clamp) whenever active, meaning the "cyclical
+ * altitude chasing" complaint was this gate flickering ALTHOLD on/off across the
+ * pilot's normal hover height, not a control-loop stability bug. */
+#define APP_BARO_VZ_DAMP_MIN_ALT_M       0.3f
 /* REVERTED 2026-08-21: a same-day attempt to map the full throttle stick range to
  * a commanded climb rate (fixing "Z axis very sensitive to throttle") caused a
  * real in-flight uncontrolled climb. Root cause: althold_center_throttle_us is a
@@ -157,6 +199,22 @@
 #define APP_ALTHOLD_STICK_SETTLE_MS        300U
 #define APP_ALTHOLD_MAX_CLIMB_MPS           2.0f
 #define APP_ALTHOLD_ALT_HOLD_KP_MPS_PER_M   0.8f
+/* REVERTED 2026-08-22 (same day as the increase below): raising these caused a
+ * real, clean limit-cycle oscillation - confirmed directly in a flight log with
+ * the throttle stick held dead flat for 18+ seconds: altitude cycled between
+ * 0.35m and 1.42m (~1m/3.5ft swing) with a ~4-6s period, and trim oscillated
+ * right along with it (ranging -11 to -77us, never crossing positive) - the
+ * classic signature of integral gain too aggressive relative to the aircraft's
+ * real thrust-response lag (overcorrect, forced to reverse, overcorrect the
+ * other way). The earlier persistent-hover-reference fix and shortened
+ * complementary-filter tau (see kh7-althold-oscillation-yawhold-todo memory)
+ * were confirmed still working correctly in this same flight (stick-steady
+ * behavior, not a reference/sign bug) - this was purely the gain increase
+ * overshooting into instability. Back to the original, previously-stable
+ * values. If more authority is wanted again, re-attempt in much smaller steps
+ * with a dedicated stick-held-steady bench/hover test to check for oscillation
+ * BEFORE calling it validated - a "does it saturate" check alone (which is what
+ * motivated the increase last time) does not rule out this failure mode. */
 #define APP_ALTHOLD_VZ_KP_US_PER_MPS        25.0f
 #define APP_ALTHOLD_VZ_KI_US_PER_MPS_S       8.0f
 #define APP_ALTHOLD_INTEGRAL_LIMIT_US      200U
@@ -165,6 +223,9 @@
  * sensor/vibration noise translated directly into trim was making the motors
  * respond jerkily on the Z axis. A slow-ish cutoff is fine since altitude
  * corrections are inherently a slow process. */
+/* REVERTED to 250 alongside the VZ_KP/KI/INTEGRAL_LIMIT revert above - see that
+ * comment. Raising this to 350 alongside the gain increase was part of the
+ * same overshoot; back to the original, previously-stable value. */
 #define APP_ALTHOLD_TRIM_LPF_HZ             1.5f
 #define APP_ALTHOLD_TRIM_LIMIT_US          250U
 /* --- NAV_VELOCITY_BRAKE (experimental GPS horizontal velocity brake, phase 1) ---
@@ -355,6 +416,46 @@
 #define APP_RATE_CMD_MAX_ROLL_DPS   300.0f
 #define APP_RATE_CMD_MAX_PITCH_DPS  300.0f
 #define APP_RATE_CMD_MAX_YAW_DPS    220.0f
+/* Yaw angle-hold (2026-08-22) - a small, bounded assist that pulls back toward
+ * a captured target heading whenever the yaw stick is centered, in
+ * ATTITUDE/ALTHOLD/NAV_VELOCITY_BRAKE (matching where roll/pitch already get
+ * angle-holding); RATE mode is untouched, yaw stays pure rate passthrough
+ * there by design (acro-style). This is the first cut of a previously-missing
+ * feature (yaw was rate-control-only everywhere - see kh7-althold-oscillation-
+ * yawhold-todo memory), kept deliberately conservative given everything
+ * learned tuning ALTHOLD's gains this same session: max assist rate is a small
+ * fraction (~14%) of full manual yaw authority (APP_RATE_CMD_MAX_YAW_DPS), and
+ * the gain saturates at only a 10deg error, so it can't apply a large,
+ * sudden correction. Bench-test for smooth, non-oscillatory tracking (yaw
+ * setpoint vs gyro correlation, same method used to tune the rate PIDs) before
+ * trusting it in flight - do not assume gentle bench behavior generalizes to
+ * flight without checking, per kh7-flight-test-workflow memory. */
+/* Briefly halved 2026-08-22 (Kp 3.0->1.5, ceiling 30->15) after a re-test flight showed
+ * setpoint_yaw_dps pegged at the ceiling for 45% of the flight with what looked like a
+ * limit-cycle oscillation in yaw_deg - assumed at the time to be a P-gain-too-aggressive
+ * problem (same failure class as the ALTHOLD Ki oscillation earlier this session). A
+ * SECOND re-test at the halved gains still showed a monotonic yaw_deg runaway (not an
+ * oscillation this time, which is what exposed the real bug - see the sign-flip comment
+ * at the cmd_yaw_rate_dps assignment near the capture site below), proving gain magnitude
+ * was never the actual problem: the correction term had the wrong sign and was reliably
+ * pushing yaw_deg further from target, at whatever rate the gain/ceiling allowed. With
+ * the sign now fixed, restored to the original values - re-bench-test for correct-
+ * direction, settling (not diverging) tracking before the next real flight; do not
+ * reflexively assume oscillation-shaped symptoms mean "lower the gain" without first
+ * checking the correction is even pointed the right way. */
+#define APP_YAWHOLD_KP_DPS_PER_DEG    3.0f
+#define APP_YAWHOLD_MAX_RATE_DPS     30.0f
+/* Dedicated engagement deadband, NOT the tiny APP_CONTROL_DEADBAND_US (20us) -
+ * that constant exists to reject stick jitter inside the direct stick->rate
+ * mapping, where being off by a few dps doesn't matter. Bench-tested
+ * 2026-08-22: with APP_CONTROL_DEADBAND_US, a single clean stick-centered
+ * twist-and-release left yaw sitting 20+ degrees off target for 7+ seconds
+ * before yaw-hold's own engagement condition happened to be satisfied - too
+ * tight for normal stick/receiver jitter and human precision holding a stick
+ * at center. ALTHOLD's analogous "is the stick centered enough to engage
+ * assist" gate uses 100us (APP_ALTHOLD_THROTTLE_DEADBAND_US) - matching that
+ * scale here instead. */
+#define APP_YAWHOLD_DEADBAND_US      80U
 /* Live-tuned 2026-08-18 via SD-log correlation testing (setpoint_*_dps vs gyro_*_dps
  * per axis across multiple real flights) - see the "KH7 yaw system state" memory note
  * for the full before/after numbers. Kp raised from 0.90/0.90/0.80 after yaw tracking
@@ -2475,6 +2576,27 @@ void App_Update(void)
   static uint16_t roll_center_us = APP_PWM_MID_US;
   static uint16_t pitch_center_us = APP_PWM_MID_US;
   static uint16_t yaw_center_us = APP_PWM_MID_US;
+  /* REVISED 2026-08-22 (same day as the original settle-latch fix): a real
+   * flight (yaw-hold-vs-no-yaw-hold comparison, ALTHOLD deliberately excluded
+   * to isolate the yaw subsystem) came back with yaw "wandering worse" than
+   * before yaw-hold existed. Root cause: unlike ALTHOLD's throttle (which has
+   * no natural resting position and genuinely needs continuous re-discovery
+   * of wherever hover happens to be), the yaw stick is spring-centered with a
+   * FIXED true neutral. Copying ALTHOLD's "settle anywhere the stick sits
+   * still" technique wholesale was wrong for yaw - it treated ANY steady
+   * stick position held for the settle window as the new "center," including
+   * a deliberate sustained turn (very normal - holding a steady yaw
+   * deflection for a controlled turn easily exceeds 300ms), corrupting
+   * yaw_center_us mid-flight and throwing off both the engagement gate and
+   * every subsequent yaw-hold target. Fixed by locking the settle-latch after
+   * its FIRST successful commit each arm (yaw_center_locked below) - it still
+   * gets to briefly refine away from a bad arm-instant snapshot right after
+   * arming (fixing the original bench-tested engagement-delay bug), but can
+   * never again drift to wherever the stick happens to be during a real
+   * maneuver later in the flight. */
+  static uint16_t yaw_settle_ref_us = APP_PWM_MID_US;
+  static uint32_t yaw_settle_start_ms = 0U;
+  static uint8_t yaw_center_locked = 0U;
   static float measured_roll_rate_dps = 0.0f;
   static float measured_pitch_rate_dps = 0.0f;
   static float measured_yaw_rate_dps = 0.0f;
@@ -2578,13 +2700,30 @@ void App_Update(void)
   static uint32_t last_mag_retry_ms = 0U;
   static uint8_t liftoff_ramp_active = 0U;
   static uint32_t liftoff_ramp_start_ms = 0U;
+  /* Yaw angle-hold - see the capture/use site near cmd_yaw_rate_dps below for
+   * the full design writeup. Unlike ALTHOLD's persistent-hover-reference
+   * (which had to survive brief correction nudges without losing the pilot's
+   * original target), a fresh capture on every deadband re-entry is the
+   * CORRECT behavior here: a yaw stick touch is essentially always a
+   * deliberate "face this new direction" action, not a drift correction, so
+   * there is no equivalent "should this recapture or not" ambiguity to get
+   * wrong. */
+  static uint8_t yawhold_active = 0U;
+  static float yawhold_target_deg = 0.0f;
   static uint8_t althold_holding = 0U;
   static float althold_target_alt_m = 0.0f;
+  /* Which settled stick center althold_target_alt_m was captured against - lets
+   * a brief deadband exit (a correction nudge) be told apart from a genuine
+   * deliberate reposition (the settled center itself changing). See the target
+   * (re)capture logic below for why this matters. */
+  static uint16_t althold_target_ref_center_us = APP_PWM_MID_US;
+  static uint8_t althold_have_target = 0U;
   static float althold_integral_us = 0.0f;
   static uint16_t althold_center_throttle_us = APP_PWM_MID_US;
   static uint16_t althold_settle_ref_us = APP_PWM_MID_US;
   static uint32_t althold_settle_start_ms = 0U;
   static float althold_trim_filtered_us = 0.0f;
+  static float baro_damp_term_filtered_us = 0.0f;
   static uint8_t nav_brake_active = 0U;
   static uint8_t nav_brake_disqualified_latch = 0U;
   /* Gates ALL GPS init/retry/parsing and Nav_Update() to only when NAV_VELOCITY_BRAKE
@@ -2632,6 +2771,7 @@ void App_Update(void)
   float target_pitch_deg;
   float roll_angle_error_deg;
   float pitch_angle_error_deg;
+  float yaw_angle_error_deg;
   Nav_State_t nav_state;
   uint8_t nav_brake_requested;
   uint8_t nav_brake_tilt_limited;
@@ -3546,6 +3686,12 @@ void App_Update(void)
           {
             motors_armed = 1U;
             trim_captured = 0U;
+            /* Fresh arm always gets a fresh chance to calibrate yaw_center_us
+             * once (see the settle-latch comment above) - never carry a lock
+             * or a settled reference across arms. */
+            yaw_center_locked = 0U;
+            yaw_settle_ref_us = APP_PWM_MID_US;
+            yaw_settle_start_ms = now_ms;
             g_glog_count = 0U;
             g_glog_capturing = 1U;
             App_SdLogArmStart();
@@ -3567,6 +3713,17 @@ void App_Update(void)
             althold_holding = 0U;
             althold_integral_us = 0.0f;
             althold_trim_filtered_us = 0.0f;
+            baro_damp_term_filtered_us = 0.0f;
+            /* Same reasoning as the reset above, applied to the persistent
+             * hover-altitude target added 2026-08-22 - a stale target_alt_m
+             * from a previous flight (different altitude, different battery/
+             * loadout) is exactly the kind of carried-over static state that
+             * caused the original incident. */
+            althold_have_target = 0U;
+            /* Same discipline for yaw-hold's target - always start a fresh arm
+             * with no held heading, re-captured the moment the yaw stick first
+             * settles centered. */
+            yawhold_active = 0U;
           }
         }
         else
@@ -3586,8 +3743,36 @@ void App_Update(void)
         {
           roll_center_us = roll_us;
           pitch_center_us = pitch_us;
+          /* Immediate fallback baseline, same as roll/pitch - if the pilot
+           * never holds the stick still long enough for the settle-latch
+           * below to lock in a (possibly more accurate) value this arm, this
+           * is what yaw_center_us keeps for the whole flight, matching the
+           * original one-shot behavior exactly as a worst case. */
           yaw_center_us = yaw_us;
           trim_captured = 1U;
+        }
+        /* Yaw center: settles ONCE per arm, then locks - see the long comment
+         * on yaw_center_locked's declaration above for the full history (why
+         * this isn't a one-shot snapshot like roll/pitch, and why it must NOT
+         * keep re-settling for the whole flight the way ALTHOLD's throttle-
+         * center does). Reuses ALTHOLD's exact settle-window/settle-time
+         * constants (not ALTHOLD-specific in meaning - both are just "how
+         * tightly and how long must a stick sit still to call it settled"). */
+        if (yaw_center_locked == 0U)
+        {
+          int32_t yaw_settle_offset_us = (int32_t)yaw_us - (int32_t)yaw_settle_ref_us;
+
+          if ((yaw_settle_offset_us > (int32_t)APP_ALTHOLD_STICK_STABLE_WINDOW_US) ||
+              (yaw_settle_offset_us < -(int32_t)APP_ALTHOLD_STICK_STABLE_WINDOW_US))
+          {
+            yaw_settle_ref_us = yaw_us;
+            yaw_settle_start_ms = now_ms;
+          }
+          else if ((now_ms - yaw_settle_start_ms) >= APP_ALTHOLD_STICK_SETTLE_MS)
+          {
+            yaw_center_us = yaw_settle_ref_us;
+            yaw_center_locked = 1U;
+          }
         }
 
         pilot_roll_stick_us = (int16_t)((int32_t)roll_us - (int32_t)roll_center_us);
@@ -3759,8 +3944,51 @@ void App_Update(void)
           cmd_pitch_rate_dps = ((float)APP_PITCH_SIGN) * App_StickOffsetUsToRateDps((int32_t)pitch_us - (int32_t)pitch_center_us,
                                APP_RATE_CMD_MAX_PITCH_DPS);
         }
-        cmd_yaw_rate_dps = ((float)APP_YAW_SIGN) * App_StickOffsetUsToRateDps((int32_t)yaw_us - (int32_t)yaw_center_us,
-                               APP_RATE_CMD_MAX_YAW_DPS);
+        {
+          int32_t yaw_offset_us = (int32_t)yaw_us - (int32_t)yaw_center_us;
+          uint8_t yawhold_eligible_mode = (uint8_t)((flight_mode == APP_FLIGHT_MODE_ATTITUDE) ||
+                                                     (flight_mode == APP_FLIGHT_MODE_ALTHOLD) ||
+                                                     (flight_mode == APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE));
+
+          if ((yawhold_eligible_mode != 0U) &&
+              (yaw_offset_us > -(int32_t)APP_YAWHOLD_DEADBAND_US) &&
+              (yaw_offset_us < (int32_t)APP_YAWHOLD_DEADBAND_US))
+          {
+            if (yawhold_active == 0U)
+            {
+              yawhold_target_deg = yaw_deg;
+              yawhold_active = 1U;
+            }
+            yaw_angle_error_deg = Attitude_WrapAngle180(yawhold_target_deg - yaw_deg);
+            /* SIGN BUG FOUND (2026-08-22, after the gain-lowering re-test still showed a
+             * monotonic runaway): Attitude_GetBoardAnglesDeg() computes `yaw = -atan2f(...)`
+             * (see the gz_dps integration comment above, ~line 3264) - increasing gz_dps
+             * DECREASES yaw_deg, and measured_yaw_rate_dps/gyro_yaw_dps (what the rate PID
+             * error and this cmd_yaw_rate_dps are both expressed in terms of) follow that
+             * same inverted gz_dps convention. A positive yaw_angle_error_deg (target above
+             * current, yaw_deg needs to INCREASE) therefore needs a NEGATIVE gz-convention
+             * command, not a positive one - the un-negated version above always pushed the
+             * opposite way. Confirmed directly in a flight log: gyro_yaw_dps pinned negative
+             * (-8 to -15dps, tracking its own commanded ceiling correctly) while yaw_deg
+             * climbed +0deg->+31deg over 3.5s in lockstep - the "correction" and the observed
+             * drift moved the same direction, growing without bound, every time yaw-hold
+             * engaged. This (not gain magnitude) is the root cause of the flip incident, the
+             * "worse than before" wandering report, and this runaway - a lower gain only slows
+             * the same guaranteed-wrong-direction push. Fixed by negating the error term;
+             * gains restored to their original (pre-panic-lowering) values now that the actual
+             * bug is fixed - re-bench-test for correct-direction, settling (not diverging)
+             * tracking before the next real flight. */
+            cmd_yaw_rate_dps = App_ClampFloat(-yaw_angle_error_deg * APP_YAWHOLD_KP_DPS_PER_DEG,
+                                               -APP_YAWHOLD_MAX_RATE_DPS,
+                                               APP_YAWHOLD_MAX_RATE_DPS);
+          }
+          else
+          {
+            yawhold_active = 0U;
+            cmd_yaw_rate_dps = ((float)APP_YAW_SIGN) * App_StickOffsetUsToRateDps(yaw_offset_us,
+                                   APP_RATE_CMD_MAX_YAW_DPS);
+          }
+        }
 
         roll_rate_error_dps = cmd_roll_rate_dps - measured_roll_rate_dps;
         pitch_rate_error_dps = cmd_pitch_rate_dps - measured_pitch_rate_dps;
@@ -3989,7 +4217,25 @@ void App_Update(void)
              * climb. */
             if (althold_holding == 0U)
             {
-              althold_target_alt_m = Baro_GetAltitudeM();
+              /* Only take a FRESH altitude snapshot if there isn't a persistent
+               * target yet (first engagement this arm) or the pilot genuinely
+               * settled the stick at a new center since the last one (a
+               * deliberate reposition) - NOT on every brief deadband exit.
+               * Before this (2026-08-22), a target was captured on every single
+               * holding-0-to-1 transition, so a quick correction nudge just
+               * adopted the drifted altitude as the new "correct" one instead
+               * of actually correcting back toward where the pilot had been
+               * trying to hold - reported as "forced to constantly adjust to
+               * stay within 1-2ft of a hover reference." Deliberate
+               * repositioning (stick moves and settles somewhere new) still
+               * captures a fresh target, same as before. */
+              if ((althold_have_target == 0U) ||
+                  (althold_center_throttle_us != althold_target_ref_center_us))
+              {
+                althold_target_alt_m = Baro_GetAltitudeM();
+                althold_target_ref_center_us = althold_center_throttle_us;
+                althold_have_target = 1U;
+              }
               althold_integral_us = 0.0f;
               althold_holding = 1U;
             }
@@ -4014,10 +4260,12 @@ void App_Update(void)
             /* Either off-center (pilot actively commanding a climb/descend - full
              * manual authority over raw throttle_us, no hold trim fighting the
              * stick) or centered but too low/baro-unhealthy for a trustworthy
-             * correction. Either way, no trim. The settle-tracking above will
-             * re-latch althold_center_throttle_us once the stick genuinely stops
-             * here, so hold resumes at the new altitude without needing to
-             * return to the old reference. */
+             * correction. Either way, no trim. Deliberately NOT touching
+             * althold_target_alt_m/have_target/target_ref_center_us here - a
+             * brief excursion preserves the persistent target (see the capture
+             * logic above), so re-engaging pulls back toward where the pilot
+             * was actually trying to hold instead of adopting wherever this
+             * excursion left off. */
             althold_holding = 0U;
             althold_integral_us = 0.0f;
           }
@@ -4053,6 +4301,15 @@ void App_Update(void)
                                             -((int32_t)APP_BARO_VZ_DAMP_LIMIT_US),
                                             (int32_t)APP_BARO_VZ_DAMP_LIMIT_US);
         }
+        /* Light dedicated smoothing on this term only - see APP_BARO_VZ_DAMP_LPF_HZ's
+         * comment. Filters toward 0 the same way when the gate above is false, same
+         * "smooth ramp on engage/disengage" reasoning as the ALTHOLD trim filter. */
+        {
+          float baro_damp_lpf_alpha = App_LpfAlpha(dt_s, APP_BARO_VZ_DAMP_LPF_HZ);
+          baro_damp_term_filtered_us += baro_damp_lpf_alpha *
+                                        ((float)baro_damp_term_us - baro_damp_term_filtered_us);
+        }
+        baro_damp_term_us = (int32_t)baro_damp_term_filtered_us;
         throttle_term = althold_throttle_us + baro_damp_term_us;
         if (throttle_term < (int32_t)APP_MOTOR_IDLE_US)
         {

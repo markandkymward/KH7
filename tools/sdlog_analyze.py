@@ -411,6 +411,66 @@ def _flight_arrays(sub: List[dict]) -> dict:
     return a
 
 
+def mag_yaw_tracking(a: dict) -> Optional[dict]:
+    """Despikes/unwraps mag_heading_deg vs yaw_deg and returns their aligned
+    rotation-since-first-healthy-sample traces plus the tracking error - shared by
+    print_summary() and plot_dashboard() so the two never drift out of sync.
+    Returns None if this flight has no healthy mag samples at all."""
+    mag_healthy = (a["flags"].astype(int) & APP_SDLOG_FLAG_MAG_HEALTHY) != 0
+    if not np.any(mag_healthy):
+        return None
+
+    # Both mag_heading_deg and yaw_deg are wrapped to a fixed range by the firmware,
+    # so a plain difference produces a spurious ~360deg jump every time either one
+    # crosses its wrap boundary - unwrap first so a real multi-turn rotation (or none
+    # at all) doesn't look like a huge divergence.
+    first_idx = int(np.argmax(mag_healthy))
+    # Despike the raw heading before unwrapping - single-sample magnetometer glitches
+    # (real electrical/magnetic noise spikes, e.g. indoors near interference sources)
+    # that jump 60-170+ deg in one ~30ms sample while the gyro-integrated yaw barely
+    # moves are a real, observed phenomenon (found 2026-08-22: 29 such glitches in one
+    # 88s flight). np.unwrap() blindly trusts every sample-to-sample delta, so a single
+    # glitch it mistakes for a real rotation permanently shifts the ENTIRE rest of the
+    # unwrapped trajectory by ~360deg. Held-last-good-value despiking: compare each raw
+    # heading step against what the gyro-integrated yaw says the step should be
+    # (opposite sign convention, bench-verified) and hold the previous clean value
+    # instead of a step that disagrees wildly.
+    MAG_GLITCH_THRESHOLD_DEG = 45.0
+    yaw_unwrapped = np.unwrap(a["yaw_deg"], period=360.0)
+    mag_h_raw = a["mag_heading_deg"].astype(float)
+    mag_h_clean = mag_h_raw.copy()
+    glitch_count = 0
+    for gi in range(1, len(mag_h_clean)):
+        expected_step = -(yaw_unwrapped[gi] - yaw_unwrapped[gi - 1])
+        actual_step = mag_h_raw[gi] - mag_h_clean[gi - 1]
+        actual_step_wrapped = (actual_step + 180.0) % 360.0 - 180.0
+        if abs(actual_step_wrapped - expected_step) > MAG_GLITCH_THRESHOLD_DEG:
+            mag_h_clean[gi] = mag_h_clean[gi - 1]
+            glitch_count += 1
+        else:
+            mag_h_clean[gi] = mag_h_raw[gi]
+    mag_unwrapped = np.unwrap(mag_h_clean, period=360.0)
+
+    # mag_heading_deg and yaw_deg have OPPOSITE native sign conventions (bench-verified
+    # 2026-08-21 with real MAG+IMU telemetry - a physical CW rotation increases
+    # mag_heading_deg but decreases yaw_deg). The firmware's own mag-yaw nudge negates
+    # its internal mag_delta_deg to account for this - negate here too so this
+    # comparison matches reality instead of reporting a near-maximal, opposite-sign
+    # "divergence" that isn't real.
+    mag_delta = -(mag_unwrapped - mag_unwrapped[first_idx])
+    yaw_delta = yaw_unwrapped - yaw_unwrapped[first_idx]
+    nudge_gated = (a["flags"].astype(int) & APP_SDLOG_FLAG_MAG_NUDGE_GATED) != 0
+
+    return {
+        "mag_healthy": mag_healthy,
+        "mag_delta_deg": mag_delta,
+        "yaw_delta_deg": yaw_delta,
+        "err_deg": mag_delta - yaw_delta,
+        "glitch_count": glitch_count,
+        "nudge_gated": nudge_gated,
+    }
+
+
 LIPO_MAX_CHARGE_CELL_V = 4.25  # full-charge ceiling per cell (4.20V + margin)
 
 
@@ -486,29 +546,15 @@ def print_summary(a: dict) -> None:
     print(f"yaw stick: rms={np.sqrt(np.mean(setpoint_yaw ** 2)):.1f} max={np.max(np.abs(setpoint_yaw)):.1f}dps  "
           f"centered(<5dps)={100.0 * np.mean(yaw_stick_centered):.0f}% of flight")
 
-    mag_healthy = (a["flags"].astype(int) & APP_SDLOG_FLAG_MAG_HEALTHY) != 0
-    if np.any(mag_healthy):
-        # Both are wrapped/relative signals - compare ROTATION SINCE THE FIRST HEALTHY
-        # SAMPLE (not absolute heading vs absolute yaw, which aren't on the same
-        # reference/zero) to see whether the compass-nudge is keeping AHRS yaw from
-        # drifting away from what the compass independently says it should be.
-        # Both mag_heading_deg and yaw_deg are wrapped to a fixed range by the
-        # firmware, so a plain difference produces a spurious ~360deg jump every
-        # time either one crosses its wrap boundary - unwrap first so a real
-        # multi-turn rotation (or none at all) doesn't look like a huge divergence.
-        first_idx = int(np.argmax(mag_healthy))
-        mag_unwrapped = np.unwrap(a["mag_heading_deg"], period=360.0)
-        yaw_unwrapped = np.unwrap(a["yaw_deg"], period=360.0)
-        # mag_heading_deg and yaw_deg have OPPOSITE native sign conventions
-        # (bench-verified 2026-08-21 with real MAG+IMU telemetry - a physical
-        # CW rotation increases mag_heading_deg but decreases yaw_deg). The
-        # firmware's own mag-yaw nudge negates its internal mag_delta_deg to
-        # account for this (see app.c) - negate here too so this comparison
-        # matches reality instead of reporting a near-maximal, opposite-sign
-        # "divergence" that isn't real.
-        mag_delta = -(mag_unwrapped - mag_unwrapped[first_idx])
-        yaw_delta = yaw_unwrapped - yaw_unwrapped[first_idx]
-        err_all = mag_delta - yaw_delta
+    mag_track = mag_yaw_tracking(a)
+    if mag_track is not None:
+        mag_healthy = mag_track["mag_healthy"]
+        mag_delta = mag_track["mag_delta_deg"]
+        yaw_delta = mag_track["yaw_delta_deg"]
+        err_all = mag_track["err_deg"]
+        if mag_track["glitch_count"] > 0:
+            print(f"  (despiked {mag_track['glitch_count']} single-sample mag heading glitch(es) "
+                  f"before computing tracking error - see comment in mag_yaw_tracking())")
         err = err_all[mag_healthy]
         print(f"compass vs yaw drift: mag_delta rms={np.sqrt(np.mean(mag_delta[mag_healthy] ** 2)):.1f}deg  "
               f"yaw_delta rms={np.sqrt(np.mean(yaw_delta[mag_healthy] ** 2)):.1f}deg  "
@@ -530,7 +576,7 @@ def print_summary(a: dict) -> None:
             print(f"  while commanding yaw (stick active, {int(mask_active.sum())} samples): "
                   f"tracking err rms={np.sqrt(np.mean(err_a ** 2)):.1f} peak={np.max(np.abs(err_a)):.1f}deg")
 
-        nudge_gated = (a["flags"].astype(int) & APP_SDLOG_FLAG_MAG_NUDGE_GATED) != 0
+        nudge_gated = mag_track["nudge_gated"]
         dev_pct = a["mag_field_dev_pct"]
         print(f"  mag field deviation from boot ref: mean={dev_pct.mean():.1f}% max={dev_pct.max():.0f}%  "
               f"nudge gated (interference) {100.0 * np.mean(nudge_gated):.0f}% of samples "
@@ -600,7 +646,7 @@ def plot_dashboard(a: dict, out_path: str):
         track_axes.setdefault("roll", ax_track)
 
     ax_throttle = fig.add_subplot(gs[0:3, 3:6], sharex=track_axes["roll"])
-    ax_throttle.plot(t, a["throttle_cmd_us"], label="commanded", linewidth=0.8)
+    ax_throttle.plot(t, a["throttle_cmd_us"], label="commanded (stick position)", linewidth=0.8)
     ax_throttle.plot(t, a["throttle_actual_us"], label="actual", linewidth=0.8, alpha=0.85)
     ax_throttle.set_ylabel("throttle\nus")
     ax_throttle.legend(loc="upper right", fontsize=8)
@@ -623,23 +669,65 @@ def plot_dashboard(a: dict, out_path: str):
     ax_baro.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=7)
 
     angle_axes = []
+    # Matches APP_ROLL_SIGN/APP_PITCH_SIGN in app.c: target_{axis}_deg = SIGN * stick offset,
+    # so the raw stick trace needs the same sign flip to visually line up with commanded/actual.
+    stick_sign = {"roll": 1, "pitch": -1}
     for col, axis in enumerate(("roll", "pitch")):
         ax_angle = fig.add_subplot(gs[4, col * 3:col * 3 + 3], sharex=track_axes["roll"])
         ax_angle.plot(t, a[f"target_{axis}_deg"], label="commanded", linewidth=0.8)
         ax_angle.plot(t, a[f"{axis}_deg"], label="actual", linewidth=0.8, alpha=0.85)
         ax_angle.set_ylabel(f"{axis} angle\ndeg")
-        ax_angle.legend(loc="upper right", fontsize=7)
+
+        ax_stick = ax_angle.twinx()
+        ax_stick.plot(t, stick_sign[axis] * a[f"pilot_{axis}_stick_us"], color="tab:gray", linewidth=0.6, alpha=0.6,
+                      label="stick position")
+        ax_stick.set_ylabel("stick offset\nus")
+        ax_stick.axhline(0, color="tab:gray", linewidth=0.4, alpha=0.4)
+
+        lines1, labels1 = ax_angle.get_legend_handles_labels()
+        lines2, labels2 = ax_stick.get_legend_handles_labels()
+        ax_angle.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=7)
         angle_axes.append(ax_angle)
 
-    freqs = np.fft.rfftfreq(len(t), d=1.0 / a["fs_hz"])
-    for col, axis in enumerate(("roll", "pitch", "yaw")):
-        ax_fft = fig.add_subplot(gs[5, col * 2:col * 2 + 2])
-        sig = a[f"gyro_{axis}_dps"] - a[f"gyro_{axis}_dps"].mean()
-        spectrum = np.abs(np.fft.rfft(sig)) / max(len(t), 1)
-        ax_fft.plot(freqs, spectrum, linewidth=0.8)
-        ax_fft.set_xlim(0, min(a["fs_hz"] / 2, 250))
-        ax_fft.set_xlabel("Hz")
-        ax_fft.set_title(f"{axis} vibration", fontsize=9)
+    mag_track = mag_yaw_tracking(a)
+    ax_yaw_heading = fig.add_subplot(gs[5, 0:3], sharex=track_axes["roll"])
+    if mag_track is not None:
+        mag_healthy = mag_track["mag_healthy"]
+        ax_yaw_heading.plot(t, mag_track["yaw_delta_deg"], label="yaw (gyro)", linewidth=0.8)
+        ax_yaw_heading.plot(t, mag_track["mag_delta_deg"], label="heading (compass)", linewidth=0.8, alpha=0.85)
+        if np.any(~mag_healthy):
+            ax_yaw_heading.plot(t[~mag_healthy], mag_track["mag_delta_deg"][~mag_healthy], ".",
+                                color="tab:red", markersize=2, label="mag unhealthy")
+        ax_yaw_heading.set_ylabel("rotation since\nfirst healthy, deg")
+        ax_yaw_heading.legend(loc="upper right", fontsize=7)
+        ax_yaw_heading.set_title("yaw: gyro vs compass heading", fontsize=9)
+    else:
+        ax_yaw_heading.text(0.5, 0.5, "no healthy mag samples this flight",
+                            ha="center", va="center", transform=ax_yaw_heading.transAxes)
+    ax_yaw_heading.set_xlabel("time (s)")
+
+    ax_yaw_err = fig.add_subplot(gs[5, 3:6], sharex=track_axes["roll"])
+    if mag_track is not None:
+        ax_yaw_err.plot(t, mag_track["err_deg"], color="tab:blue", linewidth=0.8, label="tracking error")
+        ax_yaw_err.axhline(0, color="tab:blue", linewidth=0.4, alpha=0.4)
+        ax_yaw_err.set_ylabel("compass vs gyro\ntracking err, deg")
+        ax_dev = ax_yaw_err.twinx()
+        ax_dev.plot(t, a["mag_field_dev_pct"], color="tab:red", linewidth=0.6, alpha=0.6,
+                   label="field deviation")
+        ax_dev.set_ylabel("mag field dev\n% from boot ref")
+        nudge_gated = mag_track["nudge_gated"]
+        if np.any(nudge_gated):
+            ax_yaw_err.fill_between(t, ax_yaw_err.get_ylim()[0], ax_yaw_err.get_ylim()[1],
+                                    where=nudge_gated, color="tab:red", alpha=0.08,
+                                    label="nudge gated (interference)")
+        lines1, labels1 = ax_yaw_err.get_legend_handles_labels()
+        lines2, labels2 = ax_dev.get_legend_handles_labels()
+        ax_yaw_err.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=7)
+        ax_yaw_err.set_title("yaw: compass-nudge tracking error & mag health", fontsize=9)
+    else:
+        ax_yaw_err.text(0.5, 0.5, "no healthy mag samples this flight",
+                        ha="center", va="center", transform=ax_yaw_err.transAxes)
+    ax_yaw_err.set_xlabel("time (s)")
 
     ax_motors.set_xlabel("time (s)")
     ax_baro.set_xlabel("time (s)")

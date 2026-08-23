@@ -3,6 +3,10 @@
 static const char *WIFI_SSID = "NachoWi-Fi";
 static const char *WIFI_PASSWORD = "NrMaintain1!";
 
+/* Must match huart6.Init.BaudRate in Core/Src/main.c on the flight controller.
+ * REVERTED to 115200 on 2026-08-22 after 921600 corrupted the UART6 payload
+ * (likely a clock-divisor accuracy issue on the STM32 side) - see the comment
+ * on huart6.Init.BaudRate in main.c for the full writeup. */
 static const uint32_t FC_UART_BAUD = 115200;
 static const int FC_UART_RX_PIN = 16;
 static const int FC_UART_TX_PIN = 17;
@@ -50,9 +54,22 @@ static void connect_wifi()
   Serial.println(WiFi.localIP());
 }
 
+/* Byte-by-byte relaying (one client.write()/Serial2.write() call, plus one
+ * Serial.printf() debug line, PER BYTE) was the actual bottleneck for SD log
+ * pulls - measured ~8.8KB/s, right at the UART's raw baud ceiling, because each
+ * printf() call (formatting + a blocking USB-serial write) took far longer than
+ * one UART bit-time, so debug logging was throttling the relay to barely UART
+ * speed regardless of how fast the far ends could go. Found/fixed 2026-08-22.
+ * Draining each side into a local buffer and doing ONE write() per loop pass
+ * removes that bottleneck; the buffer size just needs to comfortably exceed
+ * what one loop() iteration can accumulate. */
+static uint8_t s_uart_to_tcp_buf[512];
+static uint8_t s_tcp_to_uart_buf[512];
+
 void setup()
 {
   Serial.begin(115200);
+  Serial2.setRxBufferSize(2048);
   Serial2.begin(FC_UART_BAUD, SERIAL_8N1, FC_UART_RX_PIN, FC_UART_TX_PIN);
 
   connect_wifi();
@@ -85,20 +102,26 @@ void loop()
 
   if (client && client.connected())
   {
-    while (Serial2.available() > 0)
+    int n = 0;
+    while (Serial2.available() > 0 && n < (int)sizeof(s_uart_to_tcp_buf))
     {
-      uint8_t b = (uint8_t)Serial2.read();
-      client.write(&b, 1);
-      uart_to_tcp_bytes++;
-      Serial.printf("[ESP32] UART→TCP: 0x%02X ('%c')\r\n", b, (b >= 32 && b < 127) ? (char)b : '?');
+      s_uart_to_tcp_buf[n++] = (uint8_t)Serial2.read();
+    }
+    if (n > 0)
+    {
+      client.write(s_uart_to_tcp_buf, n);
+      uart_to_tcp_bytes += (uint32_t)n;
     }
 
-    while (client.available() > 0)
+    int m = 0;
+    while (client.available() > 0 && m < (int)sizeof(s_tcp_to_uart_buf))
     {
-      uint8_t b = (uint8_t)client.read();
-      Serial2.write(&b, 1);
-      tcp_to_uart_bytes++;
-      Serial.printf("[ESP32] TCP→UART: 0x%02X ('%c')\r\n", b, (b >= 32 && b < 127) ? (char)b : '?');
+      s_tcp_to_uart_buf[m++] = (uint8_t)client.read();
+    }
+    if (m > 0)
+    {
+      Serial2.write(s_tcp_to_uart_buf, m);
+      tcp_to_uart_bytes += (uint32_t)m;
     }
   }
 

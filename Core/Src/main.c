@@ -1000,6 +1000,16 @@ static void MX_USART6_UART_Init(void)
 
   /* USER CODE END USART6_Init 1 */
   huart6.Instance = USART6;
+  /* REVERTED to 115200 on 2026-08-22: tried 921600 (see git history) to speed up
+   * SD log pulls over the ESP32 WiFi bridge - this link's throughput was
+   * matching 115200 almost exactly regardless of bridge-side relay efficiency,
+   * so a higher baud looked like the fix. In practice 921600 corrupted the data
+   * (confirmed via a raw socket capture: valid ASCII from the ESP32's own boot
+   * banner, garbage binary immediately after for the actual UART6 payload) -
+   * very likely a clock-divisor accuracy problem at that rate on this UART6
+   * clock source, not investigated further. Don't re-attempt a baud increase
+   * without first checking the actual UART6 peripheral clock and achievable
+   * baud error % at the target rate. */
   huart6.Init.BaudRate = 115200;
   huart6.Init.WordLength = UART_WORDLENGTH_8B;
   huart6.Init.StopBits = UART_STOPBITS_1;
