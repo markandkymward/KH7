@@ -33,6 +33,7 @@ set(MX_Application_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/app.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/attitude.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/baro.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/vert_ekf.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/communications.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/gps.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/imu.c

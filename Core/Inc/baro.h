@@ -23,6 +23,10 @@ uint8_t Baro_GetDetectedAddr7(void);
 uint8_t Baro_GetLastChipId(void);
 float Baro_GetAltitudeM(void);
 float Baro_GetClimbRateMps(void);
+/* Ground-reference-zeroed, propwash-corrected, but NOT LPF-smoothed - see the
+ * comment on g_alt_raw_m in baro.c. For vert_ekf.c's measurement update; everything
+ * else should keep using Baro_GetAltitudeM(). */
+float Baro_GetRawAltitudeM(void);
 
 #ifdef __cplusplus
 }

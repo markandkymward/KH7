@@ -21,6 +21,7 @@
 #define GPS_UBX_ID_CFG_PRT       0x00U
 #define GPS_UBX_ID_CFG_MSG       0x01U
 #define GPS_UBX_ID_CFG_RATE      0x08U
+#define GPS_UBX_ID_CFG_NAV5      0x24U
 #define GPS_UBX_ID_CFG_CFG       0x09U
 #define GPS_UBX_ID_CFG_RST       0x04U
 /* Raise the nav solution rate from the module's 1Hz default - the velocity-brake
@@ -66,17 +67,22 @@ static uint8_t g_configured = 0U;
 static volatile uint8_t g_last_prt_acked = 0U;
 static volatile uint8_t g_last_msg_acked = 0U;
 static volatile uint8_t g_last_rate_acked = 0U;
+static volatile uint8_t g_last_nav5_acked = 0U;
 
 static volatile uint8_t g_fix_type = 0U;
 static volatile uint8_t g_num_sv = 0U;
 static volatile float g_lat_deg = 0.0f;
 static volatile float g_lon_deg = 0.0f;
 static volatile float g_alt_m = 0.0f;
+static volatile float g_alt_ellipsoid_m = 0.0f;
 static volatile float g_h_acc_m = 0.0f;
 static volatile float g_v_acc_m = 0.0f;
 static volatile float g_s_acc_mps = 0.0f;
 static volatile float g_ground_speed_mps = 0.0f;
 static volatile float g_course_deg = 0.0f;
+static volatile float g_head_acc_deg = 0.0f;
+static volatile float g_pdop = 99.99f; /* worst-case-looking default until a real PVT is decoded */
+static volatile uint8_t g_gnss_fix_ok = 0U;
 static volatile float g_vel_n_mps = 0.0f;
 static volatile float g_vel_e_mps = 0.0f;
 static volatile float g_vel_d_mps = 0.0f;
@@ -97,7 +103,8 @@ static void GPS_DecodePvt(const uint8_t *payload)
 {
   int32_t lon_raw;
   int32_t lat_raw;
-  int32_t height_mm;
+  int32_t height_ellipsoid_mm;
+  int32_t height_msl_mm;
   uint32_t itow_ms;
   uint32_t h_acc_mm;
   uint32_t v_acc_mm;
@@ -107,6 +114,8 @@ static void GPS_DecodePvt(const uint8_t *payload)
   int32_t gspeed_mm_s;
   int32_t head_mot_raw;
   uint32_t s_acc_mm_s;
+  uint32_t head_acc_raw;
+  uint16_t pdop_raw;
 
   itow_ms = (uint32_t)payload[0] | ((uint32_t)payload[1] << 8) |
             ((uint32_t)payload[2] << 16) | ((uint32_t)payload[3] << 24);
@@ -115,8 +124,15 @@ static void GPS_DecodePvt(const uint8_t *payload)
                        ((uint32_t)payload[26] << 16) | ((uint32_t)payload[27] << 24));
   lat_raw = (int32_t)((uint32_t)payload[28] | ((uint32_t)payload[29] << 8) |
                        ((uint32_t)payload[30] << 16) | ((uint32_t)payload[31] << 24));
-  height_mm = (int32_t)((uint32_t)payload[36] | ((uint32_t)payload[37] << 8) |
-                        ((uint32_t)payload[38] << 16) | ((uint32_t)payload[39] << 24));
+  /* UBX-NAV-PVT payload layout has TWO height fields back to back: height-above-
+   * ellipsoid at offset 32, then height-above-mean-sea-level (hMSL) at offset 36 -
+   * see GPS_GetAltitudeM()'s comment for why this project's "altitude" getter has
+   * always been the hMSL one (offset 36), not this ellipsoid one. Both are cheap to
+   * keep now that this function already walks past both fields. */
+  height_ellipsoid_mm = (int32_t)((uint32_t)payload[32] | ((uint32_t)payload[33] << 8) |
+                                  ((uint32_t)payload[34] << 16) | ((uint32_t)payload[35] << 24));
+  height_msl_mm = (int32_t)((uint32_t)payload[36] | ((uint32_t)payload[37] << 8) |
+                            ((uint32_t)payload[38] << 16) | ((uint32_t)payload[39] << 24));
   h_acc_mm = (uint32_t)payload[40] | ((uint32_t)payload[41] << 8) |
              ((uint32_t)payload[42] << 16) | ((uint32_t)payload[43] << 24);
   v_acc_mm = (uint32_t)payload[44] | ((uint32_t)payload[45] << 8) |
@@ -133,12 +149,29 @@ static void GPS_DecodePvt(const uint8_t *payload)
                            ((uint32_t)payload[66] << 16) | ((uint32_t)payload[67] << 24));
   s_acc_mm_s = (uint32_t)payload[68] | ((uint32_t)payload[69] << 8) |
                ((uint32_t)payload[70] << 16) | ((uint32_t)payload[71] << 24);
+  /* headAcc (offset 72, U4, same 1e-5 deg scaling as headMot) - accuracy estimate for
+   * the course-over-ground value above. Was never parsed before, so headMot had no
+   * paired accuracy to gate trust on, unlike every other value/accuracy pair this
+   * driver exposes (hAcc, vAcc, sAcc). */
+  head_acc_raw = (uint32_t)payload[72] | ((uint32_t)payload[73] << 8) |
+                 ((uint32_t)payload[74] << 16) | ((uint32_t)payload[75] << 24);
+  /* pDOP (offset 76, U2, scale 0.01) - position dilution of precision, a pure
+   * satellite-geometry quality metric independent of the receiver's own hAcc error
+   * estimate. Standard practice to gate on both together since hAcc can be
+   * overconfident in poor geometry. Was never parsed before. */
+  pdop_raw = (uint16_t)((uint16_t)payload[76] | ((uint16_t)payload[77] << 8));
 
   g_fix_type = payload[20];
+  /* flags (offset 21), bit 0 = gnssFixOK - the receiver's own authoritative "is this
+   * fix actually good" confidence flag, distinct from (and more reliable than)
+   * fixType alone: fixType can report a 3D fix during a marginal/transient solution
+   * that the receiver itself doesn't yet trust. Was never checked anywhere before. */
+  g_gnss_fix_ok = (uint8_t)(payload[21] & 0x01U);
   g_num_sv = payload[23];
   g_lat_deg = (float)lat_raw * 1.0e-7f;
   g_lon_deg = (float)lon_raw * 1.0e-7f;
-  g_alt_m = (float)height_mm * 0.001f;
+  g_alt_ellipsoid_m = (float)height_ellipsoid_mm * 0.001f;
+  g_alt_m = (float)height_msl_mm * 0.001f;
   g_h_acc_m = (float)h_acc_mm * 0.001f;
   g_v_acc_m = (float)v_acc_mm * 0.001f;
   g_s_acc_mps = (float)s_acc_mm_s * 0.001f;
@@ -148,6 +181,8 @@ static void GPS_DecodePvt(const uint8_t *payload)
   g_ground_speed_mps = (float)gspeed_mm_s * 0.001f;
   /* headMot is degrees * 1e-5, 0..360, already clockwise-from-north (compass convention). */
   g_course_deg = (float)head_mot_raw * 1.0e-5f;
+  g_head_acc_deg = (float)head_acc_raw * 1.0e-5f;
+  g_pdop = (float)pdop_raw * 0.01f;
   g_last_itow_ms = itow_ms;
   g_last_pvt_host_ms = HAL_GetTick();
   g_pvt_update_count++;
@@ -318,10 +353,12 @@ HAL_StatusTypeDef GPS_Init(void)
   uint8_t cfg_prt_payload[20];
   uint8_t cfg_msg_payload[8];
   uint8_t cfg_rate_payload[6];
+  uint8_t cfg_nav5_payload[36];
   uint8_t cfg_cfg_payload[13];
   uint8_t prt_acked;
   uint8_t msg_acked;
   uint8_t rate_acked;
+  uint8_t nav5_acked;
 
   g_configured = 0U;
   g_have_fix_ever = 0U;
@@ -369,6 +406,41 @@ HAL_StatusTypeDef GPS_Init(void)
   GPS_SendUbx(GPS_UBX_CLASS_CFG, GPS_UBX_ID_CFG_RATE, cfg_rate_payload, sizeof(cfg_rate_payload));
   rate_acked = GPS_WaitAck(GPS_UBX_CLASS_CFG, GPS_UBX_ID_CFG_RATE, GPS_ACK_TIMEOUT_MS);
 
+  /* UBX-CFG-NAV5: set dynamic platform model to Airborne <1g (found 2026-09-04,
+   * from analyzing an entire prior flight-test session's captured telemetry - see
+   * kh7_gps_data_and_poshold_design memory). This was never configured before,
+   * so the module ran its factory-default dynamic model (Portable on u-blox
+   * chips), which applies "static hold" position clamping at low speed to
+   * suppress jitter for pedestrian-style use - it freezes the reported lat/lon
+   * bit-for-bit while the receiver judges itself stationary/slow. Cross-
+   * referencing every captured flight this session found GPS position frozen
+   * for 51.6% of total flight time with ZERO correlation to motor PWM (ruling
+   * out motor-current interference), clustered right at liftoff/low-speed - the
+   * exact signature of static hold, and exactly poshold's own operating
+   * envelope, meaning it could report a perfectly-tracking hold while the
+   * aircraft was actually free to drift with the position feed blind to it.
+   * Only the dyn field is masked (bit0) - everything else (fixMode, static-hold
+   * threshold/distance, etc.) is left at the receiver's own defaults, since
+   * dynModel=6 already disables static hold outright for this platform class. */
+  /* Retried up to 3x (2026-09-04): a single lost ACK on this send used to
+   * leave the receiver silently stuck in factory static-hold for the WHOLE
+   * flight session, with no other symptom until someone forensically compared
+   * GPS lat/lon against known real motion - the exact bug this command exists
+   * to fix, reappearing invisibly whenever the one UBX round-trip happened to
+   * drop. This module already has a known history of occasionally not ACKing
+   * a config message it otherwise applies fine (see CFG-PRT/CFG-RATE), so one
+   * attempt was never good enough for a setting this consequential. */
+  memset(cfg_nav5_payload, 0, sizeof(cfg_nav5_payload));
+  cfg_nav5_payload[0] = 0x01U;    /* mask bit0 = apply dyn (dynModel) only */
+  cfg_nav5_payload[1] = 0x00U;
+  cfg_nav5_payload[2] = 6U;       /* dynModel = 6 (Airborne <1g) */
+  nav5_acked = 0U;
+  for (uint8_t nav5_attempt = 0U; (nav5_attempt < 3U) && (nav5_acked == 0U); nav5_attempt++)
+  {
+    GPS_SendUbx(GPS_UBX_CLASS_CFG, GPS_UBX_ID_CFG_NAV5, cfg_nav5_payload, sizeof(cfg_nav5_payload));
+    nav5_acked = GPS_WaitAck(GPS_UBX_CLASS_CFG, GPS_UBX_ID_CFG_NAV5, GPS_ACK_TIMEOUT_MS);
+  }
+
   /* UBX-CFG-CFG: save to BBR (no Flash/EEPROM on this module). Best-effort,
    * doesn't gate g_configured since the module works fine without it applied. */
   memset(cfg_cfg_payload, 0, sizeof(cfg_cfg_payload));
@@ -386,6 +458,7 @@ HAL_StatusTypeDef GPS_Init(void)
   g_last_prt_acked = prt_acked;
   g_last_msg_acked = msg_acked;
   g_last_rate_acked = rate_acked;
+  g_last_nav5_acked = nav5_acked;
   /* CFG-RATE failing is not fatal (module still works at its default 1Hz) - don't
    * gate g_configured on it, just report it via GPS_GetLastRateAcked() for diagnostics.
    * CFG-PRT given the same treatment 2026-08-21 after the HGLRC M100 Pro (a newer
@@ -397,7 +470,11 @@ HAL_StatusTypeDef GPS_Init(void)
    * documented default - so the port is very likely already exactly what CFG-PRT
    * was asking for, which is plausibly why it saw no state change to ACK). Still
    * sent every init for modules that DO need/honor it; just no longer required
-   * for g_configured, matching the CFG-RATE precedent above. */
+   * for g_configured, matching the CFG-RATE precedent above. CFG-NAV5 (dynamic
+   * model) gets the identical treatment for the identical reason - it's a real
+   * improvement when it lands, but the module still flies (just with static-
+   * hold's low-speed position clamp back in play) if this specific module ever
+   * declines to ACK it the way CFG-PRT already does. */
   g_configured = (msg_acked != 0U);
   return (g_configured != 0U) ? HAL_OK : HAL_ERROR;
 }
@@ -644,6 +721,11 @@ uint8_t GPS_GetLastRateAcked(void)
   return g_last_rate_acked;
 }
 
+uint8_t GPS_GetLastNav5Acked(void)
+{
+  return g_last_nav5_acked;
+}
+
 uint8_t GPS_IsHealthy(void)
 {
   uint32_t age_ms;
@@ -685,6 +767,26 @@ float GPS_GetLongitudeDeg(void)
 float GPS_GetAltitudeM(void)
 {
   return g_alt_m;
+}
+
+float GPS_GetAltitudeEllipsoidM(void)
+{
+  return g_alt_ellipsoid_m;
+}
+
+uint8_t GPS_GetGnssFixOk(void)
+{
+  return g_gnss_fix_ok;
+}
+
+float GPS_GetPdop(void)
+{
+  return g_pdop;
+}
+
+float GPS_GetHeadingAccuracyDeg(void)
+{
+  return g_head_acc_deg;
 }
 
 float GPS_GetHorizontalAccuracyM(void)

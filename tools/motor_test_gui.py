@@ -49,6 +49,19 @@ MAG_CAL_OK_RE = re.compile(
     r"wxy=(-?\d*\.?\d+) wxz=(-?\d*\.?\d+) wyz=(-?\d*\.?\d+)\]"
 )
 MAG_CAL_FAIL_RE = re.compile(r"MAG_CAL\[FAIL([^\]]*)\]")
+# ESP32-side HC-SR04 rangefinder, sent over the ESP32's own bridge_client_printf()
+# side-channel (not FC-forwarded telemetry) - see esp32_s3_uart6_wifi_bridge.ino.
+RANGE_RE = re.compile(r"\[BRIDGE\] RANGE cm=([\d.]+) age_ms=(\d+)")
+# TF-Luna LiDAR (2026-08-25), added alongside the HC-SR04 above via the same
+# side-channel mechanism - see esp32_s3_uart6_wifi_bridge.ino's LUNA_RX_PIN comment.
+LUNA_RE = re.compile(r"\[BRIDGE\] LUNA cm=([\d.]+)")
+# vert_ekf.c live bench-validation line (2026-08-29) - FC-originated telemetry, so no
+# [BRIDGE] prefix (that prefix is only for ESP32-originated lines like RANGE/LUNA
+# above) - see Telemetry_PrintVertEkfState() in telemetry.c for the exact format.
+VEKF_RE = re.compile(
+    r"VEKF\[healthy h_cm vz_cms bias_mm_s2 lidar_h_cm sonar_h_cm\]="
+    r"\[(\d+) (-?\d+) (-?\d+) (-?\d+) (-?\d+) (-?\d+)\]"
+)
 MAG_CAL_STATUS_RE = re.compile(
     r"MAG_CAL_STATUS\[calibrated=(\d+) cx=(-?\d*\.?\d+) cy=(-?\d*\.?\d+) cz=(-?\d*\.?\d+) "
     r"wxx=(-?\d*\.?\d+) wyy=(-?\d*\.?\d+) wzz=(-?\d*\.?\d+) "
@@ -63,12 +76,14 @@ NAVPOS_LINE_RE = re.compile(
     r"velraw=\[(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\]\s+"
     r"velfilt=\[(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\]"
 )
-NAVBRK_LINE_RE = re.compile(
-    r"NAVBRK\[req act tiltlim acclim\]=\[(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\]\s+"
+NAVCTL_LINE_RE = re.compile(
+    r"NAVCTL\[req act tiltlim acclim\]=\[(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\]\s+"
     r"desvel=\[(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\]\s+"
     r"velerr=\[(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\]\s+"
     r"accel=\[(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\]\s+"
-    r"ang=\[(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\]"
+    r"ang=\[(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\]\s+"
+    r"tgt=\[(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\]\s+"
+    r"err=\[(-?\d*\.?\d+)\s+(-?\d*\.?\d+)\]"
 )
 NAV_LOST_RE = re.compile(r"NAV_LOST\[reason=([^\]]+)\]")
 NAV_FIX_NAMES = {0: "No fix", 1: "Dead reckoning", 2: "2D", 3: "3D", 4: "GNSS+DR", 5: "Time only"}
@@ -79,6 +94,26 @@ NAV_INVALID_REASON_NAMES = {
 }
 MODE_LINE_RE = re.compile(r"MODE\[name=([^\s\]]+) ch6=(\d+)\]")
 ATT_LINE_RE = re.compile(r"ATT\[src=([^\]]+)\]=\[ROLL_KP\s+([-+]?\d*\.?\d+)\s+PITCH_KP\s+([-+]?\d*\.?\d+)\s+MAX_ANG\s+([-+]?\d*\.?\d+)\]")
+ALTHOLD_KP_RE = re.compile(r"ALTHOLD_KP\[src=(\w+) value=([-+]?\d*\.?\d+) min=([-+]?\d*\.?\d+) max=([-+]?\d*\.?\d+)\]")
+ALTHOLD_KP_FAIL_RE = re.compile(r"ALTHOLD_KP_SET\[FAIL(?: reason=(\w+))?")
+ALTHOLD_MAXCLIMB_RE = re.compile(r"ALTHOLD_MAXCLIMB\[src=(\w+) value=([-+]?\d*\.?\d+) min=([-+]?\d*\.?\d+) max=([-+]?\d*\.?\d+)\]")
+ALTHOLD_MAXCLIMB_FAIL_RE = re.compile(r"ALTHOLD_MAXCLIMB_SET\[FAIL(?: reason=(\w+))?")
+ALTHOLD_POSKI_RE = re.compile(r"ALTHOLD_POSKI\[src=(\w+) value=([-+]?\d*\.?\d+) min=([-+]?\d*\.?\d+) max=([-+]?\d*\.?\d+)\]")
+ALTHOLD_POSKI_FAIL_RE = re.compile(r"ALTHOLD_POSKI_SET\[FAIL(?: reason=(\w+))?")
+ALTHOLD_VZKP_RE = re.compile(r"ALTHOLD_VZKP\[src=(\w+) value=([-+]?\d*\.?\d+) min=([-+]?\d*\.?\d+) max=([-+]?\d*\.?\d+)\]")
+ALTHOLD_VZKP_FAIL_RE = re.compile(r"ALTHOLD_VZKP_SET\[FAIL(?: reason=(\w+))?")
+ALTHOLD_VZKI_RE = re.compile(r"ALTHOLD_VZKI\[src=(\w+) value=([-+]?\d*\.?\d+) min=([-+]?\d*\.?\d+) max=([-+]?\d*\.?\d+)\]")
+ALTHOLD_VZKI_FAIL_RE = re.compile(r"ALTHOLD_VZKI_SET\[FAIL(?: reason=(\w+))?")
+ALTHOLD_DAMPGAIN_RE = re.compile(r"ALTHOLD_DAMPGAIN\[src=(\w+) value=([-+]?\d*\.?\d+) min=([-+]?\d*\.?\d+) max=([-+]?\d*\.?\d+)\]")
+ALTHOLD_DAMPGAIN_FAIL_RE = re.compile(r"ALTHOLD_DAMPGAIN_SET\[FAIL(?: reason=(\w+))?")
+ALTHOLD_DAMPLIMIT_RE = re.compile(r"ALTHOLD_DAMPLIMIT\[src=(\w+) value=([-+]?\d*\.?\d+) min=([-+]?\d*\.?\d+) max=([-+]?\d*\.?\d+)\]")
+ALTHOLD_DAMPLIMIT_FAIL_RE = re.compile(r"ALTHOLD_DAMPLIMIT_SET\[FAIL(?: reason=(\w+))?")
+ALTHOLD_SAVE_RE = re.compile(r"ALTHOLD_SAVE\[(OK|FAIL)\]")
+ALTHOLD_LOAD_RE = re.compile(r"ALTHOLD_LOAD\[(OK|FAIL_OR_NONE_SAVED)\]")
+NAVPOS_KP_RE = re.compile(r"NAVPOS_KP\[src=(\w+) value=([-+]?\d*\.?\d+) min=([-+]?\d*\.?\d+) max=([-+]?\d*\.?\d+)\]")
+NAVPOS_KP_FAIL_RE = re.compile(r"NAVPOS_KP_SET\[FAIL(?: reason=(\w+))?")
+NAVPOS_KI_RE = re.compile(r"NAVPOS_KI\[src=(\w+) value=([-+]?\d*\.?\d+) min=([-+]?\d*\.?\d+) max=([-+]?\d*\.?\d+)\]")
+NAVPOS_KI_FAIL_RE = re.compile(r"NAVPOS_KI_SET\[FAIL(?: reason=(\w+))?")
 PID_LINE_RE = re.compile(
     r"PID\[src=([^\]]+)\]=\[R\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+"
     r"P\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+"
@@ -126,7 +161,7 @@ BB_FIELD_NAMES = (
     "pilot_roll_stick_us", "pilot_pitch_stick_us",
 )
 BB_FLIGHT_GAP_MS = 1500  # a stored-sample time gap bigger than this means a new flight
-BB_FLIGHT_MODE_NAMES = {0: "RATE", 1: "ATTITUDE", 2: "ALTHOLD", 3: "NAVBRAKE"}
+BB_FLIGHT_MODE_NAMES = {0: "RATE", 1: "ATTITUDE", 2: "ALTHOLD", 3: "NAVPOSHOLD"}
 
 
 def _bb_parse_records(text: str) -> list:
@@ -223,6 +258,8 @@ class Kh7GroundGui:
             "motor_4": [],
             "baro_alt": [],
             "baro_vz": [],
+            "range_cm": [],
+            "luna_cm": [],
             "mag_heading": [],
             "nav_north": [],
             "nav_east": [],
@@ -240,11 +277,42 @@ class Kh7GroundGui:
         self.event_var = tk.StringVar(value="Ready")
         self.bridge_ip_var = tk.StringVar(value="Bridge IP: -")
         self.bridge_status_var = tk.StringVar(value="Bridge status: -")
+        self.range_var = tk.StringVar(value="-")
+        self.luna_var = tk.StringVar(value="-")
+        # vert_ekf.c live bench-validation fields (2026-08-29) - see
+        # Telemetry_PrintVertEkfState()'s comment in telemetry.c. lidar/sonar are the
+        # tilt+lever-arm-COMPENSATED implied heights, not raw slant range - the point
+        # is watching these specifically move the right way while manually tilting
+        # the aircraft, compared against the already-displayed raw Range/LiDAR cm.
+        self.vekf_h_var = tk.StringVar(value="-")
+        self.vekf_vz_var = tk.StringVar(value="-")
+        self.vekf_lidar_proj_var = tk.StringVar(value="-")
+        self.vekf_sonar_proj_var = tk.StringVar(value="-")
         self.bridge_status_lines = []
         self.battery_var = tk.StringVar(value="Battery: -")
         self.mode_var = tk.StringVar(value="Mode: -")
         self.pid_status_var = tk.StringVar(value="PID: idle")
         self.att_status_var = tk.StringVar(value="ATT: idle")
+        self.althold_kp_var = tk.StringVar(value="")
+        self.althold_kp_status_var = tk.StringVar(value="ALTHOLD KP: idle")
+        self.althold_maxclimb_var = tk.StringVar(value="")
+        self.althold_maxclimb_status_var = tk.StringVar(value="MAX CLIMB: idle")
+        self.althold_poski_var = tk.StringVar(value="")
+        self.althold_poski_status_var = tk.StringVar(value="HOLD KI: idle")
+        self.althold_vzkp_var = tk.StringVar(value="")
+        self.althold_vzkp_status_var = tk.StringVar(value="VZ KP: idle")
+        self.althold_vzki_var = tk.StringVar(value="")
+        self.althold_vzki_status_var = tk.StringVar(value="VZ KI: idle")
+        self.althold_dampgain_var = tk.StringVar(value="")
+        self.althold_dampgain_status_var = tk.StringVar(value="DAMP GAIN: idle")
+        self.althold_damplimit_var = tk.StringVar(value="")
+        self.althold_damplimit_status_var = tk.StringVar(value="DAMP LIMIT: idle")
+        self.althold_saveload_status_var = tk.StringVar(value="FLASH: idle")
+        self.poshold_kp_var = tk.StringVar(value="")
+        self.poshold_kp_status_var = tk.StringVar(value="POS KP: idle")
+        self.poshold_ki_var = tk.StringVar(value="")
+        self.poshold_ki_status_var = tk.StringVar(value="POS KI: idle")
+        self.poshold_state_var = tk.StringVar(value="POSHOLD: -")
         self.pid_debug_var = tk.StringVar(value="PID debug: -")
         self.pid_flash_var = tk.StringVar(value="PID flash: -")
         self.pid_health_var = tk.StringVar(value="PID link: waiting for checks")
@@ -298,7 +366,7 @@ class Kh7GroundGui:
         # GPS problem, but not what you need at a glance, so it's visually de-emphasized
         # in the UI rather than crammed into the primary line.
         self.nav_diag_var = tk.StringVar(value="")
-        self.navbrk_status_var = tk.StringVar(value="NAVBRAKE: req=- act=- tilt_lim=- accel_lim=-")
+        self.navbrk_status_var = tk.StringVar(value="NAVPOSHOLD: req=- act=- tilt_lim=- accel_lim=-")
         self.navbrk_vel_var = tk.StringVar(value="desired/error N,E: -")
         self.navbrk_cmd_var = tk.StringVar(value="accel N/E/fwd/right, ang roll/pitch: -")
         self.nav_lost_var = tk.StringVar(value="Last NAV_LOST: -")
@@ -598,6 +666,15 @@ class Kh7GroundGui:
 
         self._sensor_metric(sensor_box, 3, 0, "VZ (m/s)", self.baro_vz_var)
         self._sensor_metric(sensor_box, 3, 2, "Sats", self.gps_sats_var)
+        self._sensor_metric(sensor_box, 3, 4, "Range (cm)", self.range_var)
+        self._sensor_metric(sensor_box, 3, 6, "LiDAR (cm)", self.luna_var)
+
+        # vert_ekf.c bench-validation row - compare Lidar/Sonar proj (tilt-compensated)
+        # against the raw Range/LiDAR cm above while manually tilting the aircraft.
+        self._sensor_metric(sensor_box, 6, 0, "EKF H (cm)", self.vekf_h_var)
+        self._sensor_metric(sensor_box, 6, 2, "EKF VZ (cm/s)", self.vekf_vz_var)
+        self._sensor_metric(sensor_box, 7, 0, "Lidar proj (cm)", self.vekf_lidar_proj_var)
+        self._sensor_metric(sensor_box, 7, 2, "Sonar proj (cm)", self.vekf_sonar_proj_var)
 
         ttk.Label(sensor_box, textvariable=self.baro_init_var, foreground="#9aa6b2").grid(
             row=4, column=0, columnspan=2, sticky="w", padx=(10, 4), pady=(2, 4)
@@ -626,6 +703,7 @@ class Kh7GroundGui:
             row=8, column=4, columnspan=2, sticky="w", padx=(10, 4), pady=(0, 4)
         )
         self._redraw_mag_cal_coverage()
+        self._make_collapsible(sensor_box, "Sensor Health")
 
         # Layout mirrors the field tester display: one prominent GPS status line
         # (fix/sats/hAcc - "is GPS usable right now"), then Position/Velocity, then
@@ -651,6 +729,7 @@ class Kh7GroundGui:
         ttk.Label(nav_box, textvariable=self.nav_lost_var, foreground="#ff8a65").grid(
             row=6, column=0, columnspan=2, sticky="w", padx=8, pady=(2, 6)
         )
+        self._make_collapsible(nav_box, "GPS Navigation / Velocity Brake (experimental)")
 
         mid = ttk.Frame(body)
         mid.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
@@ -662,6 +741,7 @@ class Kh7GroundGui:
         self.motor_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         self.motor_canvas.bind("<Configure>", self._on_motor_canvas_resize)
         self._init_motor_map()
+        self._make_collapsible(map_box, "Logical Motor Map and Commanded Output")
 
         pose_box = ttk.LabelFrame(mid, text="Air Vehicle Pose")
         pose_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
@@ -670,6 +750,7 @@ class Kh7GroundGui:
         self.pose_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         self.pose_canvas.bind("<Configure>", self._on_pose_canvas_resize)
         self._draw_pose_canvas(0.0, 0.0, 0.0)
+        self._make_collapsible(pose_box, "Air Vehicle Pose")
 
         rc_box = ttk.LabelFrame(mid, text="RC Channel Status")
         rc_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
@@ -678,6 +759,7 @@ class Kh7GroundGui:
         self.rc_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         self.rc_canvas.bind("<Configure>", self._on_rc_canvas_resize)
         self._draw_rc_canvas()
+        self._make_collapsible(rc_box, "RC Channel Status")
 
         self.right_panel = ttk.Frame(mid)
         self.right_panel.pack(side=tk.RIGHT, fill=tk.Y)
@@ -791,6 +873,207 @@ class Kh7GroundGui:
             row=5, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 8)
         )
 
+        # Always visible (not part of the RATE/ATTITUDE tuning-mode toggle above) -
+        # added 2026-08-29 so this one gain can be nudged live during a cautious
+        # low-hover ALTHOLD test instead of needing a reflash per attempt. See
+        # APP_ALTHOLD_ALT_HOLD_KP_MPS_PER_M's comment in app.c for why MAX is a hard
+        # safety bound (a real unarrestable in-flight climb/emergency disarm), not
+        # just a sanity check - the firmware itself enforces that bound regardless
+        # of what this field is set to.
+        self.althold_kp_box = ttk.LabelFrame(self.right_panel, text="ALTHOLD Tuning")
+        ttk.Label(self.althold_kp_box, text="Alt Hold Kp").grid(row=0, column=0, sticky="w", padx=(6, 4), pady=(8, 4))
+        ttk.Entry(self.althold_kp_box, width=8, textvariable=self.althold_kp_var).grid(row=0, column=1, sticky="w", padx=(0, 8), pady=(8, 4))
+        althold_kp_btns = ttk.Frame(self.althold_kp_box)
+        althold_kp_btns.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        ttk.Button(althold_kp_btns, text="Read", command=self.althold_kp_read).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(althold_kp_btns, text="Apply", command=self.althold_kp_apply).pack(side=tk.LEFT, padx=4)
+        ttk.Label(
+            self.althold_kp_box,
+            text="Firmware-enforced range: 0.1 .. 1.3 (RAM only, resets on reboot)",
+            foreground="#9aa6b2",
+            justify=tk.LEFT,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+        ttk.Label(self.althold_kp_box, textvariable=self.althold_kp_status_var).grid(
+            row=3, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 8)
+        )
+        ttk.Separator(self.althold_kp_box, orient=tk.HORIZONTAL).grid(
+            row=4, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6)
+        )
+        ttk.Label(self.althold_kp_box, text="Max Climb (m/s)").grid(row=5, column=0, sticky="w", padx=(6, 4), pady=(0, 4))
+        ttk.Entry(self.althold_kp_box, width=8, textvariable=self.althold_maxclimb_var).grid(row=5, column=1, sticky="w", padx=(0, 8), pady=(0, 4))
+        althold_maxclimb_btns = ttk.Frame(self.althold_kp_box)
+        althold_maxclimb_btns.grid(row=6, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        ttk.Button(althold_maxclimb_btns, text="Read", command=self.althold_maxclimb_read).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(althold_maxclimb_btns, text="Apply", command=self.althold_maxclimb_apply).pack(side=tk.LEFT, padx=4)
+        ttk.Label(
+            self.althold_kp_box,
+            text="Firmware-enforced range: 0.5 .. 4.0 (RAM only, resets on reboot)",
+            foreground="#9aa6b2",
+            justify=tk.LEFT,
+        ).grid(row=7, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+        ttk.Label(self.althold_kp_box, textvariable=self.althold_maxclimb_status_var).grid(
+            row=8, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 8)
+        )
+        ttk.Separator(self.althold_kp_box, orient=tk.HORIZONTAL).grid(
+            row=9, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6)
+        )
+        ttk.Label(self.althold_kp_box, text="Hold Ki").grid(row=10, column=0, sticky="w", padx=(6, 4), pady=(0, 4))
+        ttk.Entry(self.althold_kp_box, width=8, textvariable=self.althold_poski_var).grid(row=10, column=1, sticky="w", padx=(0, 8), pady=(0, 4))
+        althold_poski_btns = ttk.Frame(self.althold_kp_box)
+        althold_poski_btns.grid(row=11, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        ttk.Button(althold_poski_btns, text="Read", command=self.althold_poski_read).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(althold_poski_btns, text="Apply", command=self.althold_poski_apply).pack(side=tk.LEFT, padx=4)
+        ttk.Label(
+            self.althold_kp_box,
+            text="Firmware-enforced range: 0.0 .. 0.15 (0 = off; corrects steady-state hold droop)",
+            foreground="#9aa6b2",
+            justify=tk.LEFT,
+        ).grid(row=12, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+        ttk.Label(self.althold_kp_box, textvariable=self.althold_poski_status_var).grid(
+            row=13, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 8)
+        )
+        ttk.Separator(self.althold_kp_box, orient=tk.HORIZONTAL).grid(
+            row=14, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6)
+        )
+        ttk.Label(self.althold_kp_box, text="Vz Kp (inner loop)").grid(row=15, column=0, sticky="w", padx=(6, 4), pady=(0, 4))
+        ttk.Entry(self.althold_kp_box, width=8, textvariable=self.althold_vzkp_var).grid(row=15, column=1, sticky="w", padx=(0, 8), pady=(0, 4))
+        althold_vzkp_btns = ttk.Frame(self.althold_kp_box)
+        althold_vzkp_btns.grid(row=16, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        ttk.Button(althold_vzkp_btns, text="Read", command=self.althold_vzkp_read).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(althold_vzkp_btns, text="Apply", command=self.althold_vzkp_apply).pack(side=tk.LEFT, padx=4)
+        ttk.Label(
+            self.althold_kp_box,
+            text="Firmware-enforced range: 6.0 .. 25.0 (climb-rate trim gain - raise in SMALL steps only)",
+            foreground="#9aa6b2",
+            justify=tk.LEFT,
+        ).grid(row=17, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+        ttk.Label(self.althold_kp_box, textvariable=self.althold_vzkp_status_var).grid(
+            row=18, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 8)
+        )
+        ttk.Separator(self.althold_kp_box, orient=tk.HORIZONTAL).grid(
+            row=19, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6)
+        )
+        ttk.Label(self.althold_kp_box, text="Vz Ki (inner loop)").grid(row=20, column=0, sticky="w", padx=(6, 4), pady=(0, 4))
+        ttk.Entry(self.althold_kp_box, width=8, textvariable=self.althold_vzki_var).grid(row=20, column=1, sticky="w", padx=(0, 8), pady=(0, 4))
+        althold_vzki_btns = ttk.Frame(self.althold_kp_box)
+        althold_vzki_btns.grid(row=21, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        ttk.Button(althold_vzki_btns, text="Read", command=self.althold_vzki_read).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(althold_vzki_btns, text="Apply", command=self.althold_vzki_apply).pack(side=tk.LEFT, padx=4)
+        ttk.Label(
+            self.althold_kp_box,
+            text="Firmware-enforced range: 2.0 .. 8.0 (climb-rate trim integral gain - raise in SMALL steps only)",
+            foreground="#9aa6b2",
+            justify=tk.LEFT,
+        ).grid(row=22, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+        ttk.Label(self.althold_kp_box, textvariable=self.althold_vzki_status_var).grid(
+            row=23, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 8)
+        )
+        ttk.Separator(self.althold_kp_box, orient=tk.HORIZONTAL).grid(
+            row=24, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6)
+        )
+        ttk.Label(self.althold_kp_box, text="Damp Gain").grid(row=25, column=0, sticky="w", padx=(6, 4), pady=(0, 4))
+        ttk.Entry(self.althold_kp_box, width=8, textvariable=self.althold_dampgain_var).grid(row=25, column=1, sticky="w", padx=(0, 8), pady=(0, 4))
+        althold_dampgain_btns = ttk.Frame(self.althold_kp_box)
+        althold_dampgain_btns.grid(row=26, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        ttk.Button(althold_dampgain_btns, text="Read", command=self.althold_dampgain_read).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(althold_dampgain_btns, text="Apply", command=self.althold_dampgain_apply).pack(side=tk.LEFT, padx=4)
+        ttk.Label(
+            self.althold_kp_box,
+            text="Firmware-enforced range: 5.0 .. 45.0 (climb-rate damping gain - opposes rate of approach)",
+            foreground="#9aa6b2",
+            justify=tk.LEFT,
+        ).grid(row=27, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+        ttk.Label(self.althold_kp_box, textvariable=self.althold_dampgain_status_var).grid(
+            row=28, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 8)
+        )
+        ttk.Separator(self.althold_kp_box, orient=tk.HORIZONTAL).grid(
+            row=29, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6)
+        )
+        ttk.Label(self.althold_kp_box, text="Damp Limit (us)").grid(row=30, column=0, sticky="w", padx=(6, 4), pady=(0, 4))
+        ttk.Entry(self.althold_kp_box, width=8, textvariable=self.althold_damplimit_var).grid(row=30, column=1, sticky="w", padx=(0, 8), pady=(0, 4))
+        althold_damplimit_btns = ttk.Frame(self.althold_kp_box)
+        althold_damplimit_btns.grid(row=31, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        ttk.Button(althold_damplimit_btns, text="Read", command=self.althold_damplimit_read).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(althold_damplimit_btns, text="Apply", command=self.althold_damplimit_apply).pack(side=tk.LEFT, padx=4)
+        ttk.Label(
+            self.althold_kp_box,
+            text="Firmware-enforced range: 30 .. 150 (clamp on the damping term above)",
+            foreground="#9aa6b2",
+            justify=tk.LEFT,
+        ).grid(row=32, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+        ttk.Label(self.althold_kp_box, textvariable=self.althold_damplimit_status_var).grid(
+            row=33, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 8)
+        )
+        ttk.Separator(self.althold_kp_box, orient=tk.HORIZONTAL).grid(
+            row=34, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6)
+        )
+        althold_saveload_btns = ttk.Frame(self.althold_kp_box)
+        althold_saveload_btns.grid(row=35, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        ttk.Button(althold_saveload_btns, text="Save All to Flash", command=self.althold_save_all).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(althold_saveload_btns, text="Load All from Flash", command=self.althold_load_all).pack(side=tk.LEFT, padx=4)
+        ttk.Label(
+            self.althold_kp_box,
+            text="Saves ALL 7 values above so they survive a power cycle - refused while armed.\nWithout Save, every value here resets to its compiled default on every boot.",
+            foreground="#9aa6b2",
+            justify=tk.LEFT,
+        ).grid(row=36, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+        ttk.Label(self.althold_kp_box, textvariable=self.althold_saveload_status_var).grid(
+            row=37, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 8)
+        )
+        self.althold_kp_box.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
+        self._make_collapsible(self.althold_kp_box, "ALTHOLD Tuning")
+
+        # NAV_POSHOLD outer-loop gains (2026-09-04 rewrite - one unified GPS mode,
+        # selected on ch6 like any other flight mode) - see APP_NAVPOS_* in app.c.
+        self.poshold_box = ttk.LabelFrame(self.right_panel, text="NAV Position Hold Tuning")
+        ttk.Label(self.poshold_box, text="Pos Kp (m/s per m)").grid(row=0, column=0, sticky="w", padx=(6, 4), pady=(8, 4))
+        ttk.Entry(self.poshold_box, width=8, textvariable=self.poshold_kp_var).grid(row=0, column=1, sticky="w", padx=(0, 8), pady=(8, 4))
+        poshold_kp_btns = ttk.Frame(self.poshold_box)
+        poshold_kp_btns.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        ttk.Button(poshold_kp_btns, text="Read", command=self.poshold_kp_read).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(poshold_kp_btns, text="Apply", command=self.poshold_kp_apply).pack(side=tk.LEFT, padx=4)
+        ttk.Label(
+            self.poshold_box,
+            text="Firmware-enforced range: 0.0 .. 0.8 (RAM only, resets on reboot)",
+            foreground="#9aa6b2",
+            justify=tk.LEFT,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+        ttk.Label(self.poshold_box, textvariable=self.poshold_kp_status_var).grid(
+            row=3, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 8)
+        )
+        ttk.Separator(self.poshold_box, orient=tk.HORIZONTAL).grid(
+            row=4, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6)
+        )
+        ttk.Label(self.poshold_box, text="Pos Ki").grid(row=5, column=0, sticky="w", padx=(6, 4), pady=(0, 4))
+        ttk.Entry(self.poshold_box, width=8, textvariable=self.poshold_ki_var).grid(row=5, column=1, sticky="w", padx=(0, 8), pady=(0, 4))
+        poshold_ki_btns = ttk.Frame(self.poshold_box)
+        poshold_ki_btns.grid(row=6, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        ttk.Button(poshold_ki_btns, text="Read", command=self.poshold_ki_read).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(poshold_ki_btns, text="Apply", command=self.poshold_ki_apply).pack(side=tk.LEFT, padx=4)
+        ttk.Label(
+            self.poshold_box,
+            text="Firmware-enforced range: 0.0 .. 0.15 (0 = off; trims wind-drift)",
+            foreground="#9aa6b2",
+            justify=tk.LEFT,
+        ).grid(row=7, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+        ttk.Label(self.poshold_box, textvariable=self.poshold_ki_status_var).grid(
+            row=8, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 8)
+        )
+        ttk.Separator(self.poshold_box, orient=tk.HORIZONTAL).grid(
+            row=9, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6)
+        )
+        ttk.Label(
+            self.poshold_box,
+            text="Select NAVPOSHOLD on ch6 (top band). Sticks centered = hold once\nsettled; off-center = manual velocity; release = re-latch. Only latches\na target once GPS-measured speed is already near zero.",
+            foreground="#9aa6b2",
+            justify=tk.LEFT,
+        ).grid(row=10, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+        ttk.Label(self.poshold_box, textvariable=self.poshold_state_var).grid(
+            row=11, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 8)
+        )
+        self.poshold_box.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
+        self._make_collapsible(self.poshold_box, "Position Hold Tuning")
+
         self._apply_right_panel_visibility()
 
         charts_box = ttk.LabelFrame(body, text="Strip Charts")
@@ -832,6 +1115,15 @@ class Kh7GroundGui:
 
         self._create_strip_chart(
             charts_box,
+            chart_key="range",
+            title="Rangefinder (cm)",
+            series=[("range_cm", "Sonar", "#45d1ff"), ("luna_cm", "LiDAR", "#c77dff")],
+            y_min=0.0,
+            y_max=800.0,
+        )
+
+        self._create_strip_chart(
+            charts_box,
             chart_key="mag",
             title="Compass Heading (deg, uncompensated)",
             series=[("mag_heading", "Heading", "#c586ff")],
@@ -859,6 +1151,7 @@ class Kh7GroundGui:
             y_min=-2.0,
             y_max=2.0,
         )
+        self._make_collapsible(charts_box, "Strip Charts")
 
         bb_box = ttk.LabelFrame(body, text="Blackbox Playback (SD log)")
         bb_box.pack(fill=tk.X, pady=(0, 10))
@@ -907,6 +1200,7 @@ class Kh7GroundGui:
             text="(reuses the Gyro/Motor strip charts above; no accel/angle data in the SD log)",
             foreground="#9aa6b2",
         ).pack(side=tk.LEFT, padx=(16, 0))
+        self._make_collapsible(bb_box, "Blackbox Playback (SD log)")
 
         log_box = ttk.LabelFrame(body, text="Raw Link Log")
         log_box.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
@@ -933,6 +1227,7 @@ class Kh7GroundGui:
         log_scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
         log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_text.configure(yscrollcommand=log_scroll.set)
+        self._make_collapsible(log_box, "Raw Link Log")
 
         self.scale.set(self.pulse_var.get())
         self._on_transport_changed()
@@ -1202,6 +1497,49 @@ class Kh7GroundGui:
             "y_max": y_max,
         }
         self._redraw_strip_chart(chart_key)
+
+    def _make_collapsible(self, frame: ttk.LabelFrame, title: str) -> None:
+        """Adds a collapse/expand toggle to an existing LabelFrame's title bar,
+        operating on whatever children it already has (grid- or pack-managed)
+        without needing to restructure how those children were built. Collapsing
+        hides the frame's content down to just its title bar; since every caller of
+        this helper packs its frame with side=TOP (vertical stacks) or
+        side=LEFT+expand=True (horizontal rows), tkinter's own pack layout already
+        reflows sibling panes into the freed space with no extra repositioning code
+        needed - a collapsed pane just becomes a thin bar instead of a full box.
+        Deliberately NOT applied to the "Board Telemetry" box (battery/mode must
+        always stay visible in their current format, per explicit instruction)."""
+        state = {"collapsed": False, "children_info": []}
+
+        def toggle() -> None:
+            if not state["collapsed"]:
+                info = []
+                for child in frame.winfo_children():
+                    if child is toggle_btn:
+                        continue
+                    manager = child.winfo_manager()
+                    if manager == "pack":
+                        info.append(("pack", child, child.pack_info()))
+                        child.pack_forget()
+                    elif manager == "grid":
+                        info.append(("grid", child, child.grid_info()))
+                        child.grid_forget()
+                state["children_info"] = info
+                state["collapsed"] = True
+                toggle_btn.configure(text="▶ " + title)
+            else:
+                for manager, child, saved in state["children_info"]:
+                    if manager == "pack":
+                        child.pack(**saved)
+                    else:
+                        clean = {k: v for k, v in saved.items() if k != "in"}
+                        child.grid(**clean)
+                state["children_info"] = []
+                state["collapsed"] = False
+                toggle_btn.configure(text="▼ " + title)
+
+        toggle_btn = ttk.Button(frame, text="▼ " + title, command=toggle)
+        frame.configure(labelwidget=toggle_btn)
 
     def _metric_row(
         self,
@@ -1914,6 +2252,15 @@ class Kh7GroundGui:
         self.pid_received_once = False
         self.start_pid_sync()
         self.att_read()
+        self.althold_kp_read()
+        self.althold_maxclimb_read()
+        self.althold_poski_read()
+        self.althold_vzkp_read()
+        self.althold_vzki_read()
+        self.althold_dampgain_read()
+        self.althold_damplimit_read()
+        self.poshold_kp_read()
+        self.poshold_ki_read()
         self._query_mag_cal_status()
 
     def connect(self, show_errors: bool = True) -> bool:
@@ -1922,6 +2269,13 @@ class Kh7GroundGui:
             if connected:
                 self.start_pid_sync()
                 self.att_read()
+                self.althold_kp_read()
+                self.althold_maxclimb_read()
+                self.althold_poski_read()
+                self.althold_vzkp_read()
+                self.althold_vzki_read()
+                self.althold_dampgain_read()
+                self.althold_damplimit_read()
                 self._query_mag_cal_status()
             return connected
 
@@ -2048,6 +2402,32 @@ class Kh7GroundGui:
             elif "[OFF" in line:
                 self.escpt_status_var.set("ESC pass-through: OFF")
             self.event_var.set(line)
+            return
+
+        m_range = RANGE_RE.search(line)
+        if m_range is not None:
+            cm, _age_ms = m_range.groups()
+            range_cm = float(cm)
+            self.range_var.set(f"{range_cm:.1f}")
+            self._append_samples([("range_cm", range_cm)])
+            self._redraw_strip_chart("range")
+            return
+
+        m_luna = LUNA_RE.search(line)
+        if m_luna is not None:
+            luna_cm = float(m_luna.group(1))
+            self.luna_var.set(f"{luna_cm:.1f}")
+            self._append_samples([("luna_cm", luna_cm)])
+            self._redraw_strip_chart("range")
+            return
+
+        m_vekf = VEKF_RE.search(line)
+        if m_vekf is not None:
+            _healthy, h_cm, vz_cms, _bias_mm_s2, lidar_h_cm, sonar_h_cm = m_vekf.groups()
+            self.vekf_h_var.set(f"{int(h_cm)}")
+            self.vekf_vz_var.set(f"{int(vz_cms)}")
+            self.vekf_lidar_proj_var.set(f"{int(lidar_h_cm)}")
+            self.vekf_sonar_proj_var.set(f"{int(sonar_h_cm)}")
             return
 
         if line.startswith("[BRIDGE]") or line.startswith("[WIFI]") or line.startswith("[TCP]") or line.startswith("[STAT]") or line.startswith("[BOOT]") or line.startswith("[UART2]") or line.startswith("[MDNS]"):
@@ -2182,6 +2562,176 @@ class Kh7GroundGui:
                 self._cancel_att_verify()
             else:
                 self.att_status_var.set(f"ATT source: {m_att.group(1)}")
+            return
+
+        m_althold_kp_fail = ALTHOLD_KP_FAIL_RE.search(line)
+        if m_althold_kp_fail is not None:
+            reason = m_althold_kp_fail.group(1) or "unknown"
+            self.althold_kp_status_var.set(f"ALTHOLD KP: rejected by FC ({reason})")
+            return
+
+        m_althold_kp = ALTHOLD_KP_RE.search(line)
+        if m_althold_kp is not None:
+            src = m_althold_kp.group(1)
+            value = float(m_althold_kp.group(2))
+            kp_min = float(m_althold_kp.group(3))
+            kp_max = float(m_althold_kp.group(4))
+            self.althold_kp_var.set(f"{value:.4f}")
+            verb = "confirmed" if src == "set" else "current"
+            self.althold_kp_status_var.set(f"ALTHOLD KP: {verb} value {value:.4f} (range {kp_min:.1f}..{kp_max:.1f})")
+            return
+
+        m_maxclimb_fail = ALTHOLD_MAXCLIMB_FAIL_RE.search(line)
+        if m_maxclimb_fail is not None:
+            reason = m_maxclimb_fail.group(1) or "unknown"
+            self.althold_maxclimb_status_var.set(f"MAX CLIMB: rejected by FC ({reason})")
+            return
+
+        m_maxclimb = ALTHOLD_MAXCLIMB_RE.search(line)
+        if m_maxclimb is not None:
+            src = m_maxclimb.group(1)
+            value = float(m_maxclimb.group(2))
+            mc_min = float(m_maxclimb.group(3))
+            mc_max = float(m_maxclimb.group(4))
+            self.althold_maxclimb_var.set(f"{value:.4f}")
+            verb = "confirmed" if src == "set" else "current"
+            self.althold_maxclimb_status_var.set(f"MAX CLIMB: {verb} value {value:.4f} m/s (range {mc_min:.1f}..{mc_max:.1f})")
+            return
+
+        m_poski_fail = ALTHOLD_POSKI_FAIL_RE.search(line)
+        if m_poski_fail is not None:
+            reason = m_poski_fail.group(1) or "unknown"
+            self.althold_poski_status_var.set(f"HOLD KI: rejected by FC ({reason})")
+            return
+
+        m_poski = ALTHOLD_POSKI_RE.search(line)
+        if m_poski is not None:
+            src = m_poski.group(1)
+            value = float(m_poski.group(2))
+            ki_min = float(m_poski.group(3))
+            ki_max = float(m_poski.group(4))
+            self.althold_poski_var.set(f"{value:.4f}")
+            verb = "confirmed" if src == "set" else "current"
+            self.althold_poski_status_var.set(f"HOLD KI: {verb} value {value:.4f} (range {ki_min:.2f}..{ki_max:.2f})")
+            return
+
+        m_navpos_kp_fail = NAVPOS_KP_FAIL_RE.search(line)
+        if m_navpos_kp_fail is not None:
+            reason = m_navpos_kp_fail.group(1) or "unknown"
+            self.poshold_kp_status_var.set(f"POS KP: rejected by FC ({reason})")
+            return
+
+        m_navpos_kp = NAVPOS_KP_RE.search(line)
+        if m_navpos_kp is not None:
+            src = m_navpos_kp.group(1)
+            value = float(m_navpos_kp.group(2))
+            kp_min = float(m_navpos_kp.group(3))
+            kp_max = float(m_navpos_kp.group(4))
+            self.poshold_kp_var.set(f"{value:.4f}")
+            verb = "confirmed" if src == "set" else "current"
+            self.poshold_kp_status_var.set(f"POS KP: {verb} value {value:.4f} (range {kp_min:.2f}..{kp_max:.2f})")
+            return
+
+        m_navpos_ki_fail = NAVPOS_KI_FAIL_RE.search(line)
+        if m_navpos_ki_fail is not None:
+            reason = m_navpos_ki_fail.group(1) or "unknown"
+            self.poshold_ki_status_var.set(f"POS KI: rejected by FC ({reason})")
+            return
+
+        m_navpos_ki = NAVPOS_KI_RE.search(line)
+        if m_navpos_ki is not None:
+            src = m_navpos_ki.group(1)
+            value = float(m_navpos_ki.group(2))
+            ki_min = float(m_navpos_ki.group(3))
+            ki_max = float(m_navpos_ki.group(4))
+            self.poshold_ki_var.set(f"{value:.4f}")
+            verb = "confirmed" if src == "set" else "current"
+            self.poshold_ki_status_var.set(f"POS KI: {verb} value {value:.4f} (range {ki_min:.2f}..{ki_max:.2f})")
+            return
+
+        m_vzkp_fail = ALTHOLD_VZKP_FAIL_RE.search(line)
+        if m_vzkp_fail is not None:
+            reason = m_vzkp_fail.group(1) or "unknown"
+            self.althold_vzkp_status_var.set(f"VZ KP: rejected by FC ({reason})")
+            return
+
+        m_vzkp = ALTHOLD_VZKP_RE.search(line)
+        if m_vzkp is not None:
+            src = m_vzkp.group(1)
+            value = float(m_vzkp.group(2))
+            kp_min = float(m_vzkp.group(3))
+            kp_max = float(m_vzkp.group(4))
+            self.althold_vzkp_var.set(f"{value:.4f}")
+            verb = "confirmed" if src == "set" else "current"
+            self.althold_vzkp_status_var.set(f"VZ KP: {verb} value {value:.4f} (range {kp_min:.2f}..{kp_max:.2f})")
+            return
+
+        m_vzki_fail = ALTHOLD_VZKI_FAIL_RE.search(line)
+        if m_vzki_fail is not None:
+            reason = m_vzki_fail.group(1) or "unknown"
+            self.althold_vzki_status_var.set(f"VZ KI: rejected by FC ({reason})")
+            return
+
+        m_vzki = ALTHOLD_VZKI_RE.search(line)
+        if m_vzki is not None:
+            src = m_vzki.group(1)
+            value = float(m_vzki.group(2))
+            ki_min = float(m_vzki.group(3))
+            ki_max = float(m_vzki.group(4))
+            self.althold_vzki_var.set(f"{value:.4f}")
+            verb = "confirmed" if src == "set" else "current"
+            self.althold_vzki_status_var.set(f"VZ KI: {verb} value {value:.4f} (range {ki_min:.2f}..{ki_max:.2f})")
+            return
+
+        m_dampgain_fail = ALTHOLD_DAMPGAIN_FAIL_RE.search(line)
+        if m_dampgain_fail is not None:
+            reason = m_dampgain_fail.group(1) or "unknown"
+            self.althold_dampgain_status_var.set(f"DAMP GAIN: rejected by FC ({reason})")
+            return
+
+        m_dampgain = ALTHOLD_DAMPGAIN_RE.search(line)
+        if m_dampgain is not None:
+            src = m_dampgain.group(1)
+            value = float(m_dampgain.group(2))
+            gain_min = float(m_dampgain.group(3))
+            gain_max = float(m_dampgain.group(4))
+            self.althold_dampgain_var.set(f"{value:.4f}")
+            verb = "confirmed" if src == "set" else "current"
+            self.althold_dampgain_status_var.set(f"DAMP GAIN: {verb} value {value:.4f} (range {gain_min:.2f}..{gain_max:.2f})")
+            return
+
+        m_damplimit_fail = ALTHOLD_DAMPLIMIT_FAIL_RE.search(line)
+        if m_damplimit_fail is not None:
+            reason = m_damplimit_fail.group(1) or "unknown"
+            self.althold_damplimit_status_var.set(f"DAMP LIMIT: rejected by FC ({reason})")
+            return
+
+        m_damplimit = ALTHOLD_DAMPLIMIT_RE.search(line)
+        if m_damplimit is not None:
+            src = m_damplimit.group(1)
+            value = float(m_damplimit.group(2))
+            limit_min = float(m_damplimit.group(3))
+            limit_max = float(m_damplimit.group(4))
+            self.althold_damplimit_var.set(f"{value:.4f}")
+            verb = "confirmed" if src == "set" else "current"
+            self.althold_damplimit_status_var.set(f"DAMP LIMIT: {verb} value {value:.4f} (range {limit_min:.0f}..{limit_max:.0f})")
+            return
+
+        m_ah_save = ALTHOLD_SAVE_RE.search(line)
+        if m_ah_save is not None:
+            ok = m_ah_save.group(1) == "OK"
+            self.althold_saveload_status_var.set(
+                "FLASH: saved all 7 values" if ok else "FLASH: save FAILED (refused while armed?)"
+            )
+            return
+
+        m_ah_load = ALTHOLD_LOAD_RE.search(line)
+        if m_ah_load is not None:
+            ok = m_ah_load.group(1) == "OK"
+            self.althold_saveload_status_var.set(
+                "FLASH: loaded all 7 values (fields below updated)" if ok
+                else "FLASH: nothing saved yet (or load failed) - fields unchanged"
+            )
             return
 
         m_arm_event = ARM_EVENT_RE.search(line)
@@ -2435,15 +2985,16 @@ class Kh7GroundGui:
             self._redraw_strip_chart("navvel")
             return
 
-        m_navbrk = NAVBRK_LINE_RE.search(line)
-        if m_navbrk is not None:
-            g = m_navbrk.groups()
+        m_navctl = NAVCTL_LINE_RE.search(line)
+        if m_navctl is not None:
+            g = m_navctl.groups()
             requested, active, tilt_lim, accel_lim = (int(x) for x in g[0:4])
             des_n, des_e, err_n, err_e = (float(x) for x in g[4:8])
             accel_n, accel_e, accel_fwd, accel_right = (float(x) for x in g[8:12])
             ang_roll, ang_pitch = (float(x) for x in g[12:14])
+            tgt_n, tgt_e, hold_err_n, hold_err_e = (float(x) for x in g[14:18])
             self.navbrk_status_var.set(
-                f"NAVBRAKE: requested={'YES' if requested else 'no'} active={'YES' if active else 'no'} "
+                f"NAVPOSHOLD: requested={'YES' if requested else 'no'} active={'YES' if active else 'no'} "
                 f"tilt_limited={'YES' if tilt_lim else 'no'} accel_limited={'YES' if accel_lim else 'no'}"
             )
             self.navbrk_vel_var.set(f"desired N/E={des_n:.2f}/{des_e:.2f}  error N/E={err_n:.2f}/{err_e:.2f} m/s")
@@ -2451,6 +3002,14 @@ class Kh7GroundGui:
                 f"accel N/E={accel_n:.2f}/{accel_e:.2f} fwd/right={accel_fwd:.2f}/{accel_right:.2f} m/s^2  "
                 f"ang roll/pitch={ang_roll:.1f}/{ang_pitch:.1f} deg"
             )
+            if active:
+                self.poshold_state_var.set(
+                    f"POSHOLD: HOLDING tgt=[{tgt_n:.2f} {tgt_e:.2f}] err=[{hold_err_n:.2f} {hold_err_e:.2f}]"
+                )
+            elif requested:
+                self.poshold_state_var.set("POSHOLD: engaged, not yet settled")
+            else:
+                self.poshold_state_var.set("POSHOLD: off")
             self._append_samples([("nav_desired_vel_n", des_n), ("nav_desired_vel_e", des_e)])
             self._redraw_strip_chart("navvel")
             return
@@ -2877,6 +3436,203 @@ class Kh7GroundGui:
 
     def att_defaults(self) -> None:
         self.send_command("ATT DEFAULT")
+
+    def althold_kp_read(self) -> None:
+        self.althold_kp_status_var.set("ALTHOLD KP: reading...")
+        self.send_command("ALTHOLD KP GET")
+
+    def althold_kp_apply(self) -> None:
+        try:
+            kp = float(self.althold_kp_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid ALTHOLD Kp", "ALTHOLD Kp must be a numeric value.")
+            return
+
+        # Client-side pre-check only - the firmware enforces the real bound
+        # (App_SetAltholdAltHoldKp()/APP_ALTHOLD_ALT_HOLD_KP_MIN/MAX in app.c) and
+        # will reject anything outside it regardless of what's checked here.
+        if not (0.1 <= kp <= 1.3):
+            messagebox.showerror("ALTHOLD Kp Out of Range", "ALTHOLD Kp must be 0.1..1.3.")
+            return
+
+        self.althold_kp_status_var.set("ALTHOLD KP: apply sent...")
+        self.send_command(f"ALTHOLD KP SET {kp:.4f}")
+
+    def althold_maxclimb_read(self) -> None:
+        self.althold_maxclimb_status_var.set("MAX CLIMB: reading...")
+        self.send_command("ALTHOLD MAXCLIMB GET")
+
+    def althold_maxclimb_apply(self) -> None:
+        try:
+            max_climb_mps = float(self.althold_maxclimb_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Max Climb", "Max Climb must be a numeric value.")
+            return
+
+        # Client-side pre-check only - the firmware enforces the real bound
+        # (App_SetAltholdMaxClimbMps()/APP_ALTHOLD_MAX_CLIMB_MIN/MAX in app.c) and
+        # will reject anything outside it regardless of what's checked here.
+        if not (0.5 <= max_climb_mps <= 4.0):
+            messagebox.showerror("Max Climb Out of Range", "Max Climb must be 0.5..4.0 m/s.")
+            return
+
+        self.althold_maxclimb_status_var.set("MAX CLIMB: apply sent...")
+        self.send_command(f"ALTHOLD MAXCLIMB SET {max_climb_mps:.4f}")
+
+    def althold_poski_read(self) -> None:
+        self.althold_poski_status_var.set("HOLD KI: reading...")
+        self.send_command("ALTHOLD POSKI GET")
+
+    def althold_poski_apply(self) -> None:
+        try:
+            ki = float(self.althold_poski_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Hold Ki", "Hold Ki must be a numeric value.")
+            return
+
+        # Client-side pre-check only - the firmware enforces the real bound
+        # (App_SetAltholdPosKi()/APP_ALTHOLD_POS_KI_MIN/MAX in app.c) and will reject
+        # anything outside it regardless of what's checked here.
+        if not (0.0 <= ki <= 0.15):
+            messagebox.showerror("Hold Ki Out of Range", "Hold Ki must be 0.0..0.15.")
+            return
+
+        self.althold_poski_status_var.set("HOLD KI: apply sent...")
+        self.send_command(f"ALTHOLD POSKI SET {ki:.4f}")
+
+    def althold_vzkp_read(self) -> None:
+        self.althold_vzkp_status_var.set("VZ KP: reading...")
+        self.send_command("ALTHOLD VZKP GET")
+
+    def althold_vzkp_apply(self) -> None:
+        try:
+            vzkp = float(self.althold_vzkp_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Vz Kp", "Vz Kp must be a numeric value.")
+            return
+
+        # Client-side pre-check only - the firmware enforces the real bound
+        # (App_SetAltholdVzKp()/APP_ALTHOLD_VZ_KP_MIN/MAX in app.h) and will reject
+        # anything outside it regardless of what's checked here.
+        if not (6.0 <= vzkp <= 25.0):
+            messagebox.showerror("Vz Kp Out of Range", "Vz Kp must be 6.0..25.0.")
+            return
+
+        self.althold_vzkp_status_var.set("VZ KP: apply sent...")
+        self.send_command(f"ALTHOLD VZKP SET {vzkp:.4f}")
+
+    def althold_vzki_read(self) -> None:
+        self.althold_vzki_status_var.set("VZ KI: reading...")
+        self.send_command("ALTHOLD VZKI GET")
+
+    def althold_vzki_apply(self) -> None:
+        try:
+            vzki = float(self.althold_vzki_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Vz Ki", "Vz Ki must be a numeric value.")
+            return
+
+        # Client-side pre-check only - the firmware enforces the real bound
+        # (App_SetAltholdVzKi()/APP_ALTHOLD_VZ_KI_MIN/MAX in app.h) and will reject
+        # anything outside it regardless of what's checked here.
+        if not (2.0 <= vzki <= 8.0):
+            messagebox.showerror("Vz Ki Out of Range", "Vz Ki must be 2.0..8.0.")
+            return
+
+        self.althold_vzki_status_var.set("VZ KI: apply sent...")
+        self.send_command(f"ALTHOLD VZKI SET {vzki:.4f}")
+
+    def althold_dampgain_read(self) -> None:
+        self.althold_dampgain_status_var.set("DAMP GAIN: reading...")
+        self.send_command("ALTHOLD DAMPGAIN GET")
+
+    def althold_dampgain_apply(self) -> None:
+        try:
+            damp_gain = float(self.althold_dampgain_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Damp Gain", "Damp Gain must be a numeric value.")
+            return
+
+        # Client-side pre-check only - the firmware enforces the real bound
+        # (App_SetBaroVzDampGain()/APP_BARO_VZ_DAMP_GAIN_MIN/MAX in app.h) and will
+        # reject anything outside it regardless of what's checked here.
+        if not (5.0 <= damp_gain <= 45.0):
+            messagebox.showerror("Damp Gain Out of Range", "Damp Gain must be 5.0..45.0.")
+            return
+
+        self.althold_dampgain_status_var.set("DAMP GAIN: apply sent...")
+        self.send_command(f"ALTHOLD DAMPGAIN SET {damp_gain:.4f}")
+
+    def althold_damplimit_read(self) -> None:
+        self.althold_damplimit_status_var.set("DAMP LIMIT: reading...")
+        self.send_command("ALTHOLD DAMPLIMIT GET")
+
+    def althold_damplimit_apply(self) -> None:
+        try:
+            damp_limit = float(self.althold_damplimit_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Damp Limit", "Damp Limit must be a numeric value.")
+            return
+
+        # Client-side pre-check only - the firmware enforces the real bound
+        # (App_SetBaroVzDampLimit()/APP_BARO_VZ_DAMP_LIMIT_MIN/MAX in app.h) and will
+        # reject anything outside it regardless of what's checked here.
+        if not (30.0 <= damp_limit <= 150.0):
+            messagebox.showerror("Damp Limit Out of Range", "Damp Limit must be 30..150.")
+            return
+
+        self.althold_damplimit_status_var.set("DAMP LIMIT: apply sent...")
+        self.send_command(f"ALTHOLD DAMPLIMIT SET {damp_limit:.4f}")
+
+    def althold_save_all(self) -> None:
+        self.althold_saveload_status_var.set("FLASH: saving...")
+        self.send_command("ALTHOLD SAVE")
+
+    def althold_load_all(self) -> None:
+        self.althold_saveload_status_var.set("FLASH: loading...")
+        self.send_command("ALTHOLD LOAD")
+
+    def poshold_kp_read(self) -> None:
+        self.poshold_kp_status_var.set("POS KP: reading...")
+        self.send_command("NAVPOS KP GET")
+
+    def poshold_kp_apply(self) -> None:
+        try:
+            kp = float(self.poshold_kp_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Pos Kp", "Pos Kp must be a numeric value.")
+            return
+
+        # Client-side pre-check only - the firmware enforces the real bound
+        # (App_SetNavPosKp()/APP_NAVPOS_KP_MIN/MAX in app.h) and will reject
+        # anything outside it regardless of what's checked here.
+        if not (0.0 <= kp <= 0.8):
+            messagebox.showerror("Pos Kp Out of Range", "Pos Kp must be 0.0..0.8.")
+            return
+
+        self.poshold_kp_status_var.set("POS KP: apply sent...")
+        self.send_command(f"NAVPOS KP SET {kp:.4f}")
+
+    def poshold_ki_read(self) -> None:
+        self.poshold_ki_status_var.set("POS KI: reading...")
+        self.send_command("NAVPOS KI GET")
+
+    def poshold_ki_apply(self) -> None:
+        try:
+            ki = float(self.poshold_ki_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Pos Ki", "Pos Ki must be a numeric value.")
+            return
+
+        # Client-side pre-check only - the firmware enforces the real bound
+        # (App_SetNavPosKi()/APP_NAVPOS_KI_MIN/MAX in app.h) and will reject
+        # anything outside it regardless of what's checked here.
+        if not (0.0 <= ki <= 0.15):
+            messagebox.showerror("Pos Ki Out of Range", "Pos Ki must be 0.0..0.15.")
+            return
+
+        self.poshold_ki_status_var.set("POS KI: apply sent...")
+        self.send_command(f"NAVPOS KI SET {ki:.4f}")
 
     def att_apply(self) -> None:
         try:

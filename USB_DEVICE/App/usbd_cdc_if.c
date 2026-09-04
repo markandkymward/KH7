@@ -443,6 +443,380 @@ void CDC_ProcessCommandLine(const char *line)
     return;
   }
 
+  if (strcmp(line, "ALTHOLD KP GET") == 0)
+  {
+    printf("ALTHOLD_KP[src=get value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetAltholdAltHoldKp(),
+           (double)APP_ALTHOLD_ALT_HOLD_KP_MIN,
+           (double)APP_ALTHOLD_ALT_HOLD_KP_MAX);
+    return;
+  }
+
+  prefix = "ALTHOLD KP SET ";
+  if (strncmp(line, prefix, strlen(prefix)) == 0)
+  {
+    float kp;
+
+    cursor = (char *)(line + strlen(prefix));
+    kp = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != '\0'))
+    {
+      printf("ALTHOLD_KP_SET[FAIL reason=parse]\r\n");
+      return;
+    }
+
+    if (App_SetAltholdAltHoldKp(kp) == 0U)
+    {
+      printf("ALTHOLD_KP_SET[FAIL reason=range min=%.4f max=%.4f]\r\n",
+             (double)APP_ALTHOLD_ALT_HOLD_KP_MIN, (double)APP_ALTHOLD_ALT_HOLD_KP_MAX);
+      return;
+    }
+
+    printf("ALTHOLD_KP[src=set value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetAltholdAltHoldKp(),
+           (double)APP_ALTHOLD_ALT_HOLD_KP_MIN,
+           (double)APP_ALTHOLD_ALT_HOLD_KP_MAX);
+    return;
+  }
+
+  if (strcmp(line, "ALTHOLD MAXCLIMB GET") == 0)
+  {
+    printf("ALTHOLD_MAXCLIMB[src=get value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetAltholdMaxClimbMps(),
+           (double)APP_ALTHOLD_MAX_CLIMB_MIN,
+           (double)APP_ALTHOLD_MAX_CLIMB_MAX);
+    return;
+  }
+
+  prefix = "ALTHOLD MAXCLIMB SET ";
+  if (strncmp(line, prefix, strlen(prefix)) == 0)
+  {
+    float max_climb_mps;
+
+    cursor = (char *)(line + strlen(prefix));
+    max_climb_mps = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != '\0'))
+    {
+      printf("ALTHOLD_MAXCLIMB_SET[FAIL reason=parse]\r\n");
+      return;
+    }
+
+    if (App_SetAltholdMaxClimbMps(max_climb_mps) == 0U)
+    {
+      printf("ALTHOLD_MAXCLIMB_SET[FAIL reason=range min=%.4f max=%.4f]\r\n",
+             (double)APP_ALTHOLD_MAX_CLIMB_MIN, (double)APP_ALTHOLD_MAX_CLIMB_MAX);
+      return;
+    }
+
+    printf("ALTHOLD_MAXCLIMB[src=set value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetAltholdMaxClimbMps(),
+           (double)APP_ALTHOLD_MAX_CLIMB_MIN,
+           (double)APP_ALTHOLD_MAX_CLIMB_MAX);
+    return;
+  }
+
+  if (strcmp(line, "ALTHOLD POSKI GET") == 0)
+  {
+    printf("ALTHOLD_POSKI[src=get value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetAltholdPosKi(),
+           (double)APP_ALTHOLD_POS_KI_MIN,
+           (double)APP_ALTHOLD_POS_KI_MAX);
+    return;
+  }
+
+  prefix = "ALTHOLD POSKI SET ";
+  if (strncmp(line, prefix, strlen(prefix)) == 0)
+  {
+    float ki;
+
+    cursor = (char *)(line + strlen(prefix));
+    ki = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != '\0'))
+    {
+      printf("ALTHOLD_POSKI_SET[FAIL reason=parse]\r\n");
+      return;
+    }
+
+    if (App_SetAltholdPosKi(ki) == 0U)
+    {
+      printf("ALTHOLD_POSKI_SET[FAIL reason=range min=%.4f max=%.4f]\r\n",
+             (double)APP_ALTHOLD_POS_KI_MIN, (double)APP_ALTHOLD_POS_KI_MAX);
+      return;
+    }
+
+    printf("ALTHOLD_POSKI[src=set value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetAltholdPosKi(),
+           (double)APP_ALTHOLD_POS_KI_MIN,
+           (double)APP_ALTHOLD_POS_KI_MAX);
+    return;
+  }
+
+  if (strcmp(line, "NAVPOS KP GET") == 0)
+  {
+    printf("NAVPOS_KP[src=get value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetNavPosKp(),
+           (double)APP_NAVPOS_KP_MIN,
+           (double)APP_NAVPOS_KP_MAX);
+    return;
+  }
+
+  prefix = "NAVPOS KP SET ";
+  if (strncmp(line, prefix, strlen(prefix)) == 0)
+  {
+    float kp;
+
+    cursor = (char *)(line + strlen(prefix));
+    kp = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != '\0'))
+    {
+      printf("NAVPOS_KP_SET[FAIL reason=parse]\r\n");
+      return;
+    }
+
+    if (App_SetNavPosKp(kp) == 0U)
+    {
+      printf("NAVPOS_KP_SET[FAIL reason=range min=%.4f max=%.4f]\r\n",
+             (double)APP_NAVPOS_KP_MIN, (double)APP_NAVPOS_KP_MAX);
+      return;
+    }
+
+    printf("NAVPOS_KP[src=set value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetNavPosKp(),
+           (double)APP_NAVPOS_KP_MIN,
+           (double)APP_NAVPOS_KP_MAX);
+    return;
+  }
+
+  if (strcmp(line, "NAVPOS KI GET") == 0)
+  {
+    printf("NAVPOS_KI[src=get value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetNavPosKi(),
+           (double)APP_NAVPOS_KI_MIN,
+           (double)APP_NAVPOS_KI_MAX);
+    return;
+  }
+
+  prefix = "NAVPOS KI SET ";
+  if (strncmp(line, prefix, strlen(prefix)) == 0)
+  {
+    float ki;
+
+    cursor = (char *)(line + strlen(prefix));
+    ki = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != '\0'))
+    {
+      printf("NAVPOS_KI_SET[FAIL reason=parse]\r\n");
+      return;
+    }
+
+    if (App_SetNavPosKi(ki) == 0U)
+    {
+      printf("NAVPOS_KI_SET[FAIL reason=range min=%.4f max=%.4f]\r\n",
+             (double)APP_NAVPOS_KI_MIN, (double)APP_NAVPOS_KI_MAX);
+      return;
+    }
+
+    printf("NAVPOS_KI[src=set value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetNavPosKi(),
+           (double)APP_NAVPOS_KI_MIN,
+           (double)APP_NAVPOS_KI_MAX);
+    return;
+  }
+
+  if (strcmp(line, "ALTHOLD VZKP GET") == 0)
+  {
+    printf("ALTHOLD_VZKP[src=get value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetAltholdVzKp(),
+           (double)APP_ALTHOLD_VZ_KP_MIN,
+           (double)APP_ALTHOLD_VZ_KP_MAX);
+    return;
+  }
+
+  prefix = "ALTHOLD VZKP SET ";
+  if (strncmp(line, prefix, strlen(prefix)) == 0)
+  {
+    float vzkp;
+
+    cursor = (char *)(line + strlen(prefix));
+    vzkp = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != '\0'))
+    {
+      printf("ALTHOLD_VZKP_SET[FAIL reason=parse]\r\n");
+      return;
+    }
+
+    if (App_SetAltholdVzKp(vzkp) == 0U)
+    {
+      printf("ALTHOLD_VZKP_SET[FAIL reason=range min=%.4f max=%.4f]\r\n",
+             (double)APP_ALTHOLD_VZ_KP_MIN, (double)APP_ALTHOLD_VZ_KP_MAX);
+      return;
+    }
+
+    printf("ALTHOLD_VZKP[src=set value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetAltholdVzKp(),
+           (double)APP_ALTHOLD_VZ_KP_MIN,
+           (double)APP_ALTHOLD_VZ_KP_MAX);
+    return;
+  }
+
+  if (strcmp(line, "ALTHOLD VZKI GET") == 0)
+  {
+    printf("ALTHOLD_VZKI[src=get value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetAltholdVzKi(),
+           (double)APP_ALTHOLD_VZ_KI_MIN,
+           (double)APP_ALTHOLD_VZ_KI_MAX);
+    return;
+  }
+
+  prefix = "ALTHOLD VZKI SET ";
+  if (strncmp(line, prefix, strlen(prefix)) == 0)
+  {
+    float vzki;
+
+    cursor = (char *)(line + strlen(prefix));
+    vzki = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != '\0'))
+    {
+      printf("ALTHOLD_VZKI_SET[FAIL reason=parse]\r\n");
+      return;
+    }
+
+    if (App_SetAltholdVzKi(vzki) == 0U)
+    {
+      printf("ALTHOLD_VZKI_SET[FAIL reason=range min=%.4f max=%.4f]\r\n",
+             (double)APP_ALTHOLD_VZ_KI_MIN, (double)APP_ALTHOLD_VZ_KI_MAX);
+      return;
+    }
+
+    printf("ALTHOLD_VZKI[src=set value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetAltholdVzKi(),
+           (double)APP_ALTHOLD_VZ_KI_MIN,
+           (double)APP_ALTHOLD_VZ_KI_MAX);
+    return;
+  }
+
+  if (strcmp(line, "ALTHOLD DAMPGAIN GET") == 0)
+  {
+    printf("ALTHOLD_DAMPGAIN[src=get value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetBaroVzDampGain(),
+           (double)APP_BARO_VZ_DAMP_GAIN_MIN,
+           (double)APP_BARO_VZ_DAMP_GAIN_MAX);
+    return;
+  }
+
+  prefix = "ALTHOLD DAMPGAIN SET ";
+  if (strncmp(line, prefix, strlen(prefix)) == 0)
+  {
+    float damp_gain;
+
+    cursor = (char *)(line + strlen(prefix));
+    damp_gain = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != '\0'))
+    {
+      printf("ALTHOLD_DAMPGAIN_SET[FAIL reason=parse]\r\n");
+      return;
+    }
+
+    if (App_SetBaroVzDampGain(damp_gain) == 0U)
+    {
+      printf("ALTHOLD_DAMPGAIN_SET[FAIL reason=range min=%.4f max=%.4f]\r\n",
+             (double)APP_BARO_VZ_DAMP_GAIN_MIN, (double)APP_BARO_VZ_DAMP_GAIN_MAX);
+      return;
+    }
+
+    printf("ALTHOLD_DAMPGAIN[src=set value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetBaroVzDampGain(),
+           (double)APP_BARO_VZ_DAMP_GAIN_MIN,
+           (double)APP_BARO_VZ_DAMP_GAIN_MAX);
+    return;
+  }
+
+  if (strcmp(line, "ALTHOLD DAMPLIMIT GET") == 0)
+  {
+    printf("ALTHOLD_DAMPLIMIT[src=get value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetBaroVzDampLimit(),
+           (double)APP_BARO_VZ_DAMP_LIMIT_MIN,
+           (double)APP_BARO_VZ_DAMP_LIMIT_MAX);
+    return;
+  }
+
+  prefix = "ALTHOLD DAMPLIMIT SET ";
+  if (strncmp(line, prefix, strlen(prefix)) == 0)
+  {
+    float damp_limit;
+
+    cursor = (char *)(line + strlen(prefix));
+    damp_limit = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != '\0'))
+    {
+      printf("ALTHOLD_DAMPLIMIT_SET[FAIL reason=parse]\r\n");
+      return;
+    }
+
+    if (App_SetBaroVzDampLimit(damp_limit) == 0U)
+    {
+      printf("ALTHOLD_DAMPLIMIT_SET[FAIL reason=range min=%.4f max=%.4f]\r\n",
+             (double)APP_BARO_VZ_DAMP_LIMIT_MIN, (double)APP_BARO_VZ_DAMP_LIMIT_MAX);
+      return;
+    }
+
+    printf("ALTHOLD_DAMPLIMIT[src=set value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetBaroVzDampLimit(),
+           (double)APP_BARO_VZ_DAMP_LIMIT_MIN,
+           (double)APP_BARO_VZ_DAMP_LIMIT_MAX);
+    return;
+  }
+
+  if (strcmp(line, "ALTHOLD SAVE") == 0)
+  {
+    if (App_SaveAltholdSettings() == 0U)
+    {
+      printf("ALTHOLD_SAVE[FAIL]\r\n");
+      return;
+    }
+    printf("ALTHOLD_SAVE[OK]\r\n");
+    return;
+  }
+
+  if (strcmp(line, "ALTHOLD LOAD") == 0)
+  {
+    if (App_LoadAltholdSettings() == 0U)
+    {
+      printf("ALTHOLD_LOAD[FAIL_OR_NONE_SAVED]\r\n");
+      return;
+    }
+    printf("ALTHOLD_LOAD[OK]\r\n");
+    printf("ALTHOLD_KP[src=get value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetAltholdAltHoldKp(),
+           (double)APP_ALTHOLD_ALT_HOLD_KP_MIN,
+           (double)APP_ALTHOLD_ALT_HOLD_KP_MAX);
+    printf("ALTHOLD_MAXCLIMB[src=get value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetAltholdMaxClimbMps(),
+           (double)APP_ALTHOLD_MAX_CLIMB_MIN,
+           (double)APP_ALTHOLD_MAX_CLIMB_MAX);
+    printf("ALTHOLD_POSKI[src=get value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetAltholdPosKi(),
+           (double)APP_ALTHOLD_POS_KI_MIN,
+           (double)APP_ALTHOLD_POS_KI_MAX);
+    printf("ALTHOLD_VZKP[src=get value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetAltholdVzKp(),
+           (double)APP_ALTHOLD_VZ_KP_MIN,
+           (double)APP_ALTHOLD_VZ_KP_MAX);
+    printf("ALTHOLD_VZKI[src=get value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetAltholdVzKi(),
+           (double)APP_ALTHOLD_VZ_KI_MIN,
+           (double)APP_ALTHOLD_VZ_KI_MAX);
+    printf("ALTHOLD_DAMPGAIN[src=get value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetBaroVzDampGain(),
+           (double)APP_BARO_VZ_DAMP_GAIN_MIN,
+           (double)APP_BARO_VZ_DAMP_GAIN_MAX);
+    printf("ALTHOLD_DAMPLIMIT[src=get value=%.4f min=%.4f max=%.4f]\r\n",
+           (double)App_GetBaroVzDampLimit(),
+           (double)APP_BARO_VZ_DAMP_LIMIT_MIN,
+           (double)APP_BARO_VZ_DAMP_LIMIT_MAX);
+    return;
+  }
+
   if (strcmp(line, "ATT DEFAULT") == 0)
   {
     App_RequestAttitudeDefaults();
@@ -628,6 +1002,128 @@ void CDC_ProcessCommandLine(const char *line)
   {
     App_RequestSdLogErase();
     printf("SDLOG_ERASE[QUEUED]\r\n");
+    return;
+  }
+
+  /* Unsolicited, sent by the ESP32 bridge (see esp32_s3_uart6_wifi_bridge.ino) - NOT a
+   * ground-station-typed command. Deliberately silent (no printf response): at this
+   * rate a response line would roughly double UART6 TX traffic for zero benefit, since
+   * nothing consumes it. See App_SetRangefinderCm()'s comment for why this exists (SD-log
+   * ground truth on the FC's own time_ms axis instead of an error-prone post-hoc clock
+   * alignment between two independently-timed capture streams).
+   *
+   * Format (2026-08-25, replacing the simpler "RANGE <cm>"/"LUNA <cm>" lines):
+   * "SENSOR <id> <valid> <range_cm> <confidence> <ts_us>" - <range_cm> is the raw SLANT
+   * range, deliberately not tilt-compensated on the ESP32 side (attitude is estimated
+   * here on the FC, so slant-to-vertical projection belongs here too, using the fixed
+   * mounting descriptor from SENSOR_CFG below plus a live attitude estimate - not yet
+   * implemented, this just stores what's needed for it). A malformed line is silently
+   * ignored (same "no response" convention as everything else in this block) rather
+   * than reported, since a single dropped sensor sample isn't worth the traffic. */
+  prefix = "SENSOR ";
+  if (strncmp(line, prefix, strlen(prefix)) == 0)
+  {
+    uint8_t is_sonar;
+    long valid_field;
+    float range_cm;
+    float confidence;
+    unsigned long sensor_ts_us;
+
+    cursor = (char *)(line + strlen(prefix));
+    if (strncmp(cursor, "SONAR ", 6) == 0)
+    {
+      is_sonar = 1U;
+      cursor += 6;
+    }
+    else if (strncmp(cursor, "LUNA ", 5) == 0)
+    {
+      is_sonar = 0U;
+      cursor += 5;
+    }
+    else
+    {
+      return;
+    }
+
+    valid_field = strtol(cursor, &token_end, 10);
+    if ((token_end == cursor) || (*token_end != ' ')) { return; }
+    cursor = token_end + 1;
+
+    range_cm = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != ' ')) { return; }
+    cursor = token_end + 1;
+
+    confidence = strtof(cursor, &token_end);
+    if ((token_end == cursor) || (*token_end != ' ')) { return; }
+    cursor = token_end + 1;
+
+    sensor_ts_us = strtoul(cursor, &token_end, 10);
+    if (token_end == cursor) { return; }
+
+    /* range_cm is passed through UNCOLLAPSED here (2026-08-29) - App_SetRangefinderCm()/
+     * App_SetLunaCm() each decide separately how to use an invalid reading (still
+     * collapse to 0.0f for their own "unavailable" state, but forward the true value
+     * to VertEkf_UpdateRange() alongside the explicit valid flag) - see those
+     * functions' comments for why collapsing it here made a genuine 0cm reading
+     * indistinguishable from an actually-invalid one. */
+    if (is_sonar != 0U)
+    {
+      App_SetRangefinderCm(range_cm, confidence, (uint32_t)sensor_ts_us, (uint8_t)(valid_field != 0));
+    }
+    else
+    {
+      App_SetLunaCm(range_cm, confidence, (uint32_t)sensor_ts_us, (uint8_t)(valid_field != 0));
+    }
+    return;
+  }
+
+  /* Fixed mounting/orientation descriptor, sent once at ESP32 boot and re-sent
+   * periodically - see esp32_s3_uart6_wifi_bridge.ino's RANGE_MOUNT_AXIS comment.
+   * Format: "SENSOR_CFG <id> <axis> <offset_deg>". */
+  prefix = "SENSOR_CFG ";
+  if (strncmp(line, prefix, strlen(prefix)) == 0)
+  {
+    uint8_t is_sonar;
+    char axis_buf[8];
+    const char *axis_start;
+    size_t axis_len;
+    float offset_deg;
+
+    cursor = (char *)(line + strlen(prefix));
+    if (strncmp(cursor, "SONAR ", 6) == 0)
+    {
+      is_sonar = 1U;
+      cursor += 6;
+    }
+    else if (strncmp(cursor, "LUNA ", 5) == 0)
+    {
+      is_sonar = 0U;
+      cursor += 5;
+    }
+    else
+    {
+      return;
+    }
+
+    axis_start = cursor;
+    while ((*cursor != '\0') && (*cursor != ' ')) { cursor++; }
+    axis_len = (size_t)(cursor - axis_start);
+    if ((axis_len == 0U) || (axis_len >= sizeof(axis_buf)) || (*cursor != ' ')) { return; }
+    (void)memcpy(axis_buf, axis_start, axis_len);
+    axis_buf[axis_len] = '\0';
+    cursor++;
+
+    offset_deg = strtof(cursor, &token_end);
+    if (token_end == cursor) { return; }
+
+    if (is_sonar != 0U)
+    {
+      App_SetRangefinderMountDescriptor(axis_buf, offset_deg);
+    }
+    else
+    {
+      App_SetLunaMountDescriptor(axis_buf, offset_deg);
+    }
     return;
   }
 

@@ -81,6 +81,14 @@ typedef struct
   float ref_alt_m;
   float north_m;
   float east_m;
+  /* LPF of north_m/east_m (NAV_POSITION_LPF_HZ) - added for position-hold (2026-08-30).
+   * Raw north_m/east_m jump meter-scale between GPS samples; feeding that directly into
+   * a P(+I) position loop would inject jitter into the velocity setpoint it produces,
+   * compounding noise through two cascaded stages. Seeded directly (no transient) on the
+   * first sample after init/reacquisition/relatch, same idiom as filtered_north_vel_mps
+   * below - see Nav_LatchReference() and Nav_Update(). */
+  float filtered_north_m;
+  float filtered_east_m;
 
   /* Velocity (raw = receiver's native NED velocity; filtered = LPF of raw). */
   float raw_north_vel_mps;
@@ -98,6 +106,10 @@ typedef struct
  * for defaults and rationale. Exposed here so app.c/telemetry/tests can reference
  * the same names rather than duplicating magic numbers. */
 #define NAV_MAX_MESSAGE_AGE_MS         700U
+/* How long GPS must stay stale before a full reacquisition is forced (see the
+ * GPS_STALE handling in Nav_Update() for why this is separate from
+ * NAV_MAX_MESSAGE_AGE_MS above). */
+#define NAV_STALE_RESET_MS             2000U
 #define NAV_MIN_UPDATE_INTERVAL_MS     50U
 #define NAV_MAX_UPDATE_INTERVAL_MS     1500U
 #define NAV_MAX_HORIZONTAL_ACC_M       5.0f
@@ -107,6 +119,10 @@ typedef struct
 #define NAV_MIN_CONSECUTIVE_VALID      5U
 #define NAV_MIN_FIX_TYPE               3U /* 3D fix */
 #define NAV_VELOCITY_LPF_HZ            0.5f
+/* Slower than the velocity LPF above - position-hold's job is slow wind-drift
+ * correction, not tracking fast motion, and raw position noise is meter-scale
+ * (see Nav_State_t.filtered_north_m/east_m above). */
+#define NAV_POSITION_LPF_HZ            0.3f
 
 void Nav_Init(void);
 /* Called every App_Update() iteration. armed/disarmed only affects automatic

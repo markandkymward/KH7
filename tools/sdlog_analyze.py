@@ -55,8 +55,10 @@ RECORD_STRUCT = struct.Struct(
     "BBBB"                    # nav_flags, nav_invalid_reason, nav_fix_type, nav_num_sv
     "HHHHH"                   # nav_h_acc_cm, nav_age_ms, nav_update_period_ms, nav_consecutive_valid, nav_dropout_count
     + "h" * 16                # nav north/east/vel(raw,filt,desired,error)/accel(n,e,fwd,right) + pilot stick, all int16
+    + "h"                     # rangefinder_cm_x10 (2026-08-23, ESP32-bridge HC-SR04 ground truth)
+    + "h"                     # luna_cm_x10 (2026-08-25, ESP32-bridge TF-Luna LiDAR)
 )
-RECORD_SIZE = RECORD_STRUCT.size  # 101 bytes, matches App_SdLogRecord_t in Core/Src/app.c
+RECORD_SIZE = RECORD_STRUCT.size  # 105 bytes, matches App_SdLogRecord_t in Core/Src/app.c
 FIELD_NAMES = (
     "time_ms",
     "setpoint_roll_dps", "setpoint_pitch_dps", "setpoint_yaw_dps",
@@ -81,6 +83,8 @@ FIELD_NAMES = (
     "nav_accel_cmd_n_x1000", "nav_accel_cmd_e_x1000",
     "nav_accel_cmd_fwd_x1000", "nav_accel_cmd_right_x1000",
     "pilot_roll_stick_us", "pilot_pitch_stick_us",
+    "rangefinder_cm_x10",
+    "luna_cm_x10",
 )
 APP_SDLOG_FLAG_LINK_ACTIVE = 0x08  # bit set when receiver_state.link_active was true
 APP_SDLOG_FLAG_MAG_HEALTHY = 0x10  # bit set when Mag_IsHealthy() was true
@@ -389,6 +393,15 @@ def _flight_arrays(sub: List[dict]) -> dict:
     a["target_roll_deg"] = a["target_roll_deg_x10"] / 10.0
     a["baro_alt_m"] = a["baro_alt_cm"] / 100.0
     a["baro_vz_mps"] = a["baro_vz_cms"] / 100.0
+    # 0 means "no/stale reading" (see App_GetRangefinderCmForLog() in app.c) - NaN instead
+    # of 0 so a gap in coverage shows as a gap on a plot, not a false dip to the floor.
+    rangefinder_cm = a["rangefinder_cm_x10"] / 10.0
+    a["rangefinder_cm"] = np.where(rangefinder_cm > 0.0, rangefinder_cm, np.nan)
+    a["rangefinder_m"] = a["rangefinder_cm"] / 100.0
+    # Same 0=unavailable convention as the rangefinder above - see App_GetLunaCm() in app.c.
+    luna_cm = a["luna_cm_x10"] / 10.0
+    a["luna_cm"] = np.where(luna_cm > 0.0, luna_cm, np.nan)
+    a["luna_m"] = a["luna_cm"] / 100.0
     a["battery_v"] = a["battery_decivolts"] / 10.0
     a["nav_h_acc_m"] = a["nav_h_acc_cm"] / 100.0
     a["nav_north_m"] = a["nav_north_m_x10"] / 10.0
@@ -659,10 +672,33 @@ def plot_dashboard(a: dict, out_path: str):
     ax_motors.legend(loc="upper right", fontsize=7, ncol=4)
 
     ax_baro = fig.add_subplot(gs[3, 3:6], sharex=track_axes["roll"])
-    ax_baro.plot(t, a["baro_alt_m"], color="tab:blue", linewidth=0.8, label="altitude")
+    ax_baro.plot(t, a["baro_alt_m"], color="tab:blue", linewidth=0.8, label="altitude (actual baro)")
+    if np.any(np.isfinite(a["rangefinder_m"])):
+        # Same time_ms axis as everything else - logged directly by the FC from the
+        # ESP32 bridge's RANGE command (see App_SetRangefinderCm() in app.c), specifically
+        # so this needs no post-hoc clock alignment against baro the way the earlier
+        # separately-captured-and-aligned-by-hand approach did (see kh7-rangefinder-setup
+        # memory - that alignment method proved too fragile to trust for real analysis).
+        ax_baro.plot(t, a["rangefinder_m"], color="tab:green", linewidth=0.9, marker=".",
+                    markersize=2, label="height (rangefinder ground truth)")
+    if np.any(np.isfinite(a["luna_m"])):
+        # Same time_ms axis, same direct-logging idea, TF-Luna added 2026-08-25 alongside
+        # the HC-SR04 above (see App_SetLunaCm() in app.c) - wider range, not subject to
+        # the sonar's multipath scatter.
+        ax_baro.plot(t, a["luna_m"], color="tab:purple", linewidth=0.9, marker=".",
+                    markersize=2, label="height (TF-Luna ground truth)")
     ax_baro.set_ylabel("baro alt\nm")
     ax_baro_vz = ax_baro.twinx()
-    ax_baro_vz.plot(t, a["baro_vz_mps"], color="tab:orange", linewidth=0.7, alpha=0.8, label="climb rate")
+    ax_baro_vz.plot(t, a["baro_vz_mps"], color="tab:orange", linewidth=0.7, alpha=0.8,
+                    label="climb rate (accel/baro complementary filter)")
+    # Raw baro-only climb rate for comparison - a straight differentiation of the logged
+    # altitude (the actual baro measurement, no accel fusion/smoothing at all) - shows how
+    # much the complementary filter above is smoothing/trusting the accelerometer over the
+    # raw sensor, and lets a propwash/ground-effect artifact be judged directly against
+    # what the sensor itself is reporting rather than through that filter.
+    raw_baro_vz = np.gradient(a["baro_alt_m"], t)
+    ax_baro_vz.plot(t, raw_baro_vz, color="tab:gray", linewidth=0.5, alpha=0.5,
+                    label="climb rate (raw baro diff)")
     ax_baro_vz.set_ylabel("climb rate\nm/s")
     lines1, labels1 = ax_baro.get_legend_handles_labels()
     lines2, labels2 = ax_baro_vz.get_legend_handles_labels()

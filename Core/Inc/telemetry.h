@@ -40,6 +40,21 @@ void Telemetry_PrintFlightMode(const char *mode_name, uint16_t mode_us);
 void Telemetry_PrintAngles(float pitch_deg, float roll_deg, float yaw_deg);
 void Telemetry_PrintBatteryState(float battery_voltage_v, uint32_t adc_raw);
 void Telemetry_PrintBaroState(float altitude_m, float climb_rate_mps, uint8_t healthy);
+void Telemetry_PrintVertEkfState(uint8_t healthy,
+                                 float height_m,
+                                 float climb_rate_mps,
+                                 float accel_bias_mps2,
+                                 float lidar_implied_height_m,
+                                 float sonar_implied_height_m);
+void Telemetry_PrintAltholdState(uint8_t holding,
+                                 uint8_t authority_active,
+                                 float target_alt_m,
+                                 float fused_alt_m,
+                                 float climb_setpoint_mps,
+                                 float climb_error_mps,
+                                 int32_t trim_us,
+                                 int32_t damp_us,
+                                 float hover_throttle_us);
 void Telemetry_PrintGpsState(uint8_t configured,
 							 uint8_t healthy,
 							 uint8_t fix_type,
@@ -79,7 +94,10 @@ void Telemetry_PrintNavPosVel(float north_m,
 							 float raw_vel_e_mps,
 							 float filt_vel_n_mps,
 							 float filt_vel_e_mps);
-void Telemetry_PrintNavBrake(uint8_t requested,
+/* NAV_POSHOLD (2026-09-04 rewrite - single unified GPS mode, see APP_NAVPOS_*
+ * in app.c) - one print covering both the velocity-command chain and the
+ * position-hold target/error, replacing the old separate NAVBRK/POSHOLD lines. */
+void Telemetry_PrintNavPos(uint8_t requested,
 							 uint8_t active,
 							 uint8_t tilt_limited,
 							 uint8_t accel_limited,
@@ -92,7 +110,11 @@ void Telemetry_PrintNavBrake(uint8_t requested,
 							 float accel_cmd_fwd_mps2,
 							 float accel_cmd_right_mps2,
 							 float target_roll_deg,
-							 float target_pitch_deg);
+							 float target_pitch_deg,
+							 float target_north_m,
+							 float target_east_m,
+							 float err_north_m,
+							 float err_east_m);
 
 #ifdef __cplusplus
 }

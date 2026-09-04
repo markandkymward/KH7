@@ -121,6 +121,14 @@ static float g_vz_filt_mps = 0.0f;
 static float g_prev_alt_m = 0.0f;
 static uint32_t g_last_update_ms = 0U;
 static uint8_t g_have_prev_alt = 0U;
+/* Raw (ground-reference-zeroed, propwash-bias-corrected, but NOT yet
+ * BARO_ALT_LPF_HZ-smoothed) altitude, added 2026-08-29 for vert_ekf.c - an EKF
+ * measurement update wants the sensor's own noise characteristics, not a signal
+ * that's already been through a separate filter (double-filtering adds lag and
+ * breaks the white-noise-residual assumption a Kalman R term relies on).
+ * Baro_GetAltitudeM() (the LPF'd value) is unaffected - still what everything
+ * else in this codebase should keep using. */
+static float g_alt_raw_m = 0.0f;
 
 static float Baro_LpfAlpha(float dt_s, float cutoff_hz)
 {
@@ -366,6 +374,7 @@ HAL_StatusTypeDef Baro_Update(float motor_power_delta_us, float vertical_accel_m
                      (BARO_PROPWASH_ALT_B_M_PER_US * motor_power_delta_us) +
                      BARO_PROPWASH_ALT_C_M;
   altitude_m -= propwash_bias_m;
+  g_alt_raw_m = altitude_m;
 
   dt_s = ((float)(now_ms - g_last_update_ms)) * 0.001f;
   if (dt_s < 0.001f)
@@ -417,6 +426,11 @@ uint8_t Baro_GetLastChipId(void)
 float Baro_GetAltitudeM(void)
 {
   return g_alt_filt_m;
+}
+
+float Baro_GetRawAltitudeM(void)
+{
+  return g_alt_raw_m;
 }
 
 float Baro_GetClimbRateMps(void)

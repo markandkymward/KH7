@@ -301,6 +301,69 @@ void Telemetry_PrintBaroState(float altitude_m, float climb_rate_mps, uint8_t he
          (long)vz_cms);
 }
 
+/* vert_ekf.c live bench-validation line (2026-08-29) - h_cm/vz_cms are
+ * VertEkf_GetHeightM()'s OWN output; ALTHOLD's altitude reference as of the same
+ * date (see app.c's ALTHOLD design comment), though vz_cms specifically is NOT a
+ * control input (ALTHOLD's climb-rate feedback stays on Baro_GetClimbRateMps() -
+ * see that same comment for why). lidar_h_cm/sonar_h_cm are each sensor's
+ * tilt+lever-arm-compensated implied height (VertEkf_GetLidarImpliedHeightM()/
+ * GetSonarImpliedHeightM()) - the point of this line is watching THESE specifically
+ * move the expected way while manually tilting the aircraft on the bench, not just
+ * the fused h_cm. bias_mm_s2 scaled to mm/s^2 (vs. baro's cm-scale fields) since
+ * accel bias is typically a much smaller quantity (~0.01-0.5 m/s^2) that would
+ * otherwise round to 0 at cm-equivalent precision. */
+void Telemetry_PrintVertEkfState(uint8_t healthy,
+                                 float height_m,
+                                 float climb_rate_mps,
+                                 float accel_bias_mps2,
+                                 float lidar_implied_height_m,
+                                 float sonar_implied_height_m)
+{
+  printf("VEKF[healthy h_cm vz_cms bias_mm_s2 lidar_h_cm sonar_h_cm]=[%u %ld %ld %ld %ld %ld]\r\n",
+         (unsigned int)healthy,
+         (long)(height_m * 100.0f),
+         (long)(climb_rate_mps * 100.0f),
+         (long)(accel_bias_mps2 * 1000.0f),
+         (long)(lidar_implied_height_m * 100.0f),
+         (long)(sonar_implied_height_m * 100.0f));
+}
+
+/* ALTHOLD internal-state diagnostic (2026-08-29) - added to root-cause a real
+ * confirmed altitude wander (~0.5m over several seconds with the throttle stick
+ * held perfectly flat - see kh7-althold-oscillation-yawhold-todo memory) that
+ * predates tonight's vert_ekf.c work. target_cm/fused_cm let you see whether the
+ * HELD TARGET itself is drifting (it should be dead flat while holding) vs. the
+ * fused estimate wandering around a stable target. setpt_cms/err_cms are the
+ * position loop's OUTPUT (desired climb rate) and the resulting error against
+ * Baro_GetClimbRateMps() - if err_cms tracks baro's own known ~25-32cm/s hover
+ * noise floor (see kh7-baro-hover-noise-characterization memory) even while
+ * setpt_cms sits near zero, that noise - not insufficient gain - is the
+ * suspected root cause, since the fast trim/integral below react to err_cms
+ * directly. trim_us/damp_us are the two terms actually summed into the final
+ * throttle (post-LPF, matching what really reaches the motors); hover_us is the
+ * slow-adapting base they ride on top of. */
+void Telemetry_PrintAltholdState(uint8_t holding,
+                                 uint8_t authority_active,
+                                 float target_alt_m,
+                                 float fused_alt_m,
+                                 float climb_setpoint_mps,
+                                 float climb_error_mps,
+                                 int32_t trim_us,
+                                 int32_t damp_us,
+                                 float hover_throttle_us)
+{
+  printf("ALTHOLD[hold auth target_cm fused_cm setpt_cms err_cms trim_us damp_us hover_us]=[%u %u %ld %ld %ld %ld %ld %ld %ld]\r\n",
+         (unsigned int)holding,
+         (unsigned int)authority_active,
+         (long)(target_alt_m * 100.0f),
+         (long)(fused_alt_m * 100.0f),
+         (long)(climb_setpoint_mps * 100.0f),
+         (long)(climb_error_mps * 100.0f),
+         (long)trim_us,
+         (long)damp_us,
+         (long)hover_throttle_us);
+}
+
 void Telemetry_PrintGpsState(uint8_t configured,
                              uint8_t healthy,
                              uint8_t fix_type,
@@ -399,7 +462,7 @@ void Telemetry_PrintNavPosVel(float north_m,
          (double)filt_vel_e_mps);
 }
 
-void Telemetry_PrintNavBrake(uint8_t requested,
+void Telemetry_PrintNavPos(uint8_t requested,
                              uint8_t active,
                              uint8_t tilt_limited,
                              uint8_t accel_limited,
@@ -412,9 +475,13 @@ void Telemetry_PrintNavBrake(uint8_t requested,
                              float accel_cmd_fwd_mps2,
                              float accel_cmd_right_mps2,
                              float target_roll_deg,
-                             float target_pitch_deg)
+                             float target_pitch_deg,
+                             float target_north_m,
+                             float target_east_m,
+                             float err_north_m,
+                             float err_east_m)
 {
-  printf("NAVBRK[req act tiltlim acclim]=[%u %u %u %u] desvel=[%.2f %.2f] velerr=[%.2f %.2f] accel=[%.2f %.2f %.2f %.2f] ang=[%.1f %.1f]\r\n",
+  printf("NAVCTL[req act tiltlim acclim]=[%u %u %u %u] desvel=[%.2f %.2f] velerr=[%.2f %.2f] accel=[%.2f %.2f %.2f %.2f] ang=[%.1f %.1f] tgt=[%.2f %.2f] err=[%.2f %.2f]\r\n",
          (unsigned int)requested,
          (unsigned int)active,
          (unsigned int)tilt_limited,
@@ -428,5 +495,9 @@ void Telemetry_PrintNavBrake(uint8_t requested,
          (double)accel_cmd_fwd_mps2,
          (double)accel_cmd_right_mps2,
          (double)target_roll_deg,
-         (double)target_pitch_deg);
+         (double)target_pitch_deg,
+         (double)target_north_m,
+         (double)target_east_m,
+         (double)err_north_m,
+         (double)err_east_m);
 }

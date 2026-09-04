@@ -22,6 +22,10 @@ float Attitude_WrapAngle180(float angle_deg);
  * attitude.c. Uses the CURRENT AHRS attitude estimate internally, so call
  * this after Attitude_UpdateIMU() for the same sample. */
 float Attitude_GetVerticalAccelMps2(float ax_g, float ay_g, float az_g);
+/* World-up (earth +Z) unit vector expressed in body-frame coordinates - see the
+ * doc comment at its definition in attitude.c for what it's for (dot it with
+ * any body-frame vector to get that vector's world-up component). */
+void Attitude_GetWorldUpInBodyFrame(float *gx, float *gy, float *gz);
 
 #ifdef __cplusplus
 }

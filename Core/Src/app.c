@@ -8,6 +8,7 @@
 #include "attitude.h"
 #include "imu.h"
 #include "baro.h"
+#include "vert_ekf.h"
 #include "gps.h"
 #include "mag.h"
 #include "nav.h"
@@ -131,9 +132,42 @@
  * Z-axis bounce/sensitivity. Conservative starting gain now that the SPA06 (SPL07-003)
  * baro is confirmed detected/healthy on hardware; hard-clamped to +-APP_BARO_VZ_DAMP_LIMIT_US
  * and only applied while Baro_IsHealthy() - re-tune upward only after a hover confirms the
- * signal is low-noise/low-latency enough to not fight stick throttle inputs. */
+ * signal is low-noise/low-latency enough to not fight stick throttle inputs.
+ *
+ * RAISED then REVERTED, both 2026-08-29. First raised 15->30 (limit 60->120) while this
+ * term still consumed a dedicated filtered BARO climb-rate - real flight data justified
+ * it (neither this term nor the trim were ever seen saturating during real ALTHOLD
+ * altitude wander, the same "ceiling wasn't the limiter, the gain was" signature as the
+ * trim history below), but a same-day flight test showed the doubled gain made NO
+ * measurable difference to the actual altitude wander (fused-height std unchanged:
+ * 0.256m vs a 0.240m baseline) - ruling out damping/authority as the limiter rather than
+ * fixing anything. Reverted back to 15/60 the same day when this term (along with the
+ * relatch gate and climb_rate_error) switched from baro's climb-rate to
+ * VertEkf_GetClimbRateMps() entirely (see APP_ALTHOLD_VZ_KP_US_PER_MPS's comment above
+ * for that switch and why its own gains were also lowered, not raised, for the same
+ * less-lagged-signal reasoning) - no evidence supports keeping the raise for a
+ * fundamentally different, snappier input signal. Re-validate with the same
+ * stick-held-steady bench/hover discipline as every other change to this loop before
+ * trusting it for real hands-off flight. */
 #define APP_BARO_VZ_DAMP_GAIN_US_PER_MPS 15.0f
 #define APP_BARO_VZ_DAMP_LIMIT_US        60U
+/* Live-tunable override for the damping gain above (2026-08-30) - a real flight at
+ * raised inner-loop VZ Kp/Ki (see that constant's comment) showed raising P/I gain did
+ * NOT meaningfully change a real, repeating ~8-10s-period height wander (~0.4-0.5m
+ * amplitude) - consistent with a delay-dominated oscillation, which more proportional/
+ * integral authority against a lagged signal does not fix and can worsen. Damping
+ * (a rate-opposing term) is the textbook lever for exactly this failure mode instead.
+ * The 2026-08-29 negative result on doubling this same gain (comment above) predates
+ * the switch to VertEkf_GetClimbRateMps() for this whole loop and used a since-removed
+ * dedicated filtered baro signal - not evidence against retrying now on the current,
+ * different signal path. `damp_us` never exceeded 12 of its 60us limit on the flight
+ * that motivated this - real headroom exists. Exposed live-tunable for the same
+ * incremental, GET/Read-verified-before-flying discipline as every other gain tonight.
+ * Bounds (APP_BARO_VZ_DAMP_GAIN_MIN/MAX, APP_BARO_VZ_DAMP_LIMIT_MIN/MAX) live in app.h,
+ * next to the getter/setter declarations - same pattern as every other live-tunable
+ * ALTHOLD gain this session. */
+static float g_baro_vz_damp_gain_us_per_mps = APP_BARO_VZ_DAMP_GAIN_US_PER_MPS;
+static uint32_t g_baro_vz_damp_limit_us = APP_BARO_VZ_DAMP_LIMIT_US;
 /* Added 2026-08-22: this term is computed fresh every 2ms control-loop tick straight
  * from the instantaneous climb-rate estimate with no smoothing of its own - unlike the
  * ALTHOLD trim above it, which IS filtered (APP_ALTHOLD_TRIM_LPF_HZ) before reaching the
@@ -158,8 +192,45 @@
  * against those flights' logged baro data, which showed the trim itself staying
  * small/well-damped (nowhere near its clamp) whenever active, meaning the "cyclical
  * altitude chasing" complaint was this gate flickering ALTHOLD on/off across the
- * pilot's normal hover height, not a control-loop stability bug. */
-#define APP_BARO_VZ_DAMP_MIN_ALT_M       0.3f
+ * pilot's normal hover height, not a control-loop stability bug.
+ *
+ * LOWERED AGAIN 2026-08-30, this time from 0.3f to vert_ekf.c's own
+ * VERT_EKF_GROUND_EFFECT_ZONE_M (2x rotor diameter = 0.254m for this
+ * airframe's 5-inch props), via VertEkf_GetGroundEffectZoneM() - real flight
+ * data that night (liftoff_capture_20260830_accelclamp.txt) showed `ah_hold`
+ * dropping to 0 nine times in one flight with the throttle stick VERIFIED
+ * pinned at a single fixed PWM value the entire time (checked the raw RX16
+ * telemetry directly - not a perception issue), every single drop coinciding
+ * with fused height dipping to 0.13-0.29m: ordinary, already-characterized
+ * height noise crossing this gate on flights held at deliberately low
+ * (0.31-0.55m) targets, not any real stick input. The prior 0.3f value was
+ * chosen ad hoc when this constant was first lowered from 1.0f (see above) -
+ * never itself derived from data. 0.254m is not a fresh guess either: it is
+ * the EXACT height vert_ekf.c's own baro ground-effect noise model already
+ * uses as the point its extra R-inflation has fully tapered to zero (see
+ * VERT_EKF_GROUND_EFFECT_ZONE_M's comment) - it was never consistent for this
+ * hard on/off gate to demand MORE clearance (0.3m) than the smooth model
+ * backing the estimate it gates already considers ground-effect-clear. Now a
+ * single shared value (via the getter) instead of two independent numbers
+ * that could silently drift apart. */
+#define APP_BARO_VZ_DAMP_MIN_ALT_M       VertEkf_GetGroundEffectZoneM()
+/* Added 2026-08-23 after tracing a real, felt Z-axis jolt right at liftoff across every
+ * flight on the card: reported altitude bounces back and forth across
+ * APP_BARO_VZ_DAMP_MIN_ALT_M several times within under a second during the actual
+ * ground-to-air transition (both the propwash pressure artifact settling out AND the
+ * real climb starting at once), so the plain >= comparison above re-triggers a FRESH
+ * proportional (and, in ALTHOLD, integral) correction from whatever momentarily-noisy
+ * climb-rate reading exists at each crossing - measured up to +4.5m/s spikes right at
+ * this boundary. That sudden throttle correction, combined with the mixer, is tightly
+ * time-correlated (same or adjacent sample, every flight examined) with large roll/pitch
+ * rate spikes (40-110+ deg/s) and individual motors pinned to their PWM rails - this
+ * gate flickering is believed to be the dominant cause of the jolt (an ATTITUDE-only
+ * flight with no ALTHOLD trim engaged, so only the smaller-clamped Vz-damping term was
+ * subject to the same flicker, showed only a mild version). Fixed with a minimum
+ * continuous-dwell debounce (see ground_effect_clear below) instead of widening this
+ * threshold - a single noisy dip below now requires the full dwell again before
+ * re-engaging, rather than instantly re-arming on the next noisy tick above it. */
+#define APP_GROUND_EFFECT_CLEAR_DWELL_MS 300U
 /* REVERTED 2026-08-21: a same-day attempt to map the full throttle stick range to
  * a commanded climb rate (fixing "Z axis very sensitive to throttle") caused a
  * real in-flight uncontrolled climb. Root cause: althold_center_throttle_us is a
@@ -179,26 +250,290 @@
  * "altitude is very difficult to hold" even in this unmodified raw-passthrough
  * design, independent of the incident above.
  *
- * ALTHOLD reuses ATTITUDE-mode roll/pitch/yaw angle stabilization. The pilot's raw
- * stick throttle is ALWAYS the primary/dominant throttle signal (exactly like
- * ATTITUDE mode) - ALTHOLD only ever ADDS a small bounded trim on top of it while
- * the stick sits near center, to hold the altitude captured the instant it
- * re-centers. Away from center the trim is zeroed and the pilot has full, direct
- * manual throttle authority. This bounded-trim design means a bad baro reading or a
- * wound-up integral can only ever nudge the output by APP_ALTHOLD_TRIM_LIMIT_US - it
- * can never freeze the motors at idle or run away independent of the stick. Falls
- * back to plain manual throttle (like ATTITUDE mode) if the baro is unhealthy. */
+ * ALTHOLD reuses ATTITUDE-mode roll/pitch/yaw angle stabilization. Throttle
+ * stick is FULL AUTHORITY, climb-rate-command design (2026-08-23, replacing
+ * an earlier raw-passthrough-plus-small-trim design): centered (within
+ * APP_ALTHOLD_THROTTLE_DEADBAND_US) LOCKS the altitude captured the instant
+ * it centers; off-center commands a climb/descend RATE proportional to
+ * stick deflection (full stick = APP_ALTHOLD_MAX_CLIMB_MPS), not a raw
+ * throttle value - the stick no longer passes through to the motors at all
+ * once engaged, not even below the ground-effect/baro-health gate (see
+ * APP_ALTHOLD_LIFTOFF_ASSIST_MAX_US's comment).
+ *
+ * "Center" is NOT a fixed PWM value (APP_PWM_MID_US=1500 was tried first and
+ * reverted the same day - see althold_settled_center_us's declaration
+ * comment for why a fixed value can't work here). It's wherever the pilot's
+ * stick genuinely SETTLES (same settle-latch idiom used elsewhere in this
+ * file, e.g. yaw_settle_ref_us, but a much longer duration - see
+ * APP_ALTHOLD_THROTTLE_SETTLE_MS's comment for why) - hold the stick still
+ * long enough and that position becomes center, exactly matching how a
+ * pilot naturally flies: find a comfortable throttle, hold it, expect the
+ * aircraft to hold that height from there. The stick's physical position
+ * never has to correspond to any particular thrust value -
+ * it only ever means "settled here" vs "displaced from there by this much" -
+ * so it works regardless of this airframe's actual hover throttle.
+ *
+ * The altitude fed into the hold/gate logic is ALSO not baro alone - it comes
+ * from vert_ekf.c (2026-08-23, replaced by a real Kalman filter 2026-08-29 -
+ * see that file's top-of-file design comment), which fuses baro against
+ * rangefinder/TF-Luna specifically because baro has a real, characterized
+ * bias/transient right at liftoff that the range sensors are immune to.
+ *
+ * This exact design (full-range stick-to-climb-rate) was attempted once
+ * before and reverted after a real in-flight uncontrolled climb (2026-08-21,
+ * see kh7-althold-throttle-incident memory) - root cause was NOT the
+ * climb-rate mapping itself, it was that the hover-throttle reference lived
+ * entirely inside the altitude gate (froze at a stale cross-flight value
+ * until the gate opened, then got used for a full-authority correction with
+ * no warm-up) and was never reset on arm. Both are fixed here:
+ * althold_hover_throttle_us updates every iteration ALTHOLD/NAVBRAKE is
+ * selected regardless of the gate (see its declaration and the throttle
+ * block below), and is reset to a safe seed on every arm (see the arm-
+ * transition block). It's also hard-clamped to
+ * [APP_ALTHOLD_HOVER_EST_MIN_US, APP_ALTHOLD_HOVER_EST_MAX_US] and can only
+ * drift at APP_ALTHOLD_HOVER_EST_KI_US_PER_MPS_S per second of sustained
+ * climb-rate error - it cannot jump. The fast/reactive trim on top of it
+ * keeps the exact same bound as the old design
+ * (APP_ALTHOLD_TRIM_LIMIT_US) for the same reason: even a wrong hover
+ * estimate can only be fought by a bounded amount on any single iteration.
+ * Whatever this whole block computes is still clamped to
+ * [APP_MOTOR_IDLE_US, APP_THROTTLE_MAX_US] same as manual flight (see
+ * throttle_term below) - full authority here is bounded by the same ceiling
+ * full-stick manual throttle already has, not something new.
+ *
+ * Treat the first flight after any change in this block as a deliberate
+ * low-altitude hover test, not normal flying - the prior incident triggered
+ * exactly at the ground-effect gate crossing. */
 #define APP_ALTHOLD_THROTTLE_DEADBAND_US   100U
-/* The hold-throttle reference re-latches to wherever the stick has genuinely
- * settled (within this small window) for this long - NOT just once at mode
- * entry (which can freeze on an unrepresentative value, e.g. idle throttle
- * before liftoff) and NOT every single non-holding iteration (which would
- * re-latch mid-movement, since consecutive samples of a smoothly-moving stick
- * are often within a small window of each other). */
+/* Stillness tolerance shared with yaw-hold's own settle-latch (see
+ * yaw_settle_ref_us/yaw_settle_start_ms below) - same idiom, two independent
+ * instances (throttle center, yaw heading). The DURATION threshold is
+ * deliberately NOT shared - see APP_ALTHOLD_THROTTLE_SETTLE_MS below. */
 #define APP_ALTHOLD_STICK_STABLE_WINDOW_US 15U
 #define APP_ALTHOLD_STICK_SETTLE_MS        300U
+/* Throttle-specific settle duration (2026-08-23) - deliberately much longer
+ * than yaw-hold's 300ms above. Confirmed via a host-side replay of a real
+ * flight log: a 300ms pause is common and unremarkable during a smooth,
+ * continuous stick push (climbing out), but the settle-latch can't tell that
+ * apart from a deliberate "I've arrived, hold here." A real incident:
+ * stick paused near 1190us for ~270ms while climbing steadily from a
+ * 988us-latched center (commanding a strong, correct climb), which relatched
+ * center to 1190us - the SAME stick position an instant later now read as a
+ * small NEGATIVE offset from the new center instead of a large positive one,
+ * and commanded throttle fell off a cliff (1253us actual -> 1140us) with no
+ * change in what the pilot was actually doing - the concrete cause of a
+ * reported "aircraft only bounces off the ground." A spring-centered yaw
+ * stick doesn't have this ambiguity (release = center, unambiguous), which
+ * is why 300ms was fine there but not here. 1200ms requires genuinely
+ * holding still for over a second - well past a natural mid-push hesitation,
+ * still fast enough to feel responsive once actually parked. */
+#define APP_ALTHOLD_THROTTLE_SETTLE_MS     1200U
+/* Second condition (2026-08-23, alongside the settle-duration fix above) for
+ * committing a relatch: the aircraft must also actually BE near-level, not
+ * just the stick being still. The settle-duration fix alone still had a gap -
+ * a genuine ~0.8s "let's see how this feels" pause DURING an ongoing climb
+ * (stick still, but the climb-rate estimate nowhere near zero) could still
+ * relatch center right there, silently locking a hold at whatever (possibly
+ * low) altitude that pause happened to occur at - reported as the aircraft
+ * "just gives up." Requiring near-zero climb rate too means a relatch can
+ * only commit once the aircraft has actually stopped moving, not just the
+ * stick. */
+#define APP_ALTHOLD_RELATCH_MAX_CLIMB_MPS  0.4f
+/* Third condition for committing a relatch (2026-08-23): the settle
+ * reference must not be within this many us of either physical stick
+ * extreme. A real incident: holding full-down stick to land is, by
+ * definition, a perfectly still stick once pinned at the mechanical limit -
+ * it satisfied both conditions above and relatched center to the stick's own
+ * position, instantly turning a commanded max-rate descent into an altitude
+ * LOCK (the same now-"centered" stick read as offset=0). The aircraft never
+ * landed - see kh7-althold-full-authority-redesign memory. Excluding both
+ * extremes means holding full-down (or full-up) always keeps commanding
+ * max-rate descent (or climb), never silently converts to a hold. */
+#define APP_ALTHOLD_RELATCH_EXCLUDE_MARGIN_US 100U
 #define APP_ALTHOLD_MAX_CLIMB_MPS           2.0f
+/* REVERTED back to 0.8 (2026-08-25, same day) - raising this to 1.5 caused a real
+ * in-flight uncontrolled climb that could not be arrested with the stick and
+ * required an emergency in-flight disarm to stop. Root cause NOT yet understood -
+ * the SD card ejected during/after the emergency disarm, so the log of this exact
+ * flight may be incomplete or unrecoverable. Do not raise this gain again without
+ * first understanding why a theoretically-bounded change (climb_rate_setpoint was
+ * still clamped to +-APP_ALTHOLD_MAX_CLIMB_MPS regardless of this value, by
+ * design) produced an unarrestable real climb - that reasoning was evidently
+ * missing something. Treat this exactly like the 2026-08-21/2026-08-22 incidents:
+ * re-attempt only in much smaller steps with a dedicated low-altitude bench/hover
+ * test, and only after the root cause of THIS incident is understood, not just
+ * because the number is reverted. */
 #define APP_ALTHOLD_ALT_HOLD_KP_MPS_PER_M   0.8f
+/* Live-tunable override for APP_ALTHOLD_ALT_HOLD_KP_MPS_PER_M (2026-08-29) - added
+ * so this specific gain can be nudged from the GUI during a cautious low-hover test
+ * instead of needing a reflash per attempt, given a real flight confirmed the
+ * position-hold loop wanders ~0.5m with the throttle stick held perfectly flat
+ * (not sensor noise - the fused height tracked lidar accurately the whole time).
+ * RAM-only, resets to the safe compiled-in default on every boot - deliberately NOT
+ * persisted to flash, so a value left over from a tuning session can never silently
+ * carry into a later one. Bounded well below 1.5 - see APP_ALTHOLD_ALT_HOLD_KP_MPS_PER_M's
+ * comment above for the exact real incident (an unarrestable in-flight climb,
+ * emergency disarm, root cause never understood) that value caused; this cap keeps
+ * any GUI-driven increase from ever reaching it. */
+static float g_althold_alt_hold_kp_mps_per_m = APP_ALTHOLD_ALT_HOLD_KP_MPS_PER_M;
+/* App_GetAltholdAltHoldKp()/App_SetAltholdAltHoldKp() are defined further below,
+ * next to App_IsFiniteInRange() which the setter's validity check needs. */
+
+/* Live-tunable override for APP_ALTHOLD_MAX_CLIMB_MPS (2026-08-30) - the ceiling on
+ * both manually-commanded climb/descend rate (off-center stick) AND the position-hold
+ * loop's own correction rate. Exposed to the GUI on request, same RAM-only/reset-on-
+ * boot/firmware-bounded pattern as the hold-gain live-tunable above. Unlike that gain,
+ * this specific constant has no direct incident history of its own (it was
+ * deliberately left untouched while OTHER gains were tuned/reverted around it - see
+ * kh7-althold-oscillation-yawhold-todo memory), but it still directly caps how fast
+ * this aircraft can move vertically, so the bound below (APP_ALTHOLD_MAX_CLIMB_MIN/MAX,
+ * app.h) is a cautious ~2x headroom above the long-standing default, not an unbounded
+ * slider. */
+static float g_althold_max_climb_mps = APP_ALTHOLD_MAX_CLIMB_MPS;
+
+/* Integral on the OUTER position-hold loop (2026-08-30) - the hold P-term
+ * (App_GetAltholdAltHoldKp() * position_error) is pure proportional, which real
+ * flight data showed settles with a persistent steady-state droop: fused height sat
+ * 8.7-15.1cm BELOW the held target across three separate hold episodes in one flight,
+ * consistently in the same direction (not symmetric noise). Same class of bug as
+ * kh7-pitch-steady-state-droop earlier this session (a P-only chain settling short of
+ * its target), fixed the same way there by adding an integral term. Starting value
+ * (0.05) chosen by simulating candidate gains against the REAL captured target/fused
+ * trajectory from that flight before ever writing this code: 0.03-0.12 all stayed
+ * well inside the integral limit with no sign of runaway, 0.05 sits in the
+ * conservative middle of that range. Live-tunable (App_GetAltholdPosKi()/
+ * App_SetAltholdPosKi()) so it can be dialed to 0 (fully off) or adjusted without a
+ * reflash if real flight shows it's too weak or too aggressive - same RAM-only/
+ * reset-on-boot pattern as every other live-tunable ALTHOLD gain tonight. Separate
+ * accumulator (althold_pos_integral_mps) and separate clamp
+ * (APP_ALTHOLD_POS_INTEGRAL_LIMIT_MPS) from the INNER climb-rate loop's own integral
+ * (althold_integral_us) - these are two different loops, not the same term reused.
+ *
+ * 2026-08-30: the open-loop-replay validation above was NOT sufficient - real flight
+ * at this exact value (0.05) caused a severe, reproducible closed-loop instability
+ * (fused height cycling ~0.1-1.7m even with the target held flat), confirmed via
+ * GUI-verified GET/Read on 4 of 5 flights, one ending in a flip; nowhere near
+ * trim/damp saturation, so it's not a clamp/authority issue. Default lowered to 0.0f
+ * here so a power cycle doesn't silently re-arm the known-bad value (this RAM-only
+ * value had already reverted and confused one earlier "confirmation" test before a
+ * GET/Read caught it - verify live value before flying, don't assume). A genuinely
+ * verified Ki=0 flight is still pending as of this note - do not raise this off 0
+ * without that, PLUS closed-loop (not just open-loop trajectory replay) validation
+ * against the halved inner climb-rate-loop gains. See
+ * kh7_althold_oscillation_yawhold_todo memory for full incident details. */
+#define APP_ALTHOLD_POS_KI_PER_S2            0.0f
+#define APP_ALTHOLD_POS_INTEGRAL_LIMIT_MPS   0.5f
+static float g_althold_pos_ki_per_s2 = APP_ALTHOLD_POS_KI_PER_S2;
+
+/* Gentle fine-adjustment rate for stick offset WITHIN the hold deadband
+ * (2026-08-23) - see the "Centered" branch's comment for why this exists.
+ * Deliberately much slower than APP_ALTHOLD_MAX_CLIMB_MPS (the full
+ * off-center climb/descend rate) so nudging while holding still feels
+ * clearly different from actively commanding a climb. */
+#define APP_ALTHOLD_HOLD_NUDGE_MAX_MPS      0.3f
+/* Deadzone on the nudge above (2026-08-29) - real ALTHOLD-on-EKF flight telemetry
+ * (the new Telemetry_PrintAltholdState() target_cm field) showed the held target
+ * continuously ramping - never flat - throughout every hold, root-caused to this
+ * exact nudge: it had no threshold of its own, so ANY nonzero throttle_offset_us
+ * walked the target, without bound, for the whole hold duration. Back-calculated
+ * from the observed drift rate (~0.02 m/s over a 10s window): an average stick
+ * offset of just 6.7us from the latched center fully explains it - smaller than
+ * any human can hold a stick to, meaning this drift was guaranteed on every
+ * single hold, for any pilot, regardless of skill. Not related to gains, baro
+ * noise, or vert_ekf.c at all - this bug predates all of that (added 2026-08-23).
+ * 20us rejects that level of stick noise/tremor while still leaving most of the
+ * +-100us deadband available for a genuinely intentional nudge. */
+#define APP_ALTHOLD_HOLD_NUDGE_DEADZONE_US  20U
+/* Safe starting point for althold_hover_throttle_us on every arm, and what it
+ * stays pinned at for the whole below-gate liftoff-assist phase (see
+ * APP_ALTHOLD_LIFTOFF_ASSIST_MAX_US below - there's no baro feedback to learn
+ * from pre-gate by design, so this never moves until the gate opens and the
+ * real closed loop takes over). Not meant to be a good guess by itself - see
+ * that constant for how liftoff actually reaches real hover/climb throttle
+ * from here - just a known, predictable, comfortably-clear-of-idle value. */
+#define APP_ALTHOLD_HOVER_EST_SEED_US    1150.0f
+#define APP_ALTHOLD_HOVER_EST_MIN_US     1100U
+/* LOWERED from 1550 to 1330 (2026-08-25) after a real incident: the aircraft climbed
+ * hard, pinned this estimate at its old 1550 ceiling, then got stuck "arrested
+ * against the ceiling" for 7+ seconds with FULL-DOWN STICK HELD THE WHOLE TIME
+ * having no effect - required an emergency in-flight disarm. Root cause: this
+ * ceiling combined with the fast trim's bounded authority
+ * (APP_ALTHOLD_TRIM_LIMIT_US=250, the most it can ever subtract) sets a WORST-CASE
+ * FLOOR of ceiling-250, regardless of stick position - at the old 1550 that floor
+ * was 1300us, which was apparently enough thrust to sustain this airframe near
+ * level flight, so even a maxed-out descend command (correctly computed - the
+ * stick-command math itself was working) could never bring real output low enough
+ * to actually descend. This wasn't unique to the gain change that triggered it
+ * this time (APP_ALTHOLD_ALT_HOLD_KP_MPS_PER_M, since reverted) - it's a latent
+ * structural gap that any sufficiently sustained climb could have wound the
+ * estimate into. Fixed at the source: 1330 guarantees ceiling-250 <=
+ * APP_MOTOR_IDLE_US(1080), so the worst possible case - this estimate pinned at
+ * its ceiling AND trim pinned at its floor, simultaneously - still reaches idle,
+ * restoring "full-down stick always actually reaches idle" as a real, provable
+ * guarantee instead of one that happened to hold only when this estimate stayed
+ * away from its ceiling. */
+#define APP_ALTHOLD_HOVER_EST_MAX_US     1330U
+/* Deliberately much smaller than APP_ALTHOLD_VZ_KI_US_PER_MPS_S below - this
+ * drives the persistent base estimate, not the fast reactive trim, so it
+ * should only fully correct a sustained error over several seconds, never in
+ * one or two iterations. Raised 3.0->9.0 (2026-09-04) after real flight data
+ * showed this Ki, combined with the resets-every-arm safety discipline above
+ * (see APP_ALTHOLD_HOVER_EST_SEED_US's reset comment - deliberate, from a real
+ * 2026-08-21 incident, NOT touched here), meant every single flight needed a
+ * genuinely painful ~30-40s of weak, barely-airborne thrust before the
+ * estimate reached this airframe's real ~1250-1290us hover point - two
+ * consecutive flights that night never got there at all. 3x faster still
+ * takes ~10-15s to fully correct a sustained error (nowhere near "one or two
+ * iterations"), it's still a bounded, gradual, per-arm-reset estimate, not a
+ * carried-over or assumed value - just less punishing to actually fly. */
+#define APP_ALTHOLD_HOVER_EST_KI_US_PER_MPS_S 9.0f
+/* Below-gate liftoff assist (2026-08-23): full stick deflection from
+ * althold_settled_center_us adds/subtracts this many us around
+ * althold_hover_throttle_us, OPEN LOOP - no baro feedback at all, since baro
+ * is known unreliable during exactly this window (see
+ * kh7-baro-liftoff-transient memory). An earlier version of this centered on
+ * a fixed APP_PWM_MID_US=1500 instead of the settled center - reverted the
+ * same day: raw PWM 1500 is nowhere near this airframe's real ~1200-1270us
+ * hover throttle, making it impossible to comfortably approach the post-gate
+ * hold center without climbing hard the whole way there (same class of
+ * stick-semantics discontinuity at the gate as the 2026-08-21 incident, just
+ * manifesting as "can't get there" instead of "runaway"). Centering on the
+ * settled stick position instead keeps stick meaning consistent across the
+ * gate with NO dependence on this airframe's specific hover throttle at all -
+ * see althold_settled_center_us's declaration comment. Sized so idle seed
+ * (1150) plus full-stick assist (1150+350=1500) alone would already reach
+ * the real observed liftoff throttle (~1210-1215us mean) well within half
+ * stick travel - conservative, not twitchy. */
+#define APP_ALTHOLD_LIFTOFF_ASSIST_MAX_US   350U
+/* ALTHOLD's ABSOLUTE ALTITUDE reference is vert_ekf.c's VertEkf_GetHeightM() as of
+ * 2026-08-29 - replaces the hand-rolled baro+rangefinder complementary fusion
+ * (App_GetFusedAltitudeM(), removed) that lived here before. See vert_ekf.c's
+ * top-of-file design comment for why a real Kalman filter with per-measurement R
+ * replaces that fusion's fixed-rate correction/outlier-reject/resync-watchdog logic
+ * outright rather than extending it further, and kh7-baro-liftoff-transient /
+ * kh7-althold-full-authority-redesign / kh7-althold-hover-est-ceiling-incident
+ * memory for exactly how much real-flight iteration went into the version this
+ * replaces.
+ *
+ * CLIMB RATE history, both 2026-08-29: FIRST attempt used VertEkf_GetClimbRateMps()
+ * directly as a drop-in swap for Baro_GetClimbRateMps() - reverted the same day after a
+ * live ALTHOLD-on-EKF test flight showed a real ~20-50cm altitude oscillation that
+ * wasn't there before. Root cause: the fused HEIGHT was accurate throughout (tracked
+ * lidar_h_cm closely the whole time), so this wasn't a sensor/estimator error - it was
+ * vert_ekf.c's climb-rate being driven by real-time accel integration, snappier/less
+ * lagged than baro's own complementary filter, changing the PID loop's effective
+ * gain/phase enough to oscillate even though the gains themselves didn't change. Reverted
+ * to baro's climb-rate (with a dedicated input-side filter added, then later removed -
+ * see APP_ALTHOLD_VZ_KP_US_PER_MPS's comment below), and real indoor+outdoor flight data
+ * confirmed baro's own noise floor (not gain, not damping, not ground-effect/
+ * recirculation - see kh7-althold-oscillation-yawhold-todo memory) as the dominant
+ * remaining driver of ALTHOLD altitude variance. SECOND attempt (same day): switched to
+ * VertEkf_GetClimbRateMps() again, this time PAIRED with a real gain reduction
+ * (APP_ALTHOLD_VZ_KP_US_PER_MPS/_KI_US_PER_MPS_S roughly halved) instead of a drop-in
+ * swap, since a less-lagged signal needs less raw gain for the same effective loop
+ * authority - see that constant's comment for the full reasoning. NOT YET
+ * FLIGHT-VALIDATED as of this comment - treat exactly like every other change to this
+ * loop, incremental stick-held-steady testing required before trusting it. */
 /* REVERTED 2026-08-22 (same day as the increase below): raising these caused a
  * real, clean limit-cycle oscillation - confirmed directly in a flight log with
  * the throttle stick held dead flat for 18+ seconds: altitude cycled between
@@ -215,8 +550,54 @@
  * with a dedicated stick-held-steady bench/hover test to check for oscillation
  * BEFORE calling it validated - a "does it saturate" check alone (which is what
  * motivated the increase last time) does not rule out this failure mode. */
-#define APP_ALTHOLD_VZ_KP_US_PER_MPS        25.0f
-#define APP_ALTHOLD_VZ_KI_US_PER_MPS_S       8.0f
+/* LOWERED 2026-08-29 (25->12, 8->4) alongside switching this loop's climb-rate SOURCE
+ * from Baro_GetClimbRateMps() to VertEkf_GetClimbRateMps() (see the big comment above
+ * APP_ALTHOLD_LIFTOFF_ASSIST_MAX_US for the full history of that switch, including the
+ * FIRST attempt the same day that caused a real ~20-50cm oscillation and was reverted).
+ * This second attempt pairs the source swap with a real gain reduction instead of a
+ * drop-in swap: vert_ekf's climb-rate is driven by real-time accel integration and
+ * reacts with less lag than baro's own complementary filter, which effectively raises
+ * this loop's gain/phase margin impact even at the SAME numeric Kp/Ki - roughly halving
+ * both is a conservative first step, not a precisely derived value (no closed-loop
+ * system ID was done, just the general principle that a less-lagged input needs less
+ * raw gain for the same effective authority). A dedicated input-side filter on baro's
+ * climb-rate (APP_ALTHOLD_VZ_FILTER_HZ, added earlier the same day) is REMOVED here,
+ * superseded by moving off baro's climb-rate for this loop entirely - see
+ * kh7-althold-oscillation-yawhold-todo memory for why baro's own noise floor was
+ * identified as the dominant remaining driver of ALTHOLD altitude variance (confirmed
+ * environment-independent via matched indoor/outdoor data), and kh7-vert-ekf-design for
+ * why increasing damping instead (tried right before this) had no measurable effect -
+ * ruling out authority/damping as the limiter and motivating this SOURCE change instead
+ * of another gain-only attempt. Treat this exactly like every other change to this
+ * exact loop: NOT YET FLIGHT-VALIDATED as of this comment, requires the same
+ * incremental, stick-held-steady, hand-ready-to-disarm testing discipline as the
+ * 2026-08-22 and 2026-08-29 gain incidents on this file. */
+#define APP_ALTHOLD_VZ_KP_US_PER_MPS        12.0f
+#define APP_ALTHOLD_VZ_KI_US_PER_MPS_S       4.0f
+/* Live-tunable overrides for the two constants above (2026-08-30) - added after a
+ * flight-confirmed-clean 70s hold (once the night's other real bugs - Ki windup,
+ * momentum-handoff capture, EKF accel/lidar glitches, ground-effect-gate cycling -
+ * were fixed separately) showed `trim_us` never exceeding 16 of its 250us ceiling
+ * the ENTIRE flight, alongside a real, slower (~8-18s) residual height wave that
+ * trim barely correlated with (r=-0.38) - strong evidence this inner loop has
+ * substantial unused corrective authority now that the ACTUAL causes of the
+ * earlier oscillation are gone, not that it's already working as hard as it safely
+ * can. Exposed live-tunable specifically so this can be tested incrementally,
+ * in small steps, with a GET/Read verification before each attempt (per the
+ * lesson learned earlier this exact session about a stale RAM-only value), rather
+ * than picking one new hardcoded number and reflashing blind. Do NOT trust an
+ * open-loop replay of old error data to validate a higher value here - that
+ * exact method already failed once tonight (see APP_ALTHOLD_POS_KI_PER_S2's
+ * comment) precisely because it cannot reveal a closed-loop instability. Bounds
+ * deliberately capped at the ORIGINAL pre-2026-08-29 values (25/8) - this is
+ * restoring toward a value this loop has run at before (with baro's climb-rate,
+ * not vert_ekf's - so even the max of this range is not proven safe with the
+ * current source, just not a step into genuinely unprecedented territory).
+ * Bounds (APP_ALTHOLD_VZ_KP_MIN/MAX, APP_ALTHOLD_VZ_KI_MIN/MAX) live in app.h,
+ * next to the getter/setter declarations - same pattern as every other
+ * live-tunable ALTHOLD gain this session. */
+static float g_althold_vz_kp_us_per_mps = APP_ALTHOLD_VZ_KP_US_PER_MPS;
+static float g_althold_vz_ki_us_per_mps_s = APP_ALTHOLD_VZ_KI_US_PER_MPS_S;
 #define APP_ALTHOLD_INTEGRAL_LIMIT_US      200U
 /* Smooths the final trim output itself (not the P/I gains) - climb-rate error is
  * fed straight from the baro, and even with the baro's own onboard LPF, real
@@ -228,49 +609,108 @@
  * same overshoot; back to the original, previously-stable value. */
 #define APP_ALTHOLD_TRIM_LPF_HZ             1.5f
 #define APP_ALTHOLD_TRIM_LIMIT_US          250U
-/* --- NAV_VELOCITY_BRAKE (experimental GPS horizontal velocity brake, phase 1) ---
- * Reuses the ATTITUDE-mode angle controller (roll/pitch) and the ALTHOLD throttle
- * controller (vertical) - this section only adds the outer velocity->angle loop.
- * Engaged when ch6 (the existing mode switch) exceeds this threshold - a 4th band
- * above ALTHOLD's >=1800us, so it needs a transmitter mix that can drive ch6 above
- * 2000us (the existing 3-way RATE/ATTITUDE/ALTHOLD switch positions are unaffected).
- *
- * FLIGHT-TESTED FINDING (2026-08-15): an earlier pitch-sign bug (APP_PITCH_SIGN was
- * applied twice - once converting stick to fwd_cmd_mps, again converting the
- * resulting accel to target_pitch_deg - so the two flips canceled and inverted the
- * pilot's fwd/aft command) was found and fixed. Bench-verified correct while
- * disarmed (no motor current). But a real flight afterwards - fully engaged the
- * whole time (NAVBRAKE requested=176/176 active=176/176) - still would not track
- * the stick and drifted. SD log analysis showed why: compass-vs-yaw tracking error
- * peaked at 25.3deg during that flight (rms 9.3deg) vs. peak 5.2deg on the same
- * airframe disarmed/no-motor-current. Both Nav_RotateBodyToNed() (stick command)
- * and Nav_RotateNedToBody() (velocity-error accel) key off yaw_deg, so a yaw error
- * that size rotates "forward" into materially the wrong geographic direction -
- * independent of, and not fixed by, the pitch-sign fix. This is the same
- * motor-current magnetic interference already called out near
- * APP_MAG_YAW_NUDGE_KP_DPS_PER_DEG below - do not trust NAVBRAKE until that's
- * actually resolved, not just mitigated.
- *
- * FOLLOW-UP (2026-08-16, real flight, 190 samples/6.24s): tracking error is not
- * just ambient motor-current interference - it's substantially worse specifically
- * while the pilot is actively commanding yaw. While holding heading (stick
- * centered, 164 samples): rms 6.4deg peak 22.3deg. While commanding yaw (stick
- * active, 26 samples): rms 21.9deg peak 32.4deg. So active rotation itself
- * degrades compass/gyro agreement well beyond the hover-only baseline - likely
- * magnetometer response lag relative to the gyro-integrated estimate, or the
- * yaw-nudge correction coping worse with a moving target than a steady one.
- * Sharpens, doesn't change, the conclusion above. */
+/* --- NAV_POSHOLD (2026-09-04 rewrite) ---
+ * Replaces the old NAV_VELOCITY_BRAKE mode + separate independent poshold aux-
+ * switch overlay (both deleted) with ONE unified GPS mode, per explicit user
+ * request after two rounds of real-flight failures in the old split design
+ * (a growing velocity-error oscillation, then an actual attitude-tracking
+ * divergence - see git history / kh7_gps_data_and_poshold_design memory for the
+ * full incident record). Engaged when ch6 exceeds this threshold, same physical
+ * slot the old top band used - reuses the ATTITUDE-mode angle controller
+ * (roll/pitch) and the ALTHOLD throttle controller (vertical), this section only
+ * adds the outer position/velocity->angle loop. Behavior (the whole mode in one
+ * paragraph): roll/pitch sticks centered -> command zero drift (hold the last
+ * settled position once GPS-measured speed confirms it's actually stopped, or
+ * brake to a stop first if it wasn't); sticks off-center -> stick maps directly
+ * to a commanded NE velocity, same as manual flying; sticks return to center ->
+ * always recapture the CURRENT position as a fresh hold target (per the pilot
+ * spec: "when you release the sticks, recapture position" - deliberately no
+ * memory of any earlier target, see the removed APP_NAVPOS_TARGET_MEMORY_MS
+ * for why that was wrong). Yaw is NOT re-litigated here - consumes the same
+ * yaw_deg/mag-nudge pipeline every other mode already shares. If the GPS engage
+ * gate ever fails while this mode is selected, falls straight through to plain
+ * stick-to-angle control (identical to ATTITUDE mode) rather than doing nothing -
+ * the pilot always has manual attitude control as a fallback. */
 #define APP_NAV_BRAKE_SWITCH_THRESHOLD_US   2000U
-/* Conservative first-pass limits (see user-selected 1.5 m/s max velocity):
- * kept at/near the low end of the suggested ranges since this mode is unflown. */
-#define APP_NAV_BRAKE_MAX_TILT_DEG          8.0f
-#define APP_NAV_BRAKE_MAX_ACCEL_MPS2        1.0f
-#define APP_NAV_BRAKE_MAX_VEL_MPS           1.5f
-#define APP_NAV_BRAKE_STICK_DEADBAND_US      20U
-/* accel_cmd (m/s^2) = Kp * vel_error (m/s). At the max 1.5 m/s error this gives
- * 0.9 m/s^2, leaving headroom below the 1.0 m/s^2 clamp instead of saturating
- * immediately at every large error. */
-#define APP_NAV_BRAKE_VELOCITY_KP            0.6f
+/* Raised again 2026-09-04 (10.0->15.0, 1.6->2.5): confirmed calm-air (no wind)
+ * flight still showed correction ramping too slowly to arrest drift within a
+ * couple seconds even after the first round of increases - with no external
+ * disturbance to explain the shortfall, the ceilings themselves were still
+ * the limit, not a real-world force this loop can never fully cancel. */
+/* APP_NAVPOS_MAX_TILT_DEG is no longer the hold's own tilt ceiling (see
+ * 2026-09-04 below) - kept only for the disarmed bench-diagnostic block's
+ * "would-be" print, which never reaches the motors. */
+#define APP_NAVPOS_MAX_TILT_DEG              15.0f
+/* Raised again 2026-09-04 (2.5->8.0): the hold's angle output is now capped by
+ * active_attitude_gains.max_angle_deg (same authority as manual flying, per
+ * the pilot's explicit request after the gentler ceilings above still felt
+ * "no different" in real flight) rather than a separate, lower tilt ceiling -
+ * this accel cap is raised well past what's needed to reach a ~35deg angle
+ * (g*tan(35)=6.9 m/s^2) so it no longer silently re-introduces a lower
+ * effective ceiling of its own. */
+#define APP_NAVPOS_MAX_ACCEL_MPS2            8.0f
+/* Raised 2026-09-04 (20->80, matching APP_YAWHOLD_DEADBAND_US's already-proven
+ * value): real flight data showed a real pilot's stick never sits inside a
+ * +-20us window for more than a fraction of a second - ordinary hand tremor
+ * repeatedly popped it outside the deadband, so navpos_active kept dropping
+ * and re-latching a BRAND NEW current-position target every time, chasing
+ * wherever the aircraft happened to be at each restart instead of ever
+ * holding one point - reported as "still drifts" even with the hold engaged
+ * most of the time. */
+#define APP_NAVPOS_STICK_DEADBAND_US        80U
+/* Raised 2026-09-04 (0.6->1.2 Kp, and MAX_ACCEL/MAX_TILT below 1.0->1.6 m/s^2,
+ * 8.0->10.0 deg): real flight data showed the hold converging in the right
+ * direction but too slowly against real outdoor disturbance - a sustained
+ * ~0.8 m/s velocity error only produced ~2-2.5deg of tilt (nowhere near
+ * either the old 1.0 m/s^2 accel cap or the 8deg tilt cap), so the low Kp
+ * itself was the bottleneck, not either ceiling. Safe to push harder here for
+ * the same reason the Kp/Ki raise above was: this chain is now used ONLY for
+ * the centered-stick hold, structurally isolated from manual flying (which
+ * uses the separate full-authority ATTITUDE-mode mapping), so it can't
+ * destabilize active piloting the way the two historical incidents did. */
+#define APP_NAVPOS_VELOCITY_KP               2.0f
+/* Off-center stick -> commanded velocity ceiling (manual flying under this mode). */
+#define APP_NAVPOS_MAX_STICK_VEL_MPS         1.5f
+/* Centered-stick position-hold outer loop: position error (Kp+Ki) -> desired NE
+ * velocity (clamped to this, separate from the manual stick ceiling above since
+ * holding against real disturbance may need more authority than a pilot's own
+ * gentle stick input ever asks for) -> feeds the SAME velocity-error->accel->angle
+ * chain above - no second, independently-tuned physics path. */
+/* Raised 2026-09-04 (0.30->0.6, 0.03->0.08): real flight data showed the hold
+ * settling at a persistent 0.2-0.6m standoff from its target rather than
+ * converging - reported as "drifts, should hold the GPS position". At the old
+ * Kp, a 0.5m error only requested a 0.15 m/s correction, well under this
+ * loop's own 1.0 m/s/1.0 m/s^2 ceilings (neither was saturating), so the
+ * bottleneck was gain, not authority. Safe to raise now in a way it wasn't
+ * before: manual flying (off-center stick) no longer shares this chain at all
+ * - it uses the separate, full-authority ATTITUDE-mode stick mapping - so this
+ * gain only affects the gentle station-keeping hold, not piloted maneuvering,
+ * unlike the two past incidents where raising a SHARED gain destabilized
+ * active flying. Still well under APP_NAVPOS_KP_MAX/KI_MAX (0.8/0.15). */
+#define APP_NAVPOS_KP_DEFAULT                0.60f  /* m/s commanded per meter of position error */
+#define APP_NAVPOS_KI_DEFAULT                0.08f  /* m/s per meter-second of accumulated error */
+#define APP_NAVPOS_MAX_INTEGRAL_MPS          0.6f   /* hard clamp, independent of ki (isfinite-guarded below) */
+/* Raised 2026-09-04 (1.0->1.5) alongside the accel/tilt ceiling raise above,
+ * so a larger position error can request a correspondingly faster correction
+ * instead of hitting this velocity ceiling before the stronger accel/tilt
+ * authority ever gets used. */
+#define APP_NAVPOS_MAX_HOLD_VEL_MPS          1.5f
+/* Tighter than NAV_MAX_HORIZONTAL_ACC_M's 5.0m general engage gate - a "hold" at
+ * 5m accuracy would visibly wander, not matching pilot expectation. Live-checked
+ * hAcc this session read 0.70m on an 18-satellite 3D fix, so ~2-3m is achievable
+ * in practice, not just in theory. */
+#define APP_NAVPOS_MAX_HORIZONTAL_ACC_M       2.5f
+/* Velocity-gated relatch (mirrors APP_ALTHOLD_RELATCH_MAX_CLIMB_MPS's incident-
+ * driven lesson): "stick centered" alone is not sufficient evidence the aircraft
+ * has actually stopped moving - require GPS-measured horizontal speed to already
+ * be near zero before latching a target, or a hold engaged mid-drift would just
+ * freeze the drift in place. */
+#define APP_NAVPOS_RELATCH_MAX_VEL_MPS        0.4f
+static float g_navpos_kp_per_s = APP_NAVPOS_KP_DEFAULT;
+static float g_navpos_ki_per_s2 = APP_NAVPOS_KI_DEFAULT;
+/* App_GetNavPosKp()/App_SetNavPosKp()/App_GetNavPosKi()/App_SetNavPosKi() are
+ * defined further below, next to App_IsFiniteInRange() which the setters need. */
+
 #define APP_ROLL_SIGN          (1)
 #define APP_PITCH_SIGN         (-1)
 #define APP_YAW_SIGN           (1)
@@ -511,6 +951,40 @@
 #define APP_PID_FLASH_VERSION  3UL
 #define APP_PID_FLASH_ADDRESS  0x081E0000UL
 
+/* Persistent storage for the ALTHOLD live-tunables (2026-08-30) - see
+ * App_SaveAltholdSettings()/App_LoadAltholdSettings() below. Deliberately a SEPARATE
+ * flash blob/sector from the rate-PID one above, not an extension of it - keeps this
+ * new, less-tested save/load path from having any chance of corrupting or being
+ * corrupted by the existing, heavily-relied-on PID gain storage. Bank 2 Sector 6
+ * (0x081C0000) - the sector immediately below the PID blob's Sector 7, still well
+ * outside the firmware image itself (which lives in Bank 1). */
+#define APP_ALTHOLD_FLASH_MAGIC    0x484F4C44UL /* "HOLD" */
+#define APP_ALTHOLD_FLASH_VERSION  1UL
+#define APP_ALTHOLD_FLASH_ADDRESS  0x081C0000UL
+
+typedef struct
+{
+  uint32_t magic;
+  uint32_t version;
+  float alt_hold_kp;
+  float max_climb_mps;
+  float pos_ki;
+  float vz_kp;
+  float vz_ki;
+  float damp_gain;
+  float damp_limit_us;
+  uint32_t crc32;
+  uint32_t reserved[6];
+} App_AltholdFlashBlob_t;
+
+typedef union
+{
+  App_AltholdFlashBlob_t blob;
+  uint32_t words[24];
+} App_AltholdFlashPage_t;
+
+_Static_assert(sizeof(App_AltholdFlashBlob_t) <= sizeof(App_AltholdFlashPage_t), "ALTHOLD flash blob too large");
+
 /* Motor position mapping used by the mixer:
  * S1 = Front-Left, S2 = Front-Right, S3 = Rear-Right, S4 = Rear-Left
  */
@@ -525,7 +999,7 @@ typedef enum
   APP_FLIGHT_MODE_RATE = 0U,
   APP_FLIGHT_MODE_ATTITUDE = 1U,
   APP_FLIGHT_MODE_ALTHOLD = 2U,
-  APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE = 3U,
+  APP_FLIGHT_MODE_NAV_POSHOLD = 3U,
 } App_FlightMode_t;
 
 typedef enum
@@ -864,6 +1338,10 @@ typedef struct __attribute__((packed))
   int16_t nav_accel_cmd_right_x1000;
   int16_t pilot_roll_stick_us;
   int16_t pilot_pitch_stick_us;
+  int16_t rangefinder_cm_x10; /* ESP32-bridge HC-SR04 ground truth, 0 = no/stale reading -
+                                * see App_GetRangefinderCm()'s comment */
+  int16_t luna_cm_x10; /* ESP32-bridge TF-Luna LiDAR, 0 = no/stale reading - see
+                         * App_GetLunaCm()'s comment */
 } App_SdLogRecord_t;
 
 #define APP_SDLOG_RECORDS_PER_BLOCK (SD_BLOCK_SIZE / sizeof(App_SdLogRecord_t))
@@ -1206,6 +1684,160 @@ void App_PrintArmedTelemetryStatus(void)
   printf("TELARM[%s]\r\n", (g_armed_test_telemetry_enabled != 0U) ? "ON" : "OFF");
 }
 
+/* ESP32-bridge-reported HC-SR04 rangefinder (2026-08-23) - ground-truth height,
+ * originally added purely for calibrating the baro's propwash/ground-effect altitude
+ * bias (logged alongside baro_alt_cm on the SAME time_ms axis instead of trying to
+ * align two independently-clocked capture streams after the fact - see
+ * kh7-sdlog-corruption-bug and kh7-rangefinder-setup memory).
+ *
+ * As of 2026-08-23 also used to help ground_effect_clear detect clearing ground effect
+ * faster/more reliably than baro altitude alone can during the liftoff window (see
+ * kh7-baro-liftoff-transient memory - baro itself swings wildly, up to ~230cm off,
+ * during exactly the window this gate needs to evaluate).
+ *
+ * IMPORTANT correction (2026-08-23, same day): this reaches the FC over Serial2/UART6 -
+ * a direct, wired, onboard link from the ESP32, NOT WiFi. WiFi only carries the
+ * SEPARATE ground-station copy of the same reading (bridge_client_printf's "[BRIDGE]
+ * RANGE" line, over the TCP clients[]) - an earlier version of this comment wrongly
+ * applied that link's WiFi latency/jitter/reconnect-drop risk to this one too, which
+ * doesn't share that path at all. The real remaining risks here are narrower: the
+ * ESP32 itself resetting/crashing (UART6 traffic just stops, caught by the staleness
+ * check below same as any other failure), transient UART6 line corruption (mitigated
+ * by the line-boundary-safe queuing on both directions - see
+ * esp32_s3_uart6_wifi_bridge.ino), and the sensor's own inherent limits (near-field
+ * dead zone during ESP32-side bootstrap lock, occasional multipath/off-axis echo
+ * spikes that survive the median/MAD filter - see kh7-rangefinder-setup memory - and a
+ * hard range ceiling around 4-6m). App_GetRangefinderCm() returns 0.0f (an otherwise
+ * impossible reading - RANGE_MIN_VALID_CM on the ESP32 side floors real readings well
+ * above 0) whenever the data is missing or stale, and every caller must treat that as
+ * "no reading available right now, fall back to baro-only" rather than "height is
+ * zero." */
+#define APP_RANGEFINDER_STALE_MS 500U  /* ESP32 reports ~every 100ms; several missed/rejected
+                                        * cycles in a row (not just one) before calling it stale */
+static float g_rangefinder_cm = 0.0f;
+static uint32_t g_rangefinder_last_update_ms = 0U;
+/* Confidence (0.0-1.0) and the ESP32's own micros() at measurement time, added
+ * 2026-08-25 alongside the "SENSOR" packet redesign (see
+ * esp32_s3_uart6_wifi_bridge.ino's range_filter_apply_ex() comment for what confidence
+ * means). Stored for future use - NOT yet consumed by App_GetBestHeightCm() or the
+ * fusion below, which still behave exactly as before this redesign. Deciding how much
+ * to lean on confidence in the actual control path is a separate, deliberate change,
+ * not part of this one. */
+static float g_rangefinder_confidence = 0.0f;
+static uint32_t g_rangefinder_sensor_ts_us = 0U;
+/* Fixed mounting descriptor from the ESP32's "SENSOR_CFG" line - see that sketch's
+ * RANGE_MOUNT_AXIS comment. Not consumed anywhere yet (no tilt-compensation is
+ * performed on the FC side currently); stored so it's available once that's added. */
+static char g_rangefinder_mount_axis[8] = "";
+static float g_rangefinder_mount_offset_deg = 0.0f;
+
+/* g_rangefinder_cm is forced to 0.0f (the existing "unavailable" convention) whenever
+ * the ESP32 reports this reading invalid - see esp32_s3_uart6_wifi_bridge.ino's
+ * SENSOR packet comment - so App_GetRangefinderCm()'s existing staleness/zero-means-
+ * unavailable contract below is unchanged. confidence/sensor_ts_us are stored
+ * unconditionally (even for an invalid reading - a low-confidence rejection is still
+ * useful diagnostic information).
+ *
+ * `valid` (2026-08-29) is passed through to VertEkf_UpdateRange() SEPARATELY from the
+ * cm collapsing above - see that function's comment for why: a genuine 0cm reading
+ * (this sensor mounted low enough to be sitting right at ground level, confirmed for
+ * real via a liftoff capture showing strong signal strength at raw_cm=0) and an
+ * actually-invalid reading both used to collapse to the same "cm==0.0f" wire value by
+ * the time they reached the EKF, so the EKF silently discarded real ground-level
+ * readings as if they were never sent - costing several real seconds of every flight,
+ * including all of liftoff, with the very sensor most needed there absent. */
+void App_SetRangefinderCm(float cm, float confidence, uint32_t sensor_ts_us, uint8_t valid)
+{
+  g_rangefinder_cm = (valid != 0U) ? cm : 0.0f;
+  g_rangefinder_last_update_ms = HAL_GetTick();
+  g_rangefinder_confidence = confidence;
+  g_rangefinder_sensor_ts_us = sensor_ts_us;
+  /* True event-driven async update (2026-08-29) - fired the instant a fresh
+   * reading arrives, not polled, matching vert_ekf.c's stated design requirement. */
+  VertEkf_UpdateRange(cm, confidence, 0U, valid);
+}
+
+void App_SetRangefinderMountDescriptor(const char *axis, float offset_deg)
+{
+  (void)strncpy(g_rangefinder_mount_axis, axis, sizeof(g_rangefinder_mount_axis) - 1U);
+  g_rangefinder_mount_axis[sizeof(g_rangefinder_mount_axis) - 1U] = '\0';
+  g_rangefinder_mount_offset_deg = offset_deg;
+}
+
+/* Returns 0.0f if no fresh reading is available - see the big comment above for why
+ * every caller must treat that as "unavailable," not "height is zero." */
+static float App_GetRangefinderCm(uint32_t now_ms)
+{
+  if ((g_rangefinder_last_update_ms == 0U) ||
+      ((now_ms - g_rangefinder_last_update_ms) > APP_RANGEFINDER_STALE_MS))
+  {
+    return 0.0f;
+  }
+  return g_rangefinder_cm;
+}
+
+/* TF-Luna LiDAR (2026-08-25) - added ALONGSIDE the HC-SR04 rangefinder above, not
+ * replacing it. Reaches the FC the same way (Serial2/UART6, direct wired link, not
+ * WiFi - see App_GetRangefinderCm()'s comment above for the same correction applied
+ * here) via a "LUNA <cm>" line from the ESP32 bridge - see
+ * esp32_s3_uart6_wifi_bridge.ino's LUNA_RX_PIN comment for the sensor/wiring
+ * details. Wider usable range (0.2-8m) and not subject to the sonar's multipath/
+ * off-axis scatter, so App_GetBestHeightCm() below prefers it whenever it's fresh
+ * and falls back to the sonar otherwise - same staleness convention as the sonar
+ * (0.0f = unavailable, never "height is zero"). */
+#define APP_LUNA_STALE_MS 500U
+static float g_luna_cm = 0.0f;
+static uint32_t g_luna_last_update_ms = 0U;
+/* Same additions as the rangefinder's above, for the same reason - see
+ * App_SetRangefinderCm()'s comment. */
+static float g_luna_confidence = 0.0f;
+static uint32_t g_luna_sensor_ts_us = 0U;
+static char g_luna_mount_axis[8] = "";
+static float g_luna_mount_offset_deg = 0.0f;
+
+void App_SetLunaCm(float cm, float confidence, uint32_t sensor_ts_us, uint8_t valid)
+{
+  g_luna_cm = (valid != 0U) ? cm : 0.0f;
+  g_luna_last_update_ms = HAL_GetTick();
+  g_luna_confidence = confidence;
+  g_luna_sensor_ts_us = sensor_ts_us;
+  /* See App_SetRangefinderCm()'s comment - same true event-driven async update, and
+   * the same reason `valid` is forwarded separately from the cm collapsing above. */
+  VertEkf_UpdateRange(cm, confidence, 1U, valid);
+}
+
+void App_SetLunaMountDescriptor(const char *axis, float offset_deg)
+{
+  (void)strncpy(g_luna_mount_axis, axis, sizeof(g_luna_mount_axis) - 1U);
+  g_luna_mount_axis[sizeof(g_luna_mount_axis) - 1U] = '\0';
+  g_luna_mount_offset_deg = offset_deg;
+}
+
+static float App_GetLunaCm(uint32_t now_ms)
+{
+  if ((g_luna_last_update_ms == 0U) ||
+      ((now_ms - g_luna_last_update_ms) > APP_LUNA_STALE_MS))
+  {
+    return 0.0f;
+  }
+  return g_luna_cm;
+}
+
+/* Centralizes "which external height sensor do we trust right now" for
+ * ground_effect_clear's sensor-based supplement below - prefers TF-Luna
+ * whenever fresh, falls back to the HC-SR04 rangefinder, and returns 0.0f
+ * (unavailable) only if neither has a fresh reading. */
+static float App_GetBestHeightCm(uint32_t now_ms)
+{
+  float luna_cm = App_GetLunaCm(now_ms);
+
+  if (luna_cm > 0.0f)
+  {
+    return luna_cm;
+  }
+  return App_GetRangefinderCm(now_ms);
+}
+
 static void App_ServiceSdLog(void)
 {
   App_SdLogCmd_t cmd = g_sdlog_cmd_pending;
@@ -1462,7 +2094,7 @@ static App_FlightMode_t App_SelectFlightMode(uint16_t mode_us)
 {
   if (mode_us > APP_NAV_BRAKE_SWITCH_THRESHOLD_US)
   {
-    return APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE;
+    return APP_FLIGHT_MODE_NAV_POSHOLD;
   }
 
   if (mode_us >= APP_ALTHOLD_SWITCH_THRESHOLD_US)
@@ -1482,8 +2114,8 @@ static const char *App_FlightModeName(App_FlightMode_t mode)
 {
   switch (mode)
   {
-    case APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE:
-      return "NAVBRAKE";
+    case APP_FLIGHT_MODE_NAV_POSHOLD:
+      return "NAVPOSHOLD";
     case APP_FLIGHT_MODE_ALTHOLD:
       return "ALTHOLD";
     case APP_FLIGHT_MODE_ATTITUDE:
@@ -1701,7 +2333,7 @@ static float App_NavStickOffsetToVelocityMps(int32_t stick_offset_us, float max_
 {
   float normalized;
 
-  stick_offset_us = App_ApplyDeadbandUs(stick_offset_us, (int32_t)APP_NAV_BRAKE_STICK_DEADBAND_US);
+  stick_offset_us = App_ApplyDeadbandUs(stick_offset_us, (int32_t)APP_NAVPOS_STICK_DEADBAND_US);
   normalized = ((float)stick_offset_us) / ((float)((int32_t)APP_PWM_MAX_US - (int32_t)APP_PWM_MID_US));
   normalized = App_ClampFloat(normalized, -1.0f, 1.0f);
 
@@ -1780,6 +2412,142 @@ static uint8_t App_IsFiniteInRange(float value, float min_value, float max_value
     return 0U;
   }
 
+  return 1U;
+}
+
+float App_GetAltholdAltHoldKp(void)
+{
+  return g_althold_alt_hold_kp_mps_per_m;
+}
+
+uint8_t App_SetAltholdAltHoldKp(float kp)
+{
+  if (App_IsFiniteInRange(kp, APP_ALTHOLD_ALT_HOLD_KP_MIN, APP_ALTHOLD_ALT_HOLD_KP_MAX) == 0U)
+  {
+    return 0U;
+  }
+  g_althold_alt_hold_kp_mps_per_m = kp;
+  return 1U;
+}
+
+float App_GetAltholdMaxClimbMps(void)
+{
+  return g_althold_max_climb_mps;
+}
+
+uint8_t App_SetAltholdMaxClimbMps(float max_climb_mps)
+{
+  if (App_IsFiniteInRange(max_climb_mps, APP_ALTHOLD_MAX_CLIMB_MIN, APP_ALTHOLD_MAX_CLIMB_MAX) == 0U)
+  {
+    return 0U;
+  }
+  g_althold_max_climb_mps = max_climb_mps;
+  return 1U;
+}
+
+float App_GetAltholdPosKi(void)
+{
+  return g_althold_pos_ki_per_s2;
+}
+
+uint8_t App_SetAltholdPosKi(float ki)
+{
+  if (App_IsFiniteInRange(ki, APP_ALTHOLD_POS_KI_MIN, APP_ALTHOLD_POS_KI_MAX) == 0U)
+  {
+    return 0U;
+  }
+  g_althold_pos_ki_per_s2 = ki;
+  return 1U;
+}
+
+float App_GetNavPosKp(void)
+{
+  return g_navpos_kp_per_s;
+}
+
+uint8_t App_SetNavPosKp(float kp)
+{
+  if (App_IsFiniteInRange(kp, APP_NAVPOS_KP_MIN, APP_NAVPOS_KP_MAX) == 0U)
+  {
+    return 0U;
+  }
+  g_navpos_kp_per_s = kp;
+  return 1U;
+}
+
+float App_GetNavPosKi(void)
+{
+  return g_navpos_ki_per_s2;
+}
+
+uint8_t App_SetNavPosKi(float ki)
+{
+  if (App_IsFiniteInRange(ki, APP_NAVPOS_KI_MIN, APP_NAVPOS_KI_MAX) == 0U)
+  {
+    return 0U;
+  }
+  g_navpos_ki_per_s2 = ki;
+  return 1U;
+}
+
+float App_GetAltholdVzKp(void)
+{
+  return g_althold_vz_kp_us_per_mps;
+}
+
+uint8_t App_SetAltholdVzKp(float kp)
+{
+  if (App_IsFiniteInRange(kp, APP_ALTHOLD_VZ_KP_MIN, APP_ALTHOLD_VZ_KP_MAX) == 0U)
+  {
+    return 0U;
+  }
+  g_althold_vz_kp_us_per_mps = kp;
+  return 1U;
+}
+
+float App_GetAltholdVzKi(void)
+{
+  return g_althold_vz_ki_us_per_mps_s;
+}
+
+uint8_t App_SetAltholdVzKi(float ki)
+{
+  if (App_IsFiniteInRange(ki, APP_ALTHOLD_VZ_KI_MIN, APP_ALTHOLD_VZ_KI_MAX) == 0U)
+  {
+    return 0U;
+  }
+  g_althold_vz_ki_us_per_mps_s = ki;
+  return 1U;
+}
+
+float App_GetBaroVzDampGain(void)
+{
+  return g_baro_vz_damp_gain_us_per_mps;
+}
+
+uint8_t App_SetBaroVzDampGain(float gain)
+{
+  if (App_IsFiniteInRange(gain, APP_BARO_VZ_DAMP_GAIN_MIN, APP_BARO_VZ_DAMP_GAIN_MAX) == 0U)
+  {
+    return 0U;
+  }
+  g_baro_vz_damp_gain_us_per_mps = gain;
+  return 1U;
+}
+
+uint32_t App_GetBaroVzDampLimit(void)
+{
+  return g_baro_vz_damp_limit_us;
+}
+
+uint8_t App_SetBaroVzDampLimit(float limit_us)
+{
+  if (App_IsFiniteInRange(limit_us, (float)APP_BARO_VZ_DAMP_LIMIT_MIN,
+                           (float)APP_BARO_VZ_DAMP_LIMIT_MAX) == 0U)
+  {
+    return 0U;
+  }
+  g_baro_vz_damp_limit_us = (uint32_t)limit_us;
   return 1U;
 }
 
@@ -2123,6 +2891,139 @@ uint8_t App_SaveRatePidGains(void)
     printf("PID_SAVE_DBG: verify crc fail stored=0x%08lX computed=0x%08lX\r\n",
            (unsigned long)written->crc32,
            (unsigned long)App_Crc32((const uint8_t *)written, offsetof(App_PidFlashBlob_t, crc32)));
+    return 0U;
+  }
+
+  return 1U;
+}
+
+uint8_t App_LoadAltholdSettings(void)
+{
+  const App_AltholdFlashBlob_t *stored;
+  uint32_t expected_crc;
+
+  stored = (const App_AltholdFlashBlob_t *)APP_ALTHOLD_FLASH_ADDRESS;
+
+  if (stored->magic != APP_ALTHOLD_FLASH_MAGIC)
+  {
+    printf("ALTHOLD_LOAD_DBG: bad magic=0x%08lX\r\n", (unsigned long)stored->magic);
+    return 0U;
+  }
+
+  if (stored->version != APP_ALTHOLD_FLASH_VERSION)
+  {
+    printf("ALTHOLD_LOAD_DBG: bad version=%lu (expected %lu)\r\n",
+           (unsigned long)stored->version, (unsigned long)APP_ALTHOLD_FLASH_VERSION);
+    return 0U;
+  }
+
+  expected_crc = App_Crc32((const uint8_t *)stored, offsetof(App_AltholdFlashBlob_t, crc32));
+  if (expected_crc != stored->crc32)
+  {
+    printf("ALTHOLD_LOAD_DBG: crc mismatch stored=0x%08lX computed=0x%08lX\r\n",
+           (unsigned long)stored->crc32, (unsigned long)expected_crc);
+    return 0U;
+  }
+
+  /* Each setter re-validates its own range - a stored value from a build with looser
+   * bounds (or plain corruption that happened to pass CRC) still can't silently apply
+   * an out-of-range gain. A rejected field just keeps its compiled-in default. */
+  (void)App_SetAltholdAltHoldKp(stored->alt_hold_kp);
+  (void)App_SetAltholdMaxClimbMps(stored->max_climb_mps);
+  (void)App_SetAltholdPosKi(stored->pos_ki);
+  (void)App_SetAltholdVzKp(stored->vz_kp);
+  (void)App_SetAltholdVzKi(stored->vz_ki);
+  (void)App_SetBaroVzDampGain(stored->damp_gain);
+  (void)App_SetBaroVzDampLimit(stored->damp_limit_us);
+
+  printf("ALTHOLD_LOAD_DBG: loaded kp=%.4f maxclimb=%.4f poski=%.4f vzkp=%.4f vzki=%.4f dampgain=%.4f damplimit=%.4f\r\n",
+         (double)stored->alt_hold_kp, (double)stored->max_climb_mps, (double)stored->pos_ki,
+         (double)stored->vz_kp, (double)stored->vz_ki, (double)stored->damp_gain,
+         (double)stored->damp_limit_us);
+  return 1U;
+}
+
+uint8_t App_SaveAltholdSettings(void)
+{
+  FLASH_EraseInitTypeDef erase;
+  uint32_t sector_error = 0U;
+  uint32_t address;
+  App_AltholdFlashPage_t APP_FLASHWORD_ALIGN page;
+  const App_AltholdFlashBlob_t *written;
+  uint8_t write_index;
+
+  /* See this function's declaration comment in app.h - self-contained armed check
+   * (unlike the rate-PID save path, whose equivalent check lives in the deferred
+   * command dispatcher instead) so every caller is protected automatically. */
+  if (g_glog_armed_state != 0U)
+  {
+    printf("ALTHOLD_SAVE_DBG: refused while armed\r\n");
+    return 0U;
+  }
+
+  memset(&page, 0xFF, sizeof(page));
+  page.blob.magic = APP_ALTHOLD_FLASH_MAGIC;
+  page.blob.version = APP_ALTHOLD_FLASH_VERSION;
+  page.blob.alt_hold_kp = App_GetAltholdAltHoldKp();
+  page.blob.max_climb_mps = App_GetAltholdMaxClimbMps();
+  page.blob.pos_ki = App_GetAltholdPosKi();
+  page.blob.vz_kp = App_GetAltholdVzKp();
+  page.blob.vz_ki = App_GetAltholdVzKi();
+  page.blob.damp_gain = App_GetBaroVzDampGain();
+  page.blob.damp_limit_us = (float)App_GetBaroVzDampLimit();
+  page.blob.crc32 = App_Crc32((const uint8_t *)&page.blob, offsetof(App_AltholdFlashBlob_t, crc32));
+
+  if (HAL_FLASH_Unlock() != HAL_OK)
+  {
+    printf("ALTHOLD_SAVE_DBG: unlock fail err=0x%08lX\r\n", (unsigned long)HAL_FLASH_GetError());
+    return 0U;
+  }
+
+  memset(&erase, 0, sizeof(erase));
+  erase.TypeErase = FLASH_TYPEERASE_SECTORS;
+  erase.Banks = FLASH_BANK_2;
+  erase.Sector = FLASH_SECTOR_6;
+  erase.NbSectors = 1U;
+  erase.VoltageRange = FLASH_VOLTAGE_RANGE_3;
+
+  if (HAL_FLASHEx_Erase(&erase, &sector_error) != HAL_OK)
+  {
+    printf("ALTHOLD_SAVE_DBG: erase fail sector_err=%lu flash_err=0x%08lX\r\n",
+           (unsigned long)sector_error, (unsigned long)HAL_FLASH_GetError());
+    (void)HAL_FLASH_Lock();
+    return 0U;
+  }
+
+  address = APP_ALTHOLD_FLASH_ADDRESS;
+  for (write_index = 0U; write_index < 3U; write_index++)
+  {
+    if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_FLASHWORD,
+                          address,
+                          (uint32_t)&page.words[write_index * 8U]) != HAL_OK)
+    {
+      printf("ALTHOLD_SAVE_DBG: write fail word=%u addr=0x%08lX err=0x%08lX\r\n",
+             (unsigned)write_index, (unsigned long)address, (unsigned long)HAL_FLASH_GetError());
+      (void)HAL_FLASH_Lock();
+      return 0U;
+    }
+    address += 32U;
+  }
+
+  (void)HAL_FLASH_Lock();
+
+  written = (const App_AltholdFlashBlob_t *)APP_ALTHOLD_FLASH_ADDRESS;
+  if ((written->magic != APP_ALTHOLD_FLASH_MAGIC) || (written->version != APP_ALTHOLD_FLASH_VERSION))
+  {
+    printf("ALTHOLD_SAVE_DBG: verify header fail magic=0x%08lX ver=%lu\r\n",
+           (unsigned long)written->magic, (unsigned long)written->version);
+    return 0U;
+  }
+
+  if (App_Crc32((const uint8_t *)written, offsetof(App_AltholdFlashBlob_t, crc32)) != written->crc32)
+  {
+    printf("ALTHOLD_SAVE_DBG: verify crc fail stored=0x%08lX computed=0x%08lX\r\n",
+           (unsigned long)written->crc32,
+           (unsigned long)App_Crc32((const uint8_t *)written, offsetof(App_AltholdFlashBlob_t, crc32)));
     return 0U;
   }
 
@@ -2483,6 +3384,7 @@ void App_Init(void)
   (void)HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
 
   Attitude_Init();
+  VertEkf_Init();
   Receiver_Init();
 
   g_boot_pid_loaded = App_LoadRatePidGains();
@@ -2490,6 +3392,11 @@ void App_Init(void)
   {
     App_ResetRatePidDefaults();
   }
+
+  /* Silently keeps compiled-in defaults (already assigned via the static
+   * initializers) if nothing was ever saved - not a failure, just "no saved
+   * settings yet" (e.g. this exact board/build has never called ALTHOLD SAVE). */
+  (void)App_LoadAltholdSettings();
 
   (void)IMU_DetectAndInit();
   if (Baro_Init() == HAL_OK)
@@ -2695,6 +3602,9 @@ void App_Update(void)
   static uint32_t last_baro_sample_ms = 0U;
   static uint32_t last_baro_retry_ms = 0U;
   static uint32_t last_gps_retry_ms = 0U;
+  /* Detects a genuinely FRESH GPS fix (vs. re-processing the same stale one every
+   * iteration) for VertEkf_UpdateGps() - see that call site below. */
+  static uint32_t last_gps_ekf_pvt_host_ms = 0U;
   static uint32_t last_sdlog_superblock_sync_ms = 0U;
   static uint32_t last_mag_sample_ms = 0U;
   static uint32_t last_mag_retry_ms = 0U;
@@ -2712,23 +3622,100 @@ void App_Update(void)
   static float yawhold_target_deg = 0.0f;
   static uint8_t althold_holding = 0U;
   static float althold_target_alt_m = 0.0f;
-  /* Which settled stick center althold_target_alt_m was captured against - lets
-   * a brief deadband exit (a correction nudge) be told apart from a genuine
-   * deliberate reposition (the settled center itself changing). See the target
-   * (re)capture logic below for why this matters. */
-  static uint16_t althold_target_ref_center_us = APP_PWM_MID_US;
-  static uint8_t althold_have_target = 0U;
   static float althold_integral_us = 0.0f;
-  static uint16_t althold_center_throttle_us = APP_PWM_MID_US;
+  /* See APP_ALTHOLD_POS_KI_PER_S2's comment - integral on the OUTER position-hold
+   * loop, separate from althold_integral_us above (which is the INNER climb-rate
+   * loop's integral). Same reset discipline as that one: zeroed on every fresh hold,
+   * on leaving the centered branch, and on arm. */
+  static float althold_pos_integral_mps = 0.0f;
+  /* Slow, full-authority base throttle estimate - see the big comment at the
+   * ALTHOLD throttle block below and kh7-althold-throttle-incident memory.
+   * Updated EVERY iteration ALTHOLD/NAVBRAKE is selected, regardless of the
+   * ground-effect/baro-health gate (deliberately decoupled - gating this was
+   * the root cause of the 2026-08-21 incident), so it already holds a
+   * realistic value by the time the gate opens instead of starting cold. */
+  static float althold_hover_throttle_us = APP_ALTHOLD_HOVER_EST_SEED_US;
+  /* Where "center" actually is for throttle-stick classification (centered =
+   * lock altitude, off-center = climb/descend rate), replacing a fixed
+   * APP_PWM_MID_US=1500 tried and reverted the same day (2026-08-23): this
+   * airframe's real hover throttle (~1200-1270us observed) is nowhere near
+   * 1500, so a fixed center made it impossible to comfortably approach the
+   * hold zone without climbing hard the whole way there. Re-latches to
+   * wherever the stick has genuinely SETTLED (stayed within
+   * APP_ALTHOLD_STICK_STABLE_WINDOW_US for APP_ALTHOLD_THROTTLE_SETTLE_MS -
+   * NOT the shorter APP_ALTHOLD_STICK_SETTLE_MS yaw-hold uses, see that
+   * constant's comment for why throttle needs its own, much longer one),
+   * tracked UNCONDITIONALLY whenever ALTHOLD/NAVBRAKE is selected regardless
+   * of the ground-effect gate (same "don't gate reference-tracking behind
+   * the gate" lesson as althold_hover_throttle_us above -
+   * kh7-althold-throttle-incident memory) so it's already meaningful by the
+   * time full authority engages. Deliberately never tied to any particular
+   * throttle VALUE - it only ever means "settled here," so it works
+   * regardless of what this or any other airframe's real hover throttle is. */
   static uint16_t althold_settle_ref_us = APP_PWM_MID_US;
   static uint32_t althold_settle_start_ms = 0U;
+  static uint16_t althold_settled_center_us = APP_PWM_MID_US;
+  /* Remembers whether full closed-loop authority was active on the PREVIOUS
+   * iteration, purely to detect the open-loop-to-closed-loop transition edge
+   * - see where it's checked, in the full-authority branch below. */
+  static uint8_t althold_authority_was_active = 0U;
   static float althold_trim_filtered_us = 0.0f;
   static float baro_damp_term_filtered_us = 0.0f;
-  static uint8_t nav_brake_active = 0U;
-  static uint8_t nav_brake_disqualified_latch = 0U;
-  /* Gates ALL GPS init/retry/parsing and Nav_Update() to only when NAV_VELOCITY_BRAKE
-   * is the currently selected mode - updated wherever flight_mode is (re)computed
-   * below, so it always reflects the mode switch with at most one iteration of lag. */
+  /* Debounced, ONE-WAY-LATCHED (per arm cycle) replacement for a plain
+   * altitude>=threshold check - see APP_GROUND_EFFECT_CLEAR_DWELL_MS's comment for
+   * why the plain check flickers right at liftoff, and the 2026-08-30 incident
+   * comment at this flag's use sites for why it was made one-way (a real emergency
+   * mid-flight disarm - a two-way flicker right at the liftoff boundary was
+   * silently swapping throttle control laws underneath the pilot's stick).
+   * ground_effect_below_since_ms tracks the start of the current continuous stretch
+   * at/above the threshold (reset to "now" on every dip below it while NOT YET
+   * clear, same idiom as the other settle-latches in this file), and
+   * ground_effect_clear latches true once that stretch has held for the full dwell
+   * time - and then stays true, ignoring further dips, until the next arm-reset. */
+  static uint8_t ground_effect_clear = 0U;
+  static uint32_t ground_effect_below_since_ms = 0U;
+  /* Same idiom, independent dwell clock, for the rangefinder-based supplemental
+   * clear path added 2026-08-23 - see where it's evaluated below and
+   * App_GetRangefinderCm()'s comment for why this can only ever ADD a way to
+   * reach ground_effect_clear sooner, never replace the baro path above. */
+  static uint32_t ground_effect_rangefinder_below_since_ms = 0U;
+  /* NAV_POSHOLD state (2026-09-04 rewrite - see the APP_NAVPOS_* block above).
+   * navpos_active means a target is currently latched and being held.
+   * Deliberately no disqualify-latch requiring a mode-reselect to recover: real
+   * flight data showed this GPS throwing frequent brief, self-recovering
+   * validity blips, and a one-strike lockout meant one blip could disable
+   * holding for the whole rest of a flight. Silently dropping out and
+   * re-attempting the (still velocity-gated) relatch on the very next good
+   * sample is simpler and matches how the off-center-stick case already
+   * behaves - no separate latch state to manage. */
+  static uint8_t navpos_active = 0U;
+  /* Tracks whether the GPS engage-gate was satisfied on the PREVIOUS iteration
+   * (independent of navpos_active, which specifically means "actively holding
+   * a target" - off-center manual flying under this mode is engaged but not
+   * active). Used solely to trigger exactly one Nav_LatchReference() call per
+   * fresh engagement, not on every iteration the gate happens to be open. */
+  static uint8_t navpos_was_engaged = 0U;
+  /* Separate from navpos_was_engaged: only true immediately after a genuinely
+   * fresh entry into NAV_POSHOLD (mode just selected, or just armed into it) -
+   * NOT after every brief GPS-staleness blip clears. Real flight data
+   * (2026-09-04) showed nav_state.valid flickering false for 100ms-3s several
+   * times per minute (GPS_STALE/REACQUIRING) while nav_state.reference_valid
+   * stayed continuously true the whole time - the local NED reference was
+   * never actually lost, so re-latching (which zeroes filtered_north/east_m at
+   * the CURRENT position) on every recovery was needless and harmful: it both
+   * discarded a still-good position reference and, combined with the fallback
+   * below swinging to full ATTITUDE-mode tilt authority, made stick response
+   * snap between two very different feels many times per flight - reported as
+   * "cannot control lat/long". */
+  static uint8_t navpos_needs_latch = 1U;
+  static float navpos_target_north_m = 0.0f;
+  static float navpos_target_east_m = 0.0f;
+  static float navpos_integral_north_mps = 0.0f;
+  static float navpos_integral_east_mps = 0.0f;
+  /* Gates ALL GPS init/retry/parsing and Nav_Update() to only when NAV_POSHOLD is
+   * the currently selected mode - updated wherever flight_mode is (re)computed
+   * below, so it always reflects the mode switch with at most one iteration of
+   * lag. */
   static App_FlightMode_t last_known_flight_mode = APP_FLIGHT_MODE_RATE;
   /* pitch_deg/roll_deg/yaw_deg are computed fresh inside whichever of the two
    * IMU-read branches below actually runs this iteration, so they aren't
@@ -2737,7 +3724,7 @@ void App_Update(void)
   static float last_known_pitch_deg = 0.0f;
   static float last_known_roll_deg = 0.0f;
   static float last_known_yaw_deg = 0.0f;
-  int32_t althold_trim_us;
+  int32_t althold_trim_us = 0;
   uint32_t liftoff_ramp_elapsed_ms;
   float liftoff_ramp_factor;
   IMU_RawData_t imu_raw;
@@ -2773,17 +3760,19 @@ void App_Update(void)
   float pitch_angle_error_deg;
   float yaw_angle_error_deg;
   Nav_State_t nav_state;
-  uint8_t nav_brake_requested;
-  uint8_t nav_brake_tilt_limited;
-  uint8_t nav_brake_accel_limited;
-  float nav_brake_desired_north_vel_mps;
-  float nav_brake_desired_east_vel_mps;
-  float nav_brake_north_vel_error_mps;
-  float nav_brake_east_vel_error_mps;
-  float nav_brake_north_accel_cmd_mps2;
-  float nav_brake_east_accel_cmd_mps2;
-  float nav_brake_fwd_accel_cmd_mps2;
-  float nav_brake_right_accel_cmd_mps2;
+  uint8_t navpos_requested;
+  uint8_t navpos_tilt_limited = 0U;
+  uint8_t navpos_accel_limited = 0U;
+  float navpos_desired_north_vel_mps = 0.0f;
+  float navpos_desired_east_vel_mps = 0.0f;
+  float navpos_north_vel_error_mps = 0.0f;
+  float navpos_east_vel_error_mps = 0.0f;
+  float navpos_north_accel_cmd_mps2 = 0.0f;
+  float navpos_east_accel_cmd_mps2 = 0.0f;
+  float navpos_fwd_accel_cmd_mps2 = 0.0f;
+  float navpos_right_accel_cmd_mps2 = 0.0f;
+  float navpos_err_north_m = 0.0f;
+  float navpos_err_east_m = 0.0f;
   int16_t pilot_roll_stick_us;
   int16_t pilot_pitch_stick_us;
   uint16_t roll_us;
@@ -2816,11 +3805,16 @@ void App_Update(void)
   int32_t pitch_term;
   int32_t yaw_term;
   int32_t throttle_term;
-  int32_t baro_damp_term_us;
+  int32_t baro_damp_term_us = 0;
   int32_t throttle_offset_us;
   int32_t althold_throttle_us;
-  float climb_rate_setpoint_mps;
-  float climb_rate_error_mps;
+  uint8_t althold_authority_active = 0U;
+  uint8_t althold_liftoff_assist_active;
+  float althold_liftoff_base_us;
+  float height_cm_now;
+  float althold_fused_alt_m_now = 0.0f;
+  float climb_rate_setpoint_mps = 0.0f;
+  float climb_rate_error_mps = 0.0f;
   uint8_t baro_healthy_now;
   int32_t m_front_left;
   int32_t m_front_right;
@@ -2846,17 +3840,7 @@ void App_Update(void)
   arm_switch_high = 0U;
   throttle_low = 0U;
   throttle_us = APP_PWM_MIN_US;
-  nav_brake_requested = 0U;
-  nav_brake_tilt_limited = 0U;
-  nav_brake_accel_limited = 0U;
-  nav_brake_desired_north_vel_mps = 0.0f;
-  nav_brake_desired_east_vel_mps = 0.0f;
-  nav_brake_north_vel_error_mps = 0.0f;
-  nav_brake_east_vel_error_mps = 0.0f;
-  nav_brake_north_accel_cmd_mps2 = 0.0f;
-  nav_brake_east_accel_cmd_mps2 = 0.0f;
-  nav_brake_fwd_accel_cmd_mps2 = 0.0f;
-  nav_brake_right_accel_cmd_mps2 = 0.0f;
+  navpos_requested = 0U;
   pilot_roll_stick_us = 0;
   pilot_pitch_stick_us = 0;
   memset(&nav_state, 0, sizeof(nav_state));
@@ -3042,13 +4026,27 @@ void App_Update(void)
     }
     (void)Baro_Update(g_avg_motor_power_delta_us,
                       Attitude_GetVerticalAccelMps2(g_last_ax_g, g_last_ay_g, g_last_az_g));
+    VertEkf_UpdateBaro(Baro_GetRawAltitudeM(), Baro_IsHealthy(), g_avg_motor_power_delta_us);
     last_baro_sample_ms = now_ms;
+  }
+
+  /* GPS bias trim/divergence check - only ever fires while GPS is actually
+   * configured/parsing, which per the comment below is NAV_VELOCITY_BRAKE only in
+   * this firmware today; a no-op elsewhere via VertEkf_UpdateGps()'s own health
+   * gate, not something changed by adding this call. GPS_GetLastPvtHostMs()
+   * changing is what "fresh fix" means here - GPS_GetAltitudeM() alone would
+   * report the same stale value between fixes, which would wrongly look like new
+   * agreement/disagreement information to the slow trim every single iteration. */
+  if (GPS_GetLastPvtHostMs() != last_gps_ekf_pvt_host_ms)
+  {
+    last_gps_ekf_pvt_host_ms = GPS_GetLastPvtHostMs();
+    VertEkf_UpdateGps(GPS_GetAltitudeM(), GPS_GetVerticalAccuracyM(), GPS_IsHealthy(), motors_armed);
   }
 
   /* GPS_Init() blocks waiting for UBX ACKs (up to ~1s worst case) - only retry
    * while disarmed, matching the SD/PID-save armed-guard pattern above. GPS is
-   * only used by NAV_VELOCITY_BRAKE - no GPS init/retry/parsing in any other mode. */
-  if ((last_known_flight_mode == APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE) &&
+   * only used by NAV_POSHOLD - no GPS init/retry/parsing in any other mode. */
+  if ((last_known_flight_mode == APP_FLIGHT_MODE_NAV_POSHOLD) &&
       (GPS_IsConfigured() == 0U) && (g_glog_armed_state == 0U) &&
       ((now_ms - last_gps_retry_ms) >= APP_GPS_RETRY_MS))
   {
@@ -3140,9 +4138,9 @@ void App_Update(void)
     last_mag_sample_ms = now_ms;
   }
 
-  /* Nav_Update() (and the GPS data it consumes) is only relevant to NAV_VELOCITY_BRAKE -
-   * skipped entirely in every other mode, leaving nav_state at its last value. */
-  if (last_known_flight_mode == APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE)
+  /* Nav_Update() (and the GPS data it consumes) is only relevant to NAV_POSHOLD -
+   * skipped entirely otherwise, leaving nav_state at its last value. */
+  if (last_known_flight_mode == APP_FLIGHT_MODE_NAV_POSHOLD)
   {
     Nav_Update(now_ms, motors_armed);
     Nav_GetState(&nav_state);
@@ -3306,6 +4304,8 @@ void App_Update(void)
       g_last_ax_g = ax_g;
       g_last_ay_g = ay_g;
       g_last_az_g = az_g;
+      VertEkf_Predict(Attitude_GetVerticalAccelMps2(ax_g, ay_g, az_g),
+                      ((float)APP_CONTROL_LOOP_MS) * 0.001f);
       Attitude_GetBoardAnglesDeg(&pitch_deg, &roll_deg, &yaw_deg);
       mag_tilt_roll_deg = roll_deg;
       mag_tilt_pitch_deg = pitch_deg;
@@ -3456,8 +4456,20 @@ void App_Update(void)
           Telemetry_PrintBatteryState(battery_voltage_filtered_v, battery_adc_raw);
         }
         Telemetry_PrintBaroState(Baro_GetAltitudeM(), Baro_GetClimbRateMps(), Baro_IsHealthy());
+        Telemetry_PrintVertEkfState(VertEkf_IsHealthy(), VertEkf_GetHeightM(), VertEkf_GetClimbRateMps(),
+                                    VertEkf_GetAccelBiasMps2(), VertEkf_GetLidarImpliedHeightM(),
+                                    VertEkf_GetSonarImpliedHeightM());
+        Telemetry_PrintAltholdState(althold_holding, althold_authority_active, althold_target_alt_m,
+                                    althold_fused_alt_m_now, climb_rate_setpoint_mps, climb_rate_error_mps,
+                                    althold_trim_us, baro_damp_term_us, althold_hover_throttle_us);
         Telemetry_PrintGpsState(GPS_IsConfigured(), GPS_IsHealthy(), GPS_GetFixType(), GPS_GetNumSatellites(),
                                GPS_GetLatitudeDeg(), GPS_GetLongitudeDeg(), GPS_GetAltitudeM());
+        /* Added 2026-09-04 alongside the CFG-NAV5 retry fix - this ack was
+         * previously invisible in telemetry, so a lost round-trip (leaving
+         * the receiver stuck in factory static-hold, freezing lat/lon) had no
+         * symptom short of forensically comparing GPS output against known
+         * real motion after the fact. */
+        printf("GPSNAV5[acked=%u]\r\n", (unsigned int)GPS_GetLastNav5Acked());
         Telemetry_PrintMagState(Mag_IsHealthy(), Mag_GetXGauss(), Mag_GetYGauss(), Mag_GetZGauss(),
                                Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg, g_avg_motor_power_delta_us));
         Telemetry_PrintMagTiltState(mag_tilt_roll_deg, mag_tilt_pitch_deg);
@@ -3539,7 +4551,7 @@ void App_Update(void)
     }
     /* Reflects the mode-switch position for telemetry/bench visibility even while
      * disarmed - the armed block below recomputes/uses this for actual control. */
-    nav_brake_requested = (flight_mode == APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE) ? 1U : 0U;
+    navpos_requested = (flight_mode == APP_FLIGHT_MODE_NAV_POSHOLD) ? 1U : 0U;
 
     if ((startup_safety_checked == 0U) && (receiver_state.link_active != 0U))
     {
@@ -3632,8 +4644,37 @@ void App_Update(void)
         roll_nonfinite_reported = 0U;
         pitch_nonfinite_reported = 0U;
         yaw_nonfinite_reported = 0U;
-        nav_brake_active = 0U;
-        nav_brake_disqualified_latch = 0U;
+        navpos_active = 0U;
+        navpos_was_engaged = 0U;
+        navpos_needs_latch = 1U;
+        navpos_target_north_m = 0.0f;
+        navpos_target_east_m = 0.0f;
+        navpos_integral_north_mps = 0.0f;
+        navpos_integral_east_mps = 0.0f;
+        /* INCIDENT (2026-08-30): ground_effect_clear used to be able to revert to 0
+         * mid-flight on a single noisy below-threshold height sample even after
+         * genuinely clearing - see the latch fix at its own declaration/use sites
+         * for the full story. Resetting it here (fresh per arm cycle) is what makes
+         * that one-way latch semantics actually work. */
+        ground_effect_clear = 0U;
+        ground_effect_below_since_ms = now_ms;
+        ground_effect_rangefinder_below_since_ms = now_ms;
+        /* INCIDENT (2026-08-30): althold_settled_center_us never got reset between
+         * arm cycles (only a genuinely fresh 1200ms settle could move it, and idle
+         * throttle right after arming is deliberately EXCLUDED from ever settling -
+         * see APP_ALTHOLD_RELATCH_EXCLUDE_MARGIN_US's comment). A real repeated-
+         * re-arm test showed this leaving a stale settled-center from an earlier
+         * arm cycle (or mode) in place: on the next arm, idle throttle read as a
+         * huge NEGATIVE offset from that stale reference, and the instant full
+         * authority engaged it commanded a hard -2.0 m/s descend instead of a
+         * climb - the aircraft would not lift at all. Resetting all three settle
+         * variables to the current stick position here means every fresh arm
+         * cycle starts from a correct, current baseline; the normal settle-latch
+         * logic still re-derives a proper center once the pilot actually holds a
+         * real hover position, exactly as before. */
+        althold_settle_ref_us = (uint16_t)throttle_us;
+        althold_settle_start_ms = now_ms;
+        althold_settled_center_us = (uint16_t)throttle_us;
 
         if (was_armed != 0U)
         {
@@ -3666,7 +4707,7 @@ void App_Update(void)
            * control and doesn't touch nav_state at all, so they stay ungated - this
            * must not block arming for RATE/ATTITUDE/ALTHOLD indoors or anywhere else
            * GPS isn't locked. */
-          uint8_t nav_arm_ok = (uint8_t)((flight_mode != APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE) ||
+          uint8_t nav_arm_ok = (uint8_t)((flight_mode != APP_FLIGHT_MODE_NAV_POSHOLD) ||
                                          (nav_state.valid != 0U));
 
           if (nav_arm_ok == 0U)
@@ -3695,31 +4736,42 @@ void App_Update(void)
             g_glog_count = 0U;
             g_glog_capturing = 1U;
             App_SdLogArmStart();
-            /* Reset ALTHOLD's hover-throttle reference fresh on every arm - these
-             * are `static` and previously carried over unchanged from whatever the
-             * last flight (possibly a different battery/loadout, hours earlier)
-             * left them at. A stale reference here was the root cause of a real
-             * uncontrolled-climb incident (2026-08-21) and is also the most likely
-             * explanation for altitude being "very difficult to hold" even in the
-             * unmodified raw-passthrough design - if the reference is wrong, the
-             * pilot may rarely/never land inside the deadband long enough to
-             * actually engage hold. APP_PWM_MID_US is just a safe, predictable,
-             * known-neutral starting point - the settle-latch (now untouched by
-             * this reset) re-converges it to the real hover throttle within
-             * APP_ALTHOLD_STICK_SETTLE_MS of the stick settling, same as always. */
-            althold_center_throttle_us = APP_PWM_MID_US;
+            /* Reset ALTHOLD's hover-throttle estimate fresh on every arm - it's
+             * `static` and previously (in an earlier design) carried over
+             * unchanged from whatever the last flight (possibly a different
+             * battery/loadout, hours earlier) left it at. A stale reference here
+             * was the root cause of a real uncontrolled-climb incident
+             * (2026-08-21, see kh7-althold-throttle-incident memory) - the seed
+             * value itself doesn't need to be a good guess, since the below-gate
+             * open-loop liftoff assist (see the ALTHOLD throttle block and
+             * APP_ALTHOLD_LIFTOFF_ASSIST_MAX_US's comment) gives the pilot full
+             * manual authority to lift off from it directly, and the real
+             * closed loop refines it quickly once the gate opens. */
+            althold_hover_throttle_us = APP_ALTHOLD_HOVER_EST_SEED_US;
+            /* Same discipline for the settled-center reference (see its
+             * declaration comment) and vert_ekf.c's state (ALTHOLD's altitude/
+             * climb-rate source as of 2026-08-29) - neither should carry state
+             * across arms/flights either. */
             althold_settle_ref_us = (uint16_t)throttle_us;
             althold_settle_start_ms = now_ms;
+            althold_settled_center_us = APP_PWM_MID_US;
+            althold_authority_was_active = 0U;
+            VertEkf_Reset();
             althold_holding = 0U;
             althold_integral_us = 0.0f;
+            althold_pos_integral_mps = 0.0f;
             althold_trim_filtered_us = 0.0f;
             baro_damp_term_filtered_us = 0.0f;
-            /* Same reasoning as the reset above, applied to the persistent
-             * hover-altitude target added 2026-08-22 - a stale target_alt_m
-             * from a previous flight (different altitude, different battery/
-             * loadout) is exactly the kind of carried-over static state that
-             * caused the original incident. */
-            althold_have_target = 0U;
+            /* Fresh arm always needs the full ground-effect dwell re-proven, never
+             * carries a "clear" verdict over from a previous flight/landing. */
+            ground_effect_clear = 0U;
+            ground_effect_below_since_ms = now_ms;
+            ground_effect_rangefinder_below_since_ms = now_ms;
+            /* No explicit reset needed for althold_target_alt_m itself - it's
+             * only ever read/used inside the `althold_holding == 0U` capture
+             * branch below, and althold_holding is reset to 0U just above, so
+             * a fresh arm always re-captures before a stale value could ever
+             * be used. */
             /* Same discipline for yaw-hold's target - always start a fresh arm
              * with no held heading, re-captured the moment the yaw stick first
              * settles centered. */
@@ -3777,131 +4829,218 @@ void App_Update(void)
 
         pilot_roll_stick_us = (int16_t)((int32_t)roll_us - (int32_t)roll_center_us);
         pilot_pitch_stick_us = (int16_t)((int32_t)pitch_us - (int32_t)pitch_center_us);
-        nav_brake_requested = (flight_mode == APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE) ? 1U : 0U;
+        navpos_requested = (flight_mode == APP_FLIGHT_MODE_NAV_POSHOLD) ? 1U : 0U;
 
-        if (nav_brake_requested != 0U)
+        /* NAV_POSHOLD (2026-09-04 rewrite): one unified GPS mode - see the
+         * APP_NAVPOS_* block for the full design. No separate "braking" vs
+         * "position hold" split, no independent enable switch: sticks centered
+         * commands zero drift (holding once settled), sticks off-center maps
+         * directly to a commanded velocity, and returning to center re-latches
+         * (or resumes) a hold target. */
+        if (navpos_requested != 0U)
         {
-          /* Engagement requirements (section 9): valid+referenced GPS nav, a
-           * usable attitude/yaw solution, altitude hold available, link up,
-           * and not latched out from a previous in-mode GPS loss. */
-          uint8_t nav_engage_ok = (uint8_t)((nav_state.valid != 0U) &&
-                                            (nav_state.reference_valid != 0U) &&
-                                            (attitude_zero_captured != 0U) &&
-                                            (Baro_IsHealthy() != 0U) &&
-                                            (receiver_state.link_active != 0U) &&
-                                            (nav_brake_disqualified_latch == 0U));
+          /* Engagement requirement: valid+referenced GPS nav accurate enough to
+           * trust, a usable attitude solution, link up. Deliberately no latch-
+           * out on loss - falls straight through to plain stick-angle control
+           * below (identical to ATTITUDE mode) until the gate passes again, so
+           * the pilot always retains manual attitude control as a fallback. */
+          uint8_t navpos_engage_ok = (uint8_t)((nav_state.valid != 0U) &&
+                                               (nav_state.reference_valid != 0U) &&
+                                               (nav_state.h_acc_m <= APP_NAVPOS_MAX_HORIZONTAL_ACC_M) &&
+                                               (attitude_zero_captured != 0U) &&
+                                               (receiver_state.link_active != 0U));
+          uint8_t navpos_sticks_centered = (uint8_t)((fabsf((float)pilot_roll_stick_us) <= (float)APP_NAVPOS_STICK_DEADBAND_US) &&
+                                                      (fabsf((float)pilot_pitch_stick_us) <= (float)APP_NAVPOS_STICK_DEADBAND_US));
 
-          if (nav_engage_ok != 0U)
+          if (navpos_was_engaged != 0U && navpos_engage_ok == 0U)
           {
-            float fwd_cmd_mps;
-            float right_cmd_mps;
-            float desired_north_vel_mps;
-            float desired_east_vel_mps;
+            printf("NAV_LOST[reason=%s]\r\n", Nav_InvalidReasonName(nav_state.invalid_reason));
+          }
 
-            if (nav_brake_active == 0U)
+          /* Per the pilot's explicit spec: off-center stick is manual flying,
+           * full stop - it gets the SAME direct, full-authority stick-to-angle
+           * mapping as ATTITUDE/ALTHOLD (active_attitude_gains.max_angle_deg),
+           * not the capped ~5.8deg GPS velocity/accel chain the old design
+           * routed manual flying through. Real flight data showed that capped
+           * chain made the aircraft feel like it had "no control authority"
+           * during ordinary maneuvering - the ~1.0 m/s^2 accel ceiling was
+           * appropriate for a gentle station-keeping correction, never for
+           * deliberate pilot-commanded flight. GPS-referenced position hold
+           * (the capped, gentle chain) is now used ONLY while sticks are
+           * centered and the GPS gate is satisfied - exactly the "sticks
+           * centered -> capture GPS position and hold it" behavior asked for,
+           * nothing more. */
+          if ((navpos_engage_ok != 0U) && (navpos_sticks_centered != 0U))
+          {
+            if (navpos_needs_latch != 0U)
             {
-              /* Fresh engagement this iteration: explicitly latch the local
-               * reference now (sec.4) so this always works even if the
-               * disarmed auto-latch never had the chance to run. */
+              /* Genuinely fresh entry into this mode (just selected, or just
+               * armed into it) - explicitly latch the local reference now so
+               * this always works even if the disarmed auto-latch never had
+               * the chance to run. Deliberately NOT re-latched on every gate
+               * recovery from a brief GPS blip - see navpos_needs_latch's
+               * declaration comment. */
               Nav_LatchReference();
+              navpos_needs_latch = 0U;
             }
 
-            /* NOTE: unlike target_pitch_deg below, fwd_cmd_mps is NOT sign-flipped by
-             * APP_PITCH_SIGN here - Nav_RotateBodyToNed()'s "fwd" is a true physical
-             * FRD quantity (see nav.h), and target_pitch_deg already applies the one
-             * flip needed to convert an accel command into this codebase's pitch-angle
-             * convention. Flipping here too would cancel that flip and invert the
-             * pilot's pitch command (this bit the first flight test: full forward
-             * stick drifted aft, regardless of heading). */
-            fwd_cmd_mps = App_NavStickOffsetToVelocityMps(pilot_pitch_stick_us, APP_NAV_BRAKE_MAX_VEL_MPS);
-            right_cmd_mps = ((float)APP_ROLL_SIGN) *
-                            App_NavStickOffsetToVelocityMps(pilot_roll_stick_us, APP_NAV_BRAKE_MAX_VEL_MPS);
+            if (navpos_active == 0U)
+            {
+              /* Velocity-gated relatch (mirrors APP_ALTHOLD_RELATCH_MAX_CLIMB_MPS's
+               * incident-driven lesson): "stick centered" alone does not prove the
+               * aircraft has actually stopped moving - require GPS-measured
+               * horizontal speed to already be near zero before latching a target,
+               * or a hold engaged mid-drift would just freeze the drift in place. */
+              float vel_mag_mps = sqrtf((nav_state.filtered_north_vel_mps * nav_state.filtered_north_vel_mps) +
+                                        (nav_state.filtered_east_vel_mps * nav_state.filtered_east_vel_mps));
 
-            /* Pilot command flow (sec.7): body-relative stick -> yaw-rotated
-             * desired N/E velocity -> compare to filtered GPS velocity ->
-             * earth-frame accel command -> body-frame accel -> angle command. */
-            Nav_RotateBodyToNed(fwd_cmd_mps, right_cmd_mps, yaw_deg,
-                               &desired_north_vel_mps, &desired_east_vel_mps);
+              if (vel_mag_mps <= APP_NAVPOS_RELATCH_MAX_VEL_MPS)
+              {
+                /* Always capture the CURRENT position as the fresh hold
+                 * target - per the pilot's explicit spec, releasing the
+                 * sticks recaptures wherever the aircraft is NOW. */
+                navpos_target_north_m = nav_state.filtered_north_m;
+                navpos_target_east_m = nav_state.filtered_east_m;
+                navpos_integral_north_mps = 0.0f;
+                navpos_integral_east_mps = 0.0f;
+                navpos_active = 1U;
+              }
+            }
 
-            nav_brake_north_vel_error_mps = desired_north_vel_mps - nav_state.filtered_north_vel_mps;
-            nav_brake_east_vel_error_mps = desired_east_vel_mps - nav_state.filtered_east_vel_mps;
+            if (navpos_active != 0U)
+            {
+              /* Centered and settled: position error (P+I) -> desired NE
+               * velocity -> velocity-error->accel->angle, capped at the
+               * gentle APP_NAVPOS_MAX_TILT_DEG ceiling - this is a station-
+               * keeping correction, not maneuvering flight, so a soft cap is
+               * correct here even though manual flying (above) is not
+               * capped this way. */
+              float err_n = navpos_target_north_m - nav_state.filtered_north_m;
+              float err_e = navpos_target_east_m - nav_state.filtered_east_m;
+              float navpos_dt_s = dt_s;
+              float desired_north_vel_mps;
+              float desired_east_vel_mps;
 
-            nav_brake_north_accel_cmd_mps2 = App_ClampFloat(APP_NAV_BRAKE_VELOCITY_KP * nav_brake_north_vel_error_mps,
-                                                            -APP_NAV_BRAKE_MAX_ACCEL_MPS2, APP_NAV_BRAKE_MAX_ACCEL_MPS2);
-            nav_brake_east_accel_cmd_mps2 = App_ClampFloat(APP_NAV_BRAKE_VELOCITY_KP * nav_brake_east_vel_error_mps,
-                                                           -APP_NAV_BRAKE_MAX_ACCEL_MPS2, APP_NAV_BRAKE_MAX_ACCEL_MPS2);
+              if ((navpos_dt_s < 0.0005f) || (navpos_dt_s > 0.050f))
+              {
+                navpos_dt_s = ((float)APP_CONTROL_LOOP_MS) * 0.001f;
+              }
 
-            Nav_RotateNedToBody(nav_brake_north_accel_cmd_mps2, nav_brake_east_accel_cmd_mps2, yaw_deg,
-                               &nav_brake_fwd_accel_cmd_mps2, &nav_brake_right_accel_cmd_mps2);
+              navpos_integral_north_mps = App_ClampFloat(navpos_integral_north_mps + (err_n * g_navpos_ki_per_s2 * navpos_dt_s),
+                                                         -APP_NAVPOS_MAX_INTEGRAL_MPS, APP_NAVPOS_MAX_INTEGRAL_MPS);
+              navpos_integral_east_mps = App_ClampFloat(navpos_integral_east_mps + (err_e * g_navpos_ki_per_s2 * navpos_dt_s),
+                                                        -APP_NAVPOS_MAX_INTEGRAL_MPS, APP_NAVPOS_MAX_INTEGRAL_MPS);
+              /* App_ClampFloat() alone cannot recover an already-non-finite value -
+               * see the identical isfinite() guard on the rate-PID integrals below. */
+              if (isfinite(navpos_integral_north_mps) == 0)
+              {
+                navpos_integral_north_mps = 0.0f;
+              }
+              if (isfinite(navpos_integral_east_mps) == 0)
+              {
+                navpos_integral_east_mps = 0.0f;
+              }
 
-            target_pitch_deg = ((float)APP_PITCH_SIGN) *
-                               Nav_AccelToAngleDeg(nav_brake_fwd_accel_cmd_mps2, APP_NAV_BRAKE_MAX_TILT_DEG);
-            target_roll_deg = ((float)APP_ROLL_SIGN) *
-                              Nav_AccelToAngleDeg(nav_brake_right_accel_cmd_mps2, APP_NAV_BRAKE_MAX_TILT_DEG);
+              desired_north_vel_mps = App_ClampFloat((g_navpos_kp_per_s * err_n) + navpos_integral_north_mps,
+                                                     -APP_NAVPOS_MAX_HOLD_VEL_MPS, APP_NAVPOS_MAX_HOLD_VEL_MPS);
+              desired_east_vel_mps = App_ClampFloat((g_navpos_kp_per_s * err_e) + navpos_integral_east_mps,
+                                                    -APP_NAVPOS_MAX_HOLD_VEL_MPS, APP_NAVPOS_MAX_HOLD_VEL_MPS);
+              navpos_err_north_m = err_n;
+              navpos_err_east_m = err_e;
 
-            nav_brake_desired_north_vel_mps = desired_north_vel_mps;
-            nav_brake_desired_east_vel_mps = desired_east_vel_mps;
-            nav_brake_tilt_limited = (uint8_t)((fabsf(target_pitch_deg) >= (APP_NAV_BRAKE_MAX_TILT_DEG - 0.01f)) ||
-                                               (fabsf(target_roll_deg) >= (APP_NAV_BRAKE_MAX_TILT_DEG - 0.01f)));
-            nav_brake_accel_limited = (uint8_t)((fabsf(nav_brake_north_accel_cmd_mps2) >= (APP_NAV_BRAKE_MAX_ACCEL_MPS2 - 0.001f)) ||
-                                                (fabsf(nav_brake_east_accel_cmd_mps2) >= (APP_NAV_BRAKE_MAX_ACCEL_MPS2 - 0.001f)));
+              navpos_north_vel_error_mps = desired_north_vel_mps - nav_state.filtered_north_vel_mps;
+              navpos_east_vel_error_mps = desired_east_vel_mps - nav_state.filtered_east_vel_mps;
 
-            nav_brake_active = 1U;
+              navpos_north_accel_cmd_mps2 = App_ClampFloat(APP_NAVPOS_VELOCITY_KP * navpos_north_vel_error_mps,
+                                                            -APP_NAVPOS_MAX_ACCEL_MPS2, APP_NAVPOS_MAX_ACCEL_MPS2);
+              navpos_east_accel_cmd_mps2 = App_ClampFloat(APP_NAVPOS_VELOCITY_KP * navpos_east_vel_error_mps,
+                                                           -APP_NAVPOS_MAX_ACCEL_MPS2, APP_NAVPOS_MAX_ACCEL_MPS2);
+
+              Nav_RotateNedToBody(navpos_north_accel_cmd_mps2, navpos_east_accel_cmd_mps2, yaw_deg,
+                                 &navpos_fwd_accel_cmd_mps2, &navpos_right_accel_cmd_mps2);
+
+              target_pitch_deg = ((float)APP_PITCH_SIGN) *
+                                 Nav_AccelToAngleDeg(navpos_fwd_accel_cmd_mps2, active_attitude_gains.max_angle_deg);
+              target_roll_deg = ((float)APP_ROLL_SIGN) *
+                                Nav_AccelToAngleDeg(navpos_right_accel_cmd_mps2, active_attitude_gains.max_angle_deg);
+
+              navpos_desired_north_vel_mps = desired_north_vel_mps;
+              navpos_desired_east_vel_mps = desired_east_vel_mps;
+              navpos_tilt_limited = (uint8_t)((fabsf(target_pitch_deg) >= (active_attitude_gains.max_angle_deg - 0.01f)) ||
+                                              (fabsf(target_roll_deg) >= (active_attitude_gains.max_angle_deg - 0.01f)));
+              navpos_accel_limited = (uint8_t)((fabsf(navpos_north_accel_cmd_mps2) >= (APP_NAVPOS_MAX_ACCEL_MPS2 - 0.001f)) ||
+                                               (fabsf(navpos_east_accel_cmd_mps2) >= (APP_NAVPOS_MAX_ACCEL_MPS2 - 0.001f)));
+            }
+            else
+            {
+              /* Centered but not yet settled enough to latch a hold target -
+               * ACTIVELY brake toward zero velocity through the same
+               * velocity-error->accel->angle chain, rather than just
+               * commanding level and waiting for drag to bleed off the
+               * residual speed. Real flight data showed the level-only
+               * version leaving the aircraft coasting at 0.4-0.9 m/s with a
+               * literal 0deg commanded tilt for 2+ seconds straight - a
+               * quadcopter has nowhere near enough drag to ever decay below
+               * APP_NAVPOS_RELATCH_MAX_VEL_MPS on its own, so it never
+               * reached the settle gate and just drifted indefinitely with
+               * the stick sitting dead center the whole time. */
+              float desired_north_vel_mps = 0.0f;
+              float desired_east_vel_mps = 0.0f;
+
+              navpos_north_vel_error_mps = desired_north_vel_mps - nav_state.filtered_north_vel_mps;
+              navpos_east_vel_error_mps = desired_east_vel_mps - nav_state.filtered_east_vel_mps;
+
+              navpos_north_accel_cmd_mps2 = App_ClampFloat(APP_NAVPOS_VELOCITY_KP * navpos_north_vel_error_mps,
+                                                            -APP_NAVPOS_MAX_ACCEL_MPS2, APP_NAVPOS_MAX_ACCEL_MPS2);
+              navpos_east_accel_cmd_mps2 = App_ClampFloat(APP_NAVPOS_VELOCITY_KP * navpos_east_vel_error_mps,
+                                                           -APP_NAVPOS_MAX_ACCEL_MPS2, APP_NAVPOS_MAX_ACCEL_MPS2);
+
+              Nav_RotateNedToBody(navpos_north_accel_cmd_mps2, navpos_east_accel_cmd_mps2, yaw_deg,
+                                 &navpos_fwd_accel_cmd_mps2, &navpos_right_accel_cmd_mps2);
+
+              target_pitch_deg = ((float)APP_PITCH_SIGN) *
+                                 Nav_AccelToAngleDeg(navpos_fwd_accel_cmd_mps2, active_attitude_gains.max_angle_deg);
+              target_roll_deg = ((float)APP_ROLL_SIGN) *
+                                Nav_AccelToAngleDeg(navpos_right_accel_cmd_mps2, active_attitude_gains.max_angle_deg);
+
+              navpos_desired_north_vel_mps = desired_north_vel_mps;
+              navpos_desired_east_vel_mps = desired_east_vel_mps;
+              navpos_tilt_limited = (uint8_t)((fabsf(target_pitch_deg) >= (active_attitude_gains.max_angle_deg - 0.01f)) ||
+                                              (fabsf(target_roll_deg) >= (active_attitude_gains.max_angle_deg - 0.01f)));
+              navpos_accel_limited = (uint8_t)((fabsf(navpos_north_accel_cmd_mps2) >= (APP_NAVPOS_MAX_ACCEL_MPS2 - 0.001f)) ||
+                                               (fabsf(navpos_east_accel_cmd_mps2) >= (APP_NAVPOS_MAX_ACCEL_MPS2 - 0.001f)));
+              navpos_err_north_m = 0.0f;
+              navpos_err_east_m = 0.0f;
+            }
           }
           else
           {
-            if (nav_brake_active != 0U)
-            {
-              const char *lost_reason;
-
-              /* Was engaged, lost validity this iteration - log the exact
-               * reason (sec.9) and latch out until the pilot leaves and
-               * reselects this mode. Never retain a stale nav command: fall
-               * straight through to the plain stick-angle behavior below. */
-              if (nav_state.valid == 0U)
-              {
-                lost_reason = Nav_InvalidReasonName(nav_state.invalid_reason);
-              }
-              else if (nav_state.reference_valid == 0U)
-              {
-                lost_reason = "NO_REFERENCE";
-              }
-              else if (attitude_zero_captured == 0U)
-              {
-                lost_reason = "ATTITUDE_NOT_READY";
-              }
-              else if (Baro_IsHealthy() == 0U)
-              {
-                lost_reason = "BARO_UNHEALTHY";
-              }
-              else if (receiver_state.link_active == 0U)
-              {
-                lost_reason = "RX_LINK_LOST";
-              }
-              else
-              {
-                lost_reason = "GATE_UNKNOWN";
-              }
-              printf("NAV_LOST[reason=%s]\r\n", lost_reason);
-              nav_brake_disqualified_latch = 1U;
-            }
-            nav_brake_active = 0U;
+            /* Manual flying (sticks off-center) or GPS gate not satisfied -
+             * plain, full-authority stick-to-angle, identical to ATTITUDE/
+             * ALTHOLD. No position-hold state applies here. */
+            navpos_active = 0U;
+            navpos_integral_north_mps = 0.0f;
+            navpos_integral_east_mps = 0.0f;
+            navpos_desired_north_vel_mps = 0.0f;
+            navpos_desired_east_vel_mps = 0.0f;
+            navpos_north_vel_error_mps = 0.0f;
+            navpos_east_vel_error_mps = 0.0f;
+            navpos_north_accel_cmd_mps2 = 0.0f;
+            navpos_east_accel_cmd_mps2 = 0.0f;
+            navpos_fwd_accel_cmd_mps2 = 0.0f;
+            navpos_right_accel_cmd_mps2 = 0.0f;
+            navpos_tilt_limited = 0U;
+            navpos_accel_limited = 0U;
+            navpos_err_north_m = 0.0f;
+            navpos_err_east_m = 0.0f;
 
             target_roll_deg = ((float)APP_ROLL_SIGN) * App_StickOffsetUsToAngleDeg((int32_t)roll_us - (int32_t)roll_center_us,
                                                                                     active_attitude_gains.max_angle_deg);
             target_pitch_deg = ((float)APP_PITCH_SIGN) * App_StickOffsetUsToAngleDeg((int32_t)pitch_us - (int32_t)pitch_center_us,
                                                                                       active_attitude_gains.max_angle_deg);
-            nav_brake_desired_north_vel_mps = 0.0f;
-            nav_brake_desired_east_vel_mps = 0.0f;
-            nav_brake_north_vel_error_mps = 0.0f;
-            nav_brake_east_vel_error_mps = 0.0f;
-            nav_brake_north_accel_cmd_mps2 = 0.0f;
-            nav_brake_east_accel_cmd_mps2 = 0.0f;
-            nav_brake_fwd_accel_cmd_mps2 = 0.0f;
-            nav_brake_right_accel_cmd_mps2 = 0.0f;
-            nav_brake_tilt_limited = 0U;
-            nav_brake_accel_limited = 0U;
           }
+
+          navpos_was_engaged = navpos_engage_ok;
 
           roll_angle_error_deg = Attitude_WrapAngle180(target_roll_deg - roll_deg);
           pitch_angle_error_deg = Attitude_WrapAngle180(target_pitch_deg - pitch_deg);
@@ -3915,10 +5054,11 @@ void App_Update(void)
         }
         else if ((flight_mode == APP_FLIGHT_MODE_ATTITUDE) || (flight_mode == APP_FLIGHT_MODE_ALTHOLD))
         {
-          /* Leaving NAV_VELOCITY_BRAKE always clears the disqualify latch -
+          /* Leaving NAV_POSHOLD always clears its engaged/active state -
            * re-selecting the mode later always gets a fresh engagement chance. */
-          nav_brake_active = 0U;
-          nav_brake_disqualified_latch = 0U;
+          navpos_was_engaged = 0U;
+          navpos_active = 0U;
+          navpos_needs_latch = 1U;
 
           target_roll_deg = ((float)APP_ROLL_SIGN) * App_StickOffsetUsToAngleDeg((int32_t)roll_us - (int32_t)roll_center_us,
                                                                                   active_attitude_gains.max_angle_deg);
@@ -3936,8 +5076,9 @@ void App_Update(void)
         }
         else
         {
-          nav_brake_active = 0U;
-          nav_brake_disqualified_latch = 0U;
+          navpos_was_engaged = 0U;
+          navpos_active = 0U;
+          navpos_needs_latch = 1U;
 
           cmd_roll_rate_dps = ((float)APP_ROLL_SIGN) * App_StickOffsetUsToRateDps((int32_t)roll_us - (int32_t)roll_center_us,
                              APP_RATE_CMD_MAX_ROLL_DPS);
@@ -3948,7 +5089,7 @@ void App_Update(void)
           int32_t yaw_offset_us = (int32_t)yaw_us - (int32_t)yaw_center_us;
           uint8_t yawhold_eligible_mode = (uint8_t)((flight_mode == APP_FLIGHT_MODE_ATTITUDE) ||
                                                      (flight_mode == APP_FLIGHT_MODE_ALTHOLD) ||
-                                                     (flight_mode == APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE));
+                                                     (flight_mode == APP_FLIGHT_MODE_NAV_POSHOLD));
 
           if ((yawhold_eligible_mode != 0U) &&
               (yaw_offset_us > -(int32_t)APP_YAWHOLD_DEADBAND_US) &&
@@ -4166,28 +5307,78 @@ void App_Update(void)
         pitch_term = App_ClampControlTerm((int32_t)pitch_term_f, APP_RATE_TERM_LIMIT_US);
         yaw_term = App_ClampControlTerm((int32_t)yaw_term_f, APP_RATE_TERM_LIMIT_US);
         baro_healthy_now = Baro_IsHealthy();
-        althold_trim_us = 0;
-        if ((flight_mode == APP_FLIGHT_MODE_ALTHOLD) || (flight_mode == APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE))
+        /* Runs UNCONDITIONALLY every iteration, regardless of flight mode or
+         * the gate below - same "keep tracking warm, never gate the
+         * reference itself" discipline as althold_hover_throttle_us. See
+         * vert_ekf.c's top-of-file design comment for what this actually does -
+         * VertEkf_Predict()/UpdateBaro()/UpdateRange() are called elsewhere in
+         * this same loop and from App_SetRangefinderCm()/App_SetLunaCm(), this
+         * is just reading the current fused estimate. */
+        althold_fused_alt_m_now = VertEkf_GetHeightM();
+        /* One-way latch per arm cycle (fixed 2026-08-30 after a real incident): a
+         * plain "revert to 0 the instant height dips below threshold" (the previous
+         * behavior) let a single noisy height sample right at the liftoff boundary
+         * flicker ground_effect_clear true/false/true THREE TIMES within ~3 seconds
+         * of real flight data. Each flip silently swapped the throttle control law
+         * between open-loop liftoff-assist and closed-loop climb-rate authority -
+         * felt by the pilot as the stick alternately doing nothing and then
+         * commanding a fast, uncommanded-feeling climb, and required an emergency
+         * mid-flight disarm. Once genuinely clear for this arm cycle, liftoff assist
+         * is not needed again until disarm/re-arm - see the arm-reset block above
+         * (ground_effect_clear = 0U there) for where the latch actually resets. */
+        if (ground_effect_clear == 0U)
         {
-          /* Hover-throttle reference tracking runs UNCONDITIONALLY in ALTHOLD/
-           * NAVBRAKE now (decoupled from the altitude/baro-health gate below on
-           * 2026-08-21) - this only watches the pilot's stick, it never touches
-           * the baro, so ground-effect noise has no bearing on it. Previously this
-           * was gated the same as the trim computation, which meant the reference
-           * could go stale for an entire low-altitude liftoff and then suddenly
-           * get used against a real trim correction the instant altitude cleared
-           * the gate - root cause of a real uncontrolled-climb incident. See
-           * memory kh7-althold-throttle-incident for the full writeup. */
-          /* Re-latch the hover-throttle reference to wherever the stick has
-           * genuinely SETTLED (stayed within a small window for a while), not
-           * a fixed APP_PWM_MID_US=1500 (real hover throttle is wherever this
-           * aircraft's thrust/weight puts it, observed ~1200-1270us here,
-           * nowhere near mid-stick) and not just once at mode entry (which can
-           * freeze on an unrepresentative value like idle throttle before
-           * liftoff, and then never update again once the stick moves outside
-           * the deadband of that bad reference). Also reset fresh on every arm
-           * (see the arm-transition block above) so it can't carry a stale value
-           * across flights either. */
+          if (althold_fused_alt_m_now < APP_BARO_VZ_DAMP_MIN_ALT_M)
+          {
+            ground_effect_below_since_ms = now_ms;
+          }
+          else if ((now_ms - ground_effect_below_since_ms) >= APP_GROUND_EFFECT_CLEAR_DWELL_MS)
+          {
+            ground_effect_clear = 1U;
+          }
+        }
+        /* External-height-based supplement (2026-08-23, extended 2026-08-25 to
+         * cover TF-Luna too via App_GetBestHeightCm()) - can confirm clearing
+         * ground effect independently of baro, which is known to swing wildly
+         * (up to ~230cm) during exactly this window (see
+         * kh7-baro-liftoff-transient memory), which in turn was blocking a
+         * comfortable, consistent stick center for the full-authority ALTHOLD
+         * redesign below. Only ever ADDS a way to reach ground_effect_clear
+         * sooner/more reliably - never blocks the baro-only path above. A
+         * missing/stale reading from BOTH sensors (see App_GetBestHeightCm()'s
+         * comment) is treated exactly like "still below threshold": it resets
+         * this path's own dwell clock rather than either granting clearance or
+         * silently freezing a stale clock that could false-trigger the instant
+         * a sensor recovers. Also latched one-way per arm cycle, same reasoning
+         * as the baro path above. */
+        height_cm_now = App_GetBestHeightCm(now_ms);
+        if (ground_effect_clear == 0U)
+        {
+          if ((height_cm_now <= 0.0f) ||
+              ((height_cm_now * 0.01f) < APP_BARO_VZ_DAMP_MIN_ALT_M))
+          {
+            ground_effect_rangefinder_below_since_ms = now_ms;
+          }
+          else if ((now_ms - ground_effect_rangefinder_below_since_ms) >= APP_GROUND_EFFECT_CLEAR_DWELL_MS)
+          {
+            ground_effect_clear = 1U;
+          }
+        }
+        althold_trim_us = 0;
+        althold_authority_active = 0U;
+        althold_liftoff_assist_active = 0U;
+        /* Only ever assigned inside the ALTHOLD/NAVBRAKE branch below - reset here
+         * unconditionally (2026-08-29) so Telemetry_PrintAltholdState() always reads
+         * a well-defined value in RATE/ATTITUDE mode too, not stack garbage. */
+        climb_rate_setpoint_mps = 0.0f;
+        climb_rate_error_mps = 0.0f;
+        if ((flight_mode == APP_FLIGHT_MODE_ALTHOLD) || (flight_mode == APP_FLIGHT_MODE_NAV_POSHOLD))
+        {
+          /* Settle-latch: re-latches althold_settled_center_us to wherever the
+           * stick has genuinely SETTLED, not a fixed value - see its
+           * declaration comment for why. Runs unconditionally here (both
+           * above and below the ground-effect gate), same discipline as
+           * althold_hover_throttle_us. */
           throttle_offset_us = (int32_t)throttle_us - (int32_t)althold_settle_ref_us;
           if ((throttle_offset_us > (int32_t)APP_ALTHOLD_STICK_STABLE_WINDOW_US) ||
               (throttle_offset_us < -(int32_t)APP_ALTHOLD_STICK_STABLE_WINDOW_US))
@@ -4195,111 +5386,281 @@ void App_Update(void)
             althold_settle_ref_us = (uint16_t)throttle_us;
             althold_settle_start_ms = now_ms;
           }
-          else if ((now_ms - althold_settle_start_ms) >= APP_ALTHOLD_STICK_SETTLE_MS)
+          /* Also require the aircraft to actually BE near-level before
+           * committing a relatch, not just the stick being still - see
+           * APP_ALTHOLD_RELATCH_MAX_CLIMB_MPS's comment. A real incident: a
+           * ~0.8s pause mid-climb (stick genuinely still, but the aircraft
+           * still gaining altitude) relatched center right where the pilot
+           * happened to pause, silently locking a hold at a lower altitude
+           * than intended - reported as the aircraft "just gives up." Also
+           * exclude both physical stick extremes entirely - see
+           * APP_ALTHOLD_RELATCH_EXCLUDE_MARGIN_US's comment. A second real
+           * incident: holding full-down stick to land (perfectly still, by
+           * definition, once pinned at the mechanical limit) relatched
+           * center to the stick's own position - the SAME full-down stick
+           * instantly became "centered" (offset=0), silently converting a
+           * commanded max-rate descent into an altitude LOCK. The aircraft
+           * never landed - "commanded full down throttle, and the aircraft
+           * stayed up and didn't land." */
+          else if (((now_ms - althold_settle_start_ms) >= APP_ALTHOLD_THROTTLE_SETTLE_MS) &&
+                   (fabsf(VertEkf_GetClimbRateMps()) < APP_ALTHOLD_RELATCH_MAX_CLIMB_MPS) &&
+                   (althold_settle_ref_us > (APP_PWM_MIN_US + APP_ALTHOLD_RELATCH_EXCLUDE_MARGIN_US)) &&
+                   (althold_settle_ref_us < (APP_PWM_MAX_US - APP_ALTHOLD_RELATCH_EXCLUDE_MARGIN_US)))
           {
-            althold_center_throttle_us = althold_settle_ref_us;
+            althold_settled_center_us = althold_settle_ref_us;
           }
 
-          throttle_offset_us = (int32_t)throttle_us - (int32_t)althold_center_throttle_us;
-          if ((throttle_offset_us > -(int32_t)APP_ALTHOLD_THROTTLE_DEADBAND_US) &&
-              (throttle_offset_us < (int32_t)APP_ALTHOLD_THROTTLE_DEADBAND_US) &&
-              (baro_healthy_now != 0U) &&
-              (Baro_GetAltitudeM() >= APP_BARO_VZ_DAMP_MIN_ALT_M))
+          throttle_offset_us = (int32_t)throttle_us - (int32_t)althold_settled_center_us;
+
+          if ((baro_healthy_now != 0U) && (ground_effect_clear != 0U))
           {
-            /* Centered AND clear of ground effect (same APP_BARO_VZ_DAMP_MIN_ALT_M
-             * threshold used for baro Vz damping below) - this is the only gate
-             * that still depends on altitude/baro health, and only guards the
-             * actual trim correction, not the reference tracking above. Without
-             * some ground-effect gate here, a brief natural pause in the pilot's
-             * throttle push during liftoff/climb-out (routine) could latch a hold
-             * target while altitude/climb-rate readings are still noisy, producing
-             * a jumpy unwanted correction right at liftoff instead of a clean
-             * climb. */
-            if (althold_holding == 0U)
+            /* Full computed-throttle authority - see the big design comment
+             * above APP_ALTHOLD_THROTTLE_DEADBAND_US's definition for why this
+             * is safe to re-attempt after the 2026-08-21 incident. */
+            althold_authority_active = 1U;
+
+            if ((althold_authority_was_active == 0U) &&
+                ((throttle_offset_us > (int32_t)APP_ALTHOLD_THROTTLE_DEADBAND_US) ||
+                 (throttle_offset_us < -(int32_t)APP_ALTHOLD_THROTTLE_DEADBAND_US)))
             {
-              /* Only take a FRESH altitude snapshot if there isn't a persistent
-               * target yet (first engagement this arm) or the pilot genuinely
-               * settled the stick at a new center since the last one (a
-               * deliberate reposition) - NOT on every brief deadband exit.
-               * Before this (2026-08-22), a target was captured on every single
-               * holding-0-to-1 transition, so a quick correction nudge just
-               * adopted the drifted altitude as the new "correct" one instead
-               * of actually correcting back toward where the pilot had been
-               * trying to hold - reported as "forced to constantly adjust to
-               * stay within 1-2ft of a hover reference." Deliberate
-               * repositioning (stick moves and settles somewhere new) still
-               * captures a fresh target, same as before. */
-              if ((althold_have_target == 0U) ||
-                  (althold_center_throttle_us != althold_target_ref_center_us))
-              {
-                althold_target_alt_m = Baro_GetAltitudeM();
-                althold_target_ref_center_us = althold_center_throttle_us;
-                althold_have_target = 1U;
-              }
-              althold_integral_us = 0.0f;
-              althold_holding = 1U;
+              /* Just transitioned from open-loop liftoff assist to full
+               * closed-loop authority - seed the hover estimate from what
+               * liftoff assist was ACTUALLY outputting the instant before,
+               * not its own frozen pre-gate value, so the handoff is
+               * continuous instead of snapping. A real flight exposed this:
+               * liftoff assist was outputting ~1243us (hover_est=1150 plus a
+               * large stick-offset contribution) the sample before the gate
+               * opened, then the closed-loop branch used hover_est ALONE
+               * (~1150) the sample after - a ~93us drop with no change in
+               * what the pilot was doing, regardless of trim.
+               *
+               * GATED ON OFF-CENTER STICK 2026-08-30 (was unconditional): a
+               * real flight showed this firing with the stick merely ~50us
+               * off center (well inside the deadband, about to enter the
+               * "Centered" branch below anyway) - baking that small, noisy
+               * offset into the PERSISTENT hover_throttle_us baseline rather
+               * than the transient trim caused a real, felt uncommanded climb
+               * to ~1.8m from a ~0.4m target, taking ~13s to recover (see
+               * kh7_althold_oscillation_yawhold_todo memory). The original
+               * incident this code fixed only ever needs this seed when the
+               * stick was GENUINELY off-center during liftoff assist (i.e.
+               * about to take the off-center branch below, actively
+               * commanding a climb/descend) - if the stick is within the
+               * deadband, the Centered branch's own fast trim correction
+               * handles any small mismatch without needing a one-time
+               * baseline nudge, and that nudge is pure risk (it can silently
+               * absorb stick noise) with no offsetting benefit in that case. */
+              althold_hover_throttle_us = App_ClampFloat(althold_hover_throttle_us +
+                                                          ((float)throttle_offset_us *
+                                                           ((float)APP_ALTHOLD_LIFTOFF_ASSIST_MAX_US /
+                                                            (float)((int32_t)APP_PWM_MAX_US -
+                                                                    (int32_t)APP_PWM_MID_US))),
+                                                          (float)APP_ALTHOLD_HOVER_EST_MIN_US,
+                                                          (float)APP_ALTHOLD_HOVER_EST_MAX_US);
             }
 
-            climb_rate_setpoint_mps = App_ClampFloat(APP_ALTHOLD_ALT_HOLD_KP_MPS_PER_M *
-                                                      (althold_target_alt_m - Baro_GetAltitudeM()),
-                                                      -APP_ALTHOLD_MAX_CLIMB_MPS,
-                                                      APP_ALTHOLD_MAX_CLIMB_MPS);
-            climb_rate_error_mps = climb_rate_setpoint_mps - Baro_GetClimbRateMps();
+            if ((throttle_offset_us > -(int32_t)APP_ALTHOLD_THROTTLE_DEADBAND_US) &&
+                (throttle_offset_us < (int32_t)APP_ALTHOLD_THROTTLE_DEADBAND_US))
+            {
+              /* Centered: lock the altitude captured the instant we start
+               * holding, not on every centered iteration (would let slow
+               * drift continuously redefine "correct"). ALSO require the
+               * aircraft's own climb rate to already be near zero
+               * (2026-08-30) - reusing APP_ALTHOLD_RELATCH_MAX_CLIMB_MPS,
+               * the same threshold/idiom as the stick-center relatch gate
+               * above (see its comment). Real flight data from tonight
+               * showed every severe hold-oscillation episode had 1.0-1.8 m/s
+               * of residual vertical velocity at the exact instant this code
+               * (with no velocity check) captured a fresh target - the
+               * vehicle then sailed straight past that just-latched target
+               * under its own momentum, and the resulting large error is
+               * what actually kicked off the multi-cycle oscillations
+               * (independent of the separate Ki=0.05 regression tracked in
+               * kh7_althold_oscillation_yawhold_todo memory - clean holds all
+               * had <0.4-0.5 m/s residual velocity at capture). */
+              if ((althold_holding == 0U) &&
+                  (fabsf(VertEkf_GetClimbRateMps()) < APP_ALTHOLD_RELATCH_MAX_CLIMB_MPS))
+              {
+                althold_target_alt_m = althold_fused_alt_m_now;
+                althold_integral_us = 0.0f;
+                althold_pos_integral_mps = 0.0f;
+                althold_holding = 1U;
+              }
+
+              if (althold_holding == 0U)
+              {
+                /* Stick centered but still coasting from real momentum -
+                 * don't latch a target yet (would just reproduce the bug
+                 * above). Command zero rate so the inner climb-rate loop
+                 * arrests the residual velocity; the next centered sample
+                 * where velocity has actually settled captures cleanly. */
+                climb_rate_setpoint_mps = 0.0f;
+              }
+              else
+              {
+                /* Gentle proportional nudge (2026-08-23): stick offset WITHIN
+                 * the deadband slowly walks the held target up/down instead of
+                 * being completely ignored - a real flight showed a pilot push
+                 * further while already holding (still inside the deadband)
+                 * expecting some response and getting none, reported as the
+                 * aircraft "just gives up." Deliberately a much slower rate
+                 * than the full off-center climb/descend authority below
+                 * (APP_ALTHOLD_HOLD_NUDGE_MAX_MPS vs APP_ALTHOLD_MAX_CLIMB_MPS)
+                 * so there's still a clear, distinct feel between fine-tuning
+                 * an existing hold and actively commanding a climb/descend. */
+                if ((throttle_offset_us > (int32_t)APP_ALTHOLD_HOLD_NUDGE_DEADZONE_US) ||
+                    (throttle_offset_us < -(int32_t)APP_ALTHOLD_HOLD_NUDGE_DEADZONE_US))
+                {
+                  althold_target_alt_m += ((float)throttle_offset_us /
+                                           (float)APP_ALTHOLD_THROTTLE_DEADBAND_US) *
+                                          APP_ALTHOLD_HOLD_NUDGE_MAX_MPS * dt_s;
+                }
+                {
+                  float pos_error_m = althold_target_alt_m - althold_fused_alt_m_now;
+                  althold_pos_integral_mps = App_ClampFloat(althold_pos_integral_mps +
+                                                            (pos_error_m * App_GetAltholdPosKi() * dt_s),
+                                                            -APP_ALTHOLD_POS_INTEGRAL_LIMIT_MPS,
+                                                            APP_ALTHOLD_POS_INTEGRAL_LIMIT_MPS);
+                  climb_rate_setpoint_mps = App_ClampFloat((App_GetAltholdAltHoldKp() * pos_error_m) +
+                                                            althold_pos_integral_mps,
+                                                            -App_GetAltholdMaxClimbMps(),
+                                                            App_GetAltholdMaxClimbMps());
+                }
+              }
+            }
+            else
+            {
+              /* Off-center: pilot commands a climb/descend rate directly,
+               * proportional to stick deflection from center (full stick =
+               * APP_ALTHOLD_MAX_CLIMB_MPS - same cap the hold P-term above
+               * uses, so a climb/descend is never faster than the hold loop
+               * can also arrest it). Not holding a position target while
+               * off-center - the moment the stick returns to center, a fresh
+               * altitude is captured above, i.e. it locks wherever the
+               * climb/descend left off, exactly as requested. */
+              /* Scaled per-direction by actual remaining stick travel from
+               * wherever center settled to that side's physical end, NOT a
+               * fixed half-range like the old fixed-1500-center design could
+               * assume (1500 was equidistant from both ends by construction;
+               * a settled center generally isn't) - otherwise full stick
+               * travel toward the nearer end would saturate
+               * APP_ALTHOLD_MAX_CLIMB_MPS well before actually reaching it,
+               * and the farther end would never reach full rate at all. */
+              int32_t climb_rate_scale_us = (throttle_offset_us >= 0) ?
+                  ((int32_t)APP_PWM_MAX_US - (int32_t)althold_settled_center_us) :
+                  ((int32_t)althold_settled_center_us - (int32_t)APP_PWM_MIN_US);
+              if (climb_rate_scale_us < 1)
+              {
+                climb_rate_scale_us = 1; /* guard - center settled right at an endpoint */
+              }
+              althold_holding = 0U;
+              althold_integral_us = 0.0f;
+              althold_pos_integral_mps = 0.0f;
+              {
+                float max_climb_mps = App_GetAltholdMaxClimbMps();
+                climb_rate_setpoint_mps = App_ClampFloat(
+                    ((float)throttle_offset_us / (float)climb_rate_scale_us) * max_climb_mps,
+                    -max_climb_mps, max_climb_mps);
+              }
+            }
+
+            climb_rate_error_mps = climb_rate_setpoint_mps - VertEkf_GetClimbRateMps();
+
+            /* Fast/bounded reactive term - same role, same gains, same limit
+             * as the original trim design. Protects against a short-term bad
+             * reading regardless of what the slow hover estimate below is
+             * doing. */
             althold_integral_us = App_ClampFloat(althold_integral_us +
-                                                 (climb_rate_error_mps * APP_ALTHOLD_VZ_KI_US_PER_MPS_S * dt_s),
+                                                 (climb_rate_error_mps * App_GetAltholdVzKi() * dt_s),
                                                  -(float)APP_ALTHOLD_INTEGRAL_LIMIT_US,
                                                  (float)APP_ALTHOLD_INTEGRAL_LIMIT_US);
-
-            althold_trim_us = App_ClampInt32((int32_t)((climb_rate_error_mps * APP_ALTHOLD_VZ_KP_US_PER_MPS) +
+            althold_trim_us = App_ClampInt32((int32_t)((climb_rate_error_mps * App_GetAltholdVzKp()) +
                                                         althold_integral_us),
                                              -(int32_t)APP_ALTHOLD_TRIM_LIMIT_US,
                                              (int32_t)APP_ALTHOLD_TRIM_LIMIT_US);
+
+            /* Slow-adapting base throttle - what makes full-authority output
+             * possible without raw stick passthrough. Deliberately much
+             * slower than the trim above (small Ki, hard-clamped to a narrow
+             * absolute range) so it can only ever drift gradually toward
+             * this flight's real hover throttle, never jump. */
+            althold_hover_throttle_us = App_ClampFloat(althold_hover_throttle_us +
+                                                        (climb_rate_error_mps *
+                                                         APP_ALTHOLD_HOVER_EST_KI_US_PER_MPS_S * dt_s),
+                                                        (float)APP_ALTHOLD_HOVER_EST_MIN_US,
+                                                        (float)APP_ALTHOLD_HOVER_EST_MAX_US);
           }
           else
           {
-            /* Either off-center (pilot actively commanding a climb/descend - full
-             * manual authority over raw throttle_us, no hold trim fighting the
-             * stick) or centered but too low/baro-unhealthy for a trustworthy
-             * correction. Either way, no trim. Deliberately NOT touching
-             * althold_target_alt_m/have_target/target_ref_center_us here - a
-             * brief excursion preserves the persistent target (see the capture
-             * logic above), so re-engaging pulls back toward where the pilot
-             * was actually trying to hold instead of adopting wherever this
-             * excursion left off. */
+            /* Not yet clear of ground effect, or baro unhealthy: open-loop
+             * liftoff assist, NOT raw stick passthrough - see
+             * APP_ALTHOLD_LIFTOFF_ASSIST_MAX_US's comment for why. No baro
+             * feedback at all here, so althold_hover_throttle_us is
+             * deliberately left untouched (stays at its arm-reset seed) until
+             * the branch above takes over with real climb-rate feedback. */
             althold_holding = 0U;
             althold_integral_us = 0.0f;
+            althold_pos_integral_mps = 0.0f;
+            althold_liftoff_assist_active = 1U;
+            althold_liftoff_base_us = althold_hover_throttle_us +
+                                      ((float)throttle_offset_us *
+                                       ((float)APP_ALTHOLD_LIFTOFF_ASSIST_MAX_US /
+                                        (float)((int32_t)APP_PWM_MAX_US - (int32_t)APP_PWM_MID_US)));
           }
         }
         else
         {
           althold_holding = 0U;
           althold_integral_us = 0.0f;
+          althold_pos_integral_mps = 0.0f;
+          /* Not in ALTHOLD/NAVBRAKE - don't let a stale settle-window carry
+           * into the next time this mode is selected. */
           althold_settle_ref_us = (uint16_t)throttle_us;
           althold_settle_start_ms = now_ms;
         }
+        althold_authority_was_active = althold_authority_active;
         /* Smooth the trim itself (not just the gains feeding it) - noisy baro
          * climb-rate readings were translating directly into jerky per-iteration
          * motor changes on the Z axis. Filters toward 0 the same way when not
-         * holding, so re-engaging/disengaging the hold is a smooth ramp too. */
+         * holding, so re-engaging/disengaging the hold is a smooth ramp too -
+         * including across an authority-active/inactive transition, since the
+         * base swaps below but the trim itself keeps ramping smoothly through
+         * zero regardless. */
         {
           float althold_trim_lpf_alpha = App_LpfAlpha(dt_s, APP_ALTHOLD_TRIM_LPF_HZ);
           althold_trim_filtered_us += althold_trim_lpf_alpha *
                                       ((float)althold_trim_us - althold_trim_filtered_us);
         }
         althold_trim_us = (int32_t)althold_trim_filtered_us;
-        /* ALTHOLD never overrides the pilot's raw throttle - it only ever adds a
-         * small bounded trim on top, so a bad baro reading/integral can nudge but
-         * never freeze or run away with the actual output. */
-        althold_throttle_us = (int32_t)throttle_us + althold_trim_us;
+        /* Base depends on which of the three states above ran this iteration:
+         * the slow hover estimate (full authority, gate open), the open-loop
+         * liftoff-assist base (gate closed but in ALTHOLD/NAVBRAKE), or plain
+         * raw stick throttle (RATE/ATTITUDE - not this mode at all). Whatever
+         * the base, the final result is still clamped to
+         * [APP_MOTOR_IDLE_US, APP_THROTTLE_MAX_US] below like any other
+         * throttle path - full authority here is bounded by the same ceiling
+         * full-stick manual flight already has. */
+        if (althold_authority_active != 0U)
+        {
+          althold_throttle_us = (int32_t)althold_hover_throttle_us + althold_trim_us;
+        }
+        else if (althold_liftoff_assist_active != 0U)
+        {
+          althold_throttle_us = (int32_t)althold_liftoff_base_us + althold_trim_us;
+        }
+        else
+        {
+          althold_throttle_us = (int32_t)throttle_us + althold_trim_us;
+        }
 
         baro_damp_term_us = 0;
-        if ((APP_BARO_VZ_DAMP_GAIN_US_PER_MPS != 0.0f) && (baro_healthy_now != 0U) &&
-            (Baro_GetAltitudeM() >= APP_BARO_VZ_DAMP_MIN_ALT_M))
+        if ((App_GetBaroVzDampGain() != 0.0f) && (baro_healthy_now != 0U) &&
+            (ground_effect_clear != 0U))
         {
-          baro_damp_term_us = (int32_t)(-APP_BARO_VZ_DAMP_GAIN_US_PER_MPS * Baro_GetClimbRateMps());
+          baro_damp_term_us = (int32_t)(-App_GetBaroVzDampGain() * VertEkf_GetClimbRateMps());
           baro_damp_term_us = App_ClampInt32(baro_damp_term_us,
-                                            -((int32_t)APP_BARO_VZ_DAMP_LIMIT_US),
-                                            (int32_t)APP_BARO_VZ_DAMP_LIMIT_US);
+                                            -((int32_t)App_GetBaroVzDampLimit()),
+                                            (int32_t)App_GetBaroVzDampLimit());
         }
         /* Light dedicated smoothing on this term only - see APP_BARO_VZ_DAMP_LPF_HZ's
          * comment. Filters toward 0 the same way when the gate above is false, same
@@ -4464,7 +5825,7 @@ void App_Update(void)
           sdlog_rec.roll_deg_x10 = (int16_t)(roll_deg * 10.0f);
           /* target_roll/pitch_deg are only meaningful (set this iteration) in an angle-mode branch. */
           if ((flight_mode == APP_FLIGHT_MODE_ATTITUDE) || (flight_mode == APP_FLIGHT_MODE_ALTHOLD) ||
-              (flight_mode == APP_FLIGHT_MODE_NAV_VELOCITY_BRAKE))
+              (flight_mode == APP_FLIGHT_MODE_NAV_POSHOLD))
           {
             sdlog_rec.target_pitch_deg_x10 = (int16_t)(target_pitch_deg * 10.0f);
             sdlog_rec.target_roll_deg_x10 = (int16_t)(target_roll_deg * 10.0f);
@@ -4483,10 +5844,10 @@ void App_Update(void)
           sdlog_rec.mag_heading_x10 = (uint16_t)(Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg, g_avg_motor_power_delta_us) * 10.0f);
           sdlog_rec.mag_field_dev_pct = mag_field_dev_pct;
 
-          sdlog_rec.nav_flags = (uint8_t)((nav_brake_requested != 0U ? APP_SDLOG_NAV_FLAG_REQUESTED : 0U) |
-                                          (nav_brake_active != 0U ? APP_SDLOG_NAV_FLAG_ACTIVE : 0U) |
-                                          (nav_brake_tilt_limited != 0U ? APP_SDLOG_NAV_FLAG_TILT_LIMITED : 0U) |
-                                          (nav_brake_accel_limited != 0U ? APP_SDLOG_NAV_FLAG_ACCEL_LIMITED : 0U) |
+          sdlog_rec.nav_flags = (uint8_t)((navpos_requested != 0U ? APP_SDLOG_NAV_FLAG_REQUESTED : 0U) |
+                                          (navpos_active != 0U ? APP_SDLOG_NAV_FLAG_ACTIVE : 0U) |
+                                          (navpos_tilt_limited != 0U ? APP_SDLOG_NAV_FLAG_TILT_LIMITED : 0U) |
+                                          (navpos_accel_limited != 0U ? APP_SDLOG_NAV_FLAG_ACCEL_LIMITED : 0U) |
                                           (nav_state.new_sample != 0U ? APP_SDLOG_NAV_FLAG_NEW_SAMPLE : 0U) |
                                           ((nav_state.rejected_count > 0U) &&
                                            (nav_state.invalid_reason == NAV_INVALID_REASON_POSITION_JUMP ||
@@ -4508,16 +5869,18 @@ void App_Update(void)
           sdlog_rec.nav_raw_vel_e_x100 = (int16_t)(nav_state.raw_east_vel_mps * 100.0f);
           sdlog_rec.nav_filt_vel_n_x100 = (int16_t)(nav_state.filtered_north_vel_mps * 100.0f);
           sdlog_rec.nav_filt_vel_e_x100 = (int16_t)(nav_state.filtered_east_vel_mps * 100.0f);
-          sdlog_rec.nav_desired_vel_n_x100 = (int16_t)(nav_brake_desired_north_vel_mps * 100.0f);
-          sdlog_rec.nav_desired_vel_e_x100 = (int16_t)(nav_brake_desired_east_vel_mps * 100.0f);
-          sdlog_rec.nav_vel_error_n_x100 = (int16_t)(nav_brake_north_vel_error_mps * 100.0f);
-          sdlog_rec.nav_vel_error_e_x100 = (int16_t)(nav_brake_east_vel_error_mps * 100.0f);
-          sdlog_rec.nav_accel_cmd_n_x1000 = (int16_t)(nav_brake_north_accel_cmd_mps2 * 1000.0f);
-          sdlog_rec.nav_accel_cmd_e_x1000 = (int16_t)(nav_brake_east_accel_cmd_mps2 * 1000.0f);
-          sdlog_rec.nav_accel_cmd_fwd_x1000 = (int16_t)(nav_brake_fwd_accel_cmd_mps2 * 1000.0f);
-          sdlog_rec.nav_accel_cmd_right_x1000 = (int16_t)(nav_brake_right_accel_cmd_mps2 * 1000.0f);
+          sdlog_rec.nav_desired_vel_n_x100 = (int16_t)(navpos_desired_north_vel_mps * 100.0f);
+          sdlog_rec.nav_desired_vel_e_x100 = (int16_t)(navpos_desired_east_vel_mps * 100.0f);
+          sdlog_rec.nav_vel_error_n_x100 = (int16_t)(navpos_north_vel_error_mps * 100.0f);
+          sdlog_rec.nav_vel_error_e_x100 = (int16_t)(navpos_east_vel_error_mps * 100.0f);
+          sdlog_rec.nav_accel_cmd_n_x1000 = (int16_t)(navpos_north_accel_cmd_mps2 * 1000.0f);
+          sdlog_rec.nav_accel_cmd_e_x1000 = (int16_t)(navpos_east_accel_cmd_mps2 * 1000.0f);
+          sdlog_rec.nav_accel_cmd_fwd_x1000 = (int16_t)(navpos_fwd_accel_cmd_mps2 * 1000.0f);
+          sdlog_rec.nav_accel_cmd_right_x1000 = (int16_t)(navpos_right_accel_cmd_mps2 * 1000.0f);
           sdlog_rec.pilot_roll_stick_us = pilot_roll_stick_us;
           sdlog_rec.pilot_pitch_stick_us = pilot_pitch_stick_us;
+          sdlog_rec.rangefinder_cm_x10 = (int16_t)(App_GetRangefinderCm(now_ms) * 10.0f);
+          sdlog_rec.luna_cm_x10 = (int16_t)(App_GetLunaCm(now_ms) * 10.0f);
 
           App_BlackboxCapture(&sdlog_rec);
           if ((sdlog_decim_counter++ % APP_SDLOG_DECIMATION) == 0U)
@@ -4658,6 +6021,7 @@ void App_Update(void)
     g_last_ax_g = ax_g;
     g_last_ay_g = ay_g;
     g_last_az_g = az_g;
+    VertEkf_Predict(Attitude_GetVerticalAccelMps2(ax_g, ay_g, az_g), dt_s);
     Attitude_GetBoardAnglesDeg(&pitch_deg, &roll_deg, &yaw_deg);
     mag_tilt_roll_deg = roll_deg;
     mag_tilt_pitch_deg = pitch_deg;
@@ -4823,8 +6187,23 @@ void App_Update(void)
         Telemetry_PrintBatteryState(battery_voltage_filtered_v, battery_adc_raw);
       }
       Telemetry_PrintBaroState(Baro_GetAltitudeM(), Baro_GetClimbRateMps(), Baro_IsHealthy());
+      Telemetry_PrintVertEkfState(VertEkf_IsHealthy(), VertEkf_GetHeightM(), VertEkf_GetClimbRateMps(),
+                                  VertEkf_GetAccelBiasMps2(), VertEkf_GetLidarImpliedHeightM(),
+                                  VertEkf_GetSonarImpliedHeightM());
+      Telemetry_PrintAltholdState(althold_holding, althold_authority_active, althold_target_alt_m,
+                                  althold_fused_alt_m_now, climb_rate_setpoint_mps, climb_rate_error_mps,
+                                  althold_trim_us, baro_damp_term_us, althold_hover_throttle_us);
       Telemetry_PrintGpsState(GPS_IsConfigured(), GPS_IsHealthy(), GPS_GetFixType(), GPS_GetNumSatellites(),
                              GPS_GetLatitudeDeg(), GPS_GetLongitudeDeg(), GPS_GetAltitudeM());
+      /* Added 2026-09-04 alongside the CFG-NAV5 retry fix - this ack was
+       * previously invisible in telemetry, so a lost round-trip (leaving the
+       * receiver stuck in factory static-hold, freezing lat/lon) had no
+       * symptom short of forensically comparing GPS output against known
+       * real motion after the fact. (First attempt at this print landed in
+       * the OTHER Telemetry_PrintGpsState call site, which is compiled out
+       * behind #if APP_ENABLE_USB_TEST_IMU_TELEMETRY - this one is the call
+       * site that's actually live during a real flight.) */
+      printf("GPSNAV5[acked=%u]\r\n", (unsigned int)GPS_GetLastNav5Acked());
       Telemetry_PrintMagState(Mag_IsHealthy(), Mag_GetXGauss(), Mag_GetYGauss(), Mag_GetZGauss(),
                              Mag_GetHeadingDeg(mag_tilt_roll_deg, mag_tilt_pitch_deg, g_avg_motor_power_delta_us));
       Telemetry_PrintMagTiltState(mag_tilt_roll_deg, mag_tilt_pitch_deg);
@@ -4837,26 +6216,26 @@ void App_Update(void)
                               nav_state.raw_north_vel_mps, nav_state.raw_east_vel_mps,
                               nav_state.filtered_north_vel_mps, nav_state.filtered_east_vel_mps);
       {
-        /* Bench-test diagnostic (section 14): while DISARMED, motors_armed's mixer
-         * block above never ran, so target_roll/pitch_deg and the nav_brake_* accel
-         * fields are stale/irrelevant - recompute a "would-be" nav-brake command
-         * here purely for bench validation (sign conventions, yaw rotation, GPS
-         * velocity braking direction) using the SAME named transformation
-         * functions as the real controller. This NEVER reaches the motors (motors
-         * are already forced to idle/stopped while disarmed) and is clearly a
-         * distinct print (bench values only substituted while disarmed below). */
-        uint8_t bench_requested = nav_brake_requested;
-        uint8_t bench_active = nav_brake_active;
-        uint8_t bench_tilt_limited = nav_brake_tilt_limited;
-        uint8_t bench_accel_limited = nav_brake_accel_limited;
-        float bench_desired_n = nav_brake_desired_north_vel_mps;
-        float bench_desired_e = nav_brake_desired_east_vel_mps;
-        float bench_err_n = nav_brake_north_vel_error_mps;
-        float bench_err_e = nav_brake_east_vel_error_mps;
-        float bench_accel_n = nav_brake_north_accel_cmd_mps2;
-        float bench_accel_e = nav_brake_east_accel_cmd_mps2;
-        float bench_accel_fwd = nav_brake_fwd_accel_cmd_mps2;
-        float bench_accel_right = nav_brake_right_accel_cmd_mps2;
+        /* Bench-test diagnostic: while DISARMED, the armed control-law block
+         * above never ran, so target_roll/pitch_deg and the navpos_* accel
+         * fields are stale/irrelevant - recompute a "would-be" off-center-stick
+         * NAV_POSHOLD command here purely for bench validation (sign
+         * conventions, yaw rotation, GPS velocity direction) using the SAME
+         * named transformation functions as the real controller. This NEVER
+         * reaches the motors (motors are already forced to idle/stopped while
+         * disarmed). */
+        uint8_t bench_requested = navpos_requested;
+        uint8_t bench_active = navpos_active;
+        uint8_t bench_tilt_limited = navpos_tilt_limited;
+        uint8_t bench_accel_limited = navpos_accel_limited;
+        float bench_desired_n = navpos_desired_north_vel_mps;
+        float bench_desired_e = navpos_desired_east_vel_mps;
+        float bench_err_n = navpos_north_vel_error_mps;
+        float bench_err_e = navpos_east_vel_error_mps;
+        float bench_accel_n = navpos_north_accel_cmd_mps2;
+        float bench_accel_e = navpos_east_accel_cmd_mps2;
+        float bench_accel_fwd = navpos_fwd_accel_cmd_mps2;
+        float bench_accel_right = navpos_right_accel_cmd_mps2;
         float bench_target_roll_deg = target_roll_deg;
         float bench_target_pitch_deg = target_pitch_deg;
 
@@ -4865,10 +6244,10 @@ void App_Update(void)
           /* No APP_PITCH_SIGN flip here - see the matching comment on the armed
            * path above; this bench block must stay in sync with it. */
           float fwd_cmd_mps = App_NavStickOffsetToVelocityMps((int32_t)pitch_us - (int32_t)pitch_center_us,
-                                                              APP_NAV_BRAKE_MAX_VEL_MPS);
+                                                              APP_NAVPOS_MAX_STICK_VEL_MPS);
           float right_cmd_mps = ((float)APP_ROLL_SIGN) *
                                 App_NavStickOffsetToVelocityMps((int32_t)roll_us - (int32_t)roll_center_us,
-                                                                APP_NAV_BRAKE_MAX_VEL_MPS);
+                                                                APP_NAVPOS_MAX_STICK_VEL_MPS);
           float desired_n;
           float desired_e;
 
@@ -4876,34 +6255,34 @@ void App_Update(void)
 
           bench_err_n = desired_n - nav_state.filtered_north_vel_mps;
           bench_err_e = desired_e - nav_state.filtered_east_vel_mps;
-          bench_accel_n = App_ClampFloat(APP_NAV_BRAKE_VELOCITY_KP * bench_err_n,
-                                         -APP_NAV_BRAKE_MAX_ACCEL_MPS2, APP_NAV_BRAKE_MAX_ACCEL_MPS2);
-          bench_accel_e = App_ClampFloat(APP_NAV_BRAKE_VELOCITY_KP * bench_err_e,
-                                         -APP_NAV_BRAKE_MAX_ACCEL_MPS2, APP_NAV_BRAKE_MAX_ACCEL_MPS2);
+          bench_accel_n = App_ClampFloat(APP_NAVPOS_VELOCITY_KP * bench_err_n,
+                                         -APP_NAVPOS_MAX_ACCEL_MPS2, APP_NAVPOS_MAX_ACCEL_MPS2);
+          bench_accel_e = App_ClampFloat(APP_NAVPOS_VELOCITY_KP * bench_err_e,
+                                         -APP_NAVPOS_MAX_ACCEL_MPS2, APP_NAVPOS_MAX_ACCEL_MPS2);
           Nav_RotateNedToBody(bench_accel_n, bench_accel_e, yaw_deg, &bench_accel_fwd, &bench_accel_right);
-          bench_target_pitch_deg = ((float)APP_PITCH_SIGN) * Nav_AccelToAngleDeg(bench_accel_fwd, APP_NAV_BRAKE_MAX_TILT_DEG);
-          bench_target_roll_deg = ((float)APP_ROLL_SIGN) * Nav_AccelToAngleDeg(bench_accel_right, APP_NAV_BRAKE_MAX_TILT_DEG);
+          bench_target_pitch_deg = ((float)APP_PITCH_SIGN) * Nav_AccelToAngleDeg(bench_accel_fwd, APP_NAVPOS_MAX_TILT_DEG);
+          bench_target_roll_deg = ((float)APP_ROLL_SIGN) * Nav_AccelToAngleDeg(bench_accel_right, APP_NAVPOS_MAX_TILT_DEG);
           bench_desired_n = desired_n;
           bench_desired_e = desired_e;
-          bench_tilt_limited = (uint8_t)((fabsf(bench_target_pitch_deg) >= (APP_NAV_BRAKE_MAX_TILT_DEG - 0.01f)) ||
-                                         (fabsf(bench_target_roll_deg) >= (APP_NAV_BRAKE_MAX_TILT_DEG - 0.01f)));
-          bench_accel_limited = (uint8_t)((fabsf(bench_accel_n) >= (APP_NAV_BRAKE_MAX_ACCEL_MPS2 - 0.001f)) ||
-                                          (fabsf(bench_accel_e) >= (APP_NAV_BRAKE_MAX_ACCEL_MPS2 - 0.001f)));
+          bench_tilt_limited = (uint8_t)((fabsf(bench_target_pitch_deg) >= (APP_NAVPOS_MAX_TILT_DEG - 0.01f)) ||
+                                         (fabsf(bench_target_roll_deg) >= (APP_NAVPOS_MAX_TILT_DEG - 0.01f)));
+          bench_accel_limited = (uint8_t)((fabsf(bench_accel_n) >= (APP_NAVPOS_MAX_ACCEL_MPS2 - 0.001f)) ||
+                                          (fabsf(bench_accel_e) >= (APP_NAVPOS_MAX_ACCEL_MPS2 - 0.001f)));
         }
 
-        Telemetry_PrintNavBrake(bench_requested, bench_active, bench_tilt_limited, bench_accel_limited,
+        Telemetry_PrintNavPos(bench_requested, bench_active, bench_tilt_limited, bench_accel_limited,
                                bench_desired_n, bench_desired_e,
                                bench_err_n, bench_err_e,
                                bench_accel_n, bench_accel_e,
                                bench_accel_fwd, bench_accel_right,
-                               bench_target_roll_deg, bench_target_pitch_deg);
-         printf("NAVGATE[nav ref att baro link latch]=[%u %u %u %u %u %u]\r\n",
+                               bench_target_roll_deg, bench_target_pitch_deg,
+                               navpos_target_north_m, navpos_target_east_m,
+                               navpos_err_north_m, navpos_err_east_m);
+         printf("NAVGATE[nav ref att link]=[%u %u %u %u]\r\n",
            (unsigned int)nav_state.valid,
            (unsigned int)nav_state.reference_valid,
            (unsigned int)attitude_zero_captured,
-           (unsigned int)Baro_IsHealthy(),
-           (unsigned int)receiver_state.link_active,
-           (unsigned int)nav_brake_disqualified_latch);
+           (unsigned int)receiver_state.link_active);
       }
       last_imu_telemetry_ms = now_ms;
     }

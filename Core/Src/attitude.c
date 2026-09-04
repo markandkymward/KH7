@@ -189,6 +189,22 @@ void Attitude_UpdateIMU(float gx_rad_s,
   }
 }
 
+/* World-up (earth +Z) unit vector, expressed in body-frame coordinates - the
+ * same quantity independently recomputed inline in both
+ * Attitude_GetVerticalAccelMps2() and Attitude_GetBoardAnglesDeg() below,
+ * factored out here (2026-08-29) so a third consumer (vert_ekf.c's off-center
+ * range-sensor lever-arm correction - see VertEkf_UpdateRange()) doesn't need
+ * a fourth copy. For any body-frame vector v_body, v_body . (gx,gy,gz) gives
+ * that vector's world-up component - e.g. Attitude_GetVerticalAccelMps2()
+ * dots this with the raw accelerometer reading, and vert_ekf.c dots it with a
+ * sensor's fixed body-frame mounting offset. */
+void Attitude_GetWorldUpInBodyFrame(float *gx, float *gy, float *gz)
+{
+  *gx = 2.0f * ((g_ahrs.q1 * g_ahrs.q3) - (g_ahrs.q0 * g_ahrs.q2));
+  *gy = 2.0f * ((g_ahrs.q0 * g_ahrs.q1) + (g_ahrs.q2 * g_ahrs.q3));
+  *gz = (g_ahrs.q0 * g_ahrs.q0) - (g_ahrs.q1 * g_ahrs.q1) - (g_ahrs.q2 * g_ahrs.q2) + (g_ahrs.q3 * g_ahrs.q3);
+}
+
 /* Net (gravity-removed) EARTH-frame vertical acceleration, in m/s^2,
  * positive = accelerating upward. Added 2026-08-21 to feed a baro/accel
  * complementary filter for climb rate (see Baro_Update()) - baro-derived
@@ -217,9 +233,7 @@ float Attitude_GetVerticalAccelMps2(float ax_g, float ay_g, float az_g)
   float g_z;
   float up_g;
 
-  g_x = 2.0f * ((g_ahrs.q1 * g_ahrs.q3) - (g_ahrs.q0 * g_ahrs.q2));
-  g_y = 2.0f * ((g_ahrs.q0 * g_ahrs.q1) + (g_ahrs.q2 * g_ahrs.q3));
-  g_z = (g_ahrs.q0 * g_ahrs.q0) - (g_ahrs.q1 * g_ahrs.q1) - (g_ahrs.q2 * g_ahrs.q2) + (g_ahrs.q3 * g_ahrs.q3);
+  Attitude_GetWorldUpInBodyFrame(&g_x, &g_y, &g_z);
 
   up_g = (g_x * ax_g) + (g_y * ay_g) + (g_z * az_g);
 
@@ -237,9 +251,7 @@ void Attitude_GetBoardAnglesDeg(float *pitch_deg,
   float roll_denom;
   float yaw;
 
-  g_x = 2.0f * ((g_ahrs.q1 * g_ahrs.q3) - (g_ahrs.q0 * g_ahrs.q2));
-  g_y = 2.0f * ((g_ahrs.q0 * g_ahrs.q1) + (g_ahrs.q2 * g_ahrs.q3));
-  g_z = (g_ahrs.q0 * g_ahrs.q0) - (g_ahrs.q1 * g_ahrs.q1) - (g_ahrs.q2 * g_ahrs.q2) + (g_ahrs.q3 * g_ahrs.q3);
+  Attitude_GetWorldUpInBodyFrame(&g_x, &g_y, &g_z);
 
   pitch_denom = sqrtf((g_y * g_y) + (g_z * g_z));
   roll_denom = sqrtf((g_x * g_x) + (g_z * g_z));

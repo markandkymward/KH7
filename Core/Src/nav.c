@@ -145,6 +145,8 @@ void Nav_LatchReference(void)
   g_nav.reference_valid = 1U;
   g_nav.north_m = 0.0f;
   g_nav.east_m = 0.0f;
+  g_nav.filtered_north_m = 0.0f;
+  g_nav.filtered_east_m = 0.0f;
   g_have_prev_position = 0U;
 }
 
@@ -279,7 +281,7 @@ void Nav_Update(uint32_t now_ms, uint8_t motors_armed)
 
         if (sample_ok != 0U)
         {
-          float lpf_alpha;
+          float dt_s = ((float)update_period_ms) * 0.001f;
 
           g_nav.north_m = north_m;
           g_nav.east_m = east_m;
@@ -295,19 +297,24 @@ void Nav_Update(uint32_t now_ms, uint8_t motors_armed)
 
           if (g_nav.consecutive_valid == 0U)
           {
-            /* First sample after init/reacquisition: seed the filter directly,
+            /* First sample after init/reacquisition: seed the filters directly,
              * no transient from whatever stale value was there before. */
             g_nav.filtered_north_vel_mps = vel_n_mps;
             g_nav.filtered_east_vel_mps = vel_e_mps;
+            g_nav.filtered_north_m = north_m;
+            g_nav.filtered_east_m = east_m;
           }
           else
           {
-            float tau_s = 1.0f / (2.0f * 3.14159265f * NAV_VELOCITY_LPF_HZ);
-            float dt_s = ((float)update_period_ms) * 0.001f;
+            float vel_tau_s = 1.0f / (2.0f * 3.14159265f * NAV_VELOCITY_LPF_HZ);
+            float vel_alpha = 1.0f - expf(-dt_s / vel_tau_s);
+            float pos_tau_s = 1.0f / (2.0f * 3.14159265f * NAV_POSITION_LPF_HZ);
+            float pos_alpha = 1.0f - expf(-dt_s / pos_tau_s);
 
-            lpf_alpha = 1.0f - expf(-dt_s / tau_s);
-            g_nav.filtered_north_vel_mps += lpf_alpha * (vel_n_mps - g_nav.filtered_north_vel_mps);
-            g_nav.filtered_east_vel_mps += lpf_alpha * (vel_e_mps - g_nav.filtered_east_vel_mps);
+            g_nav.filtered_north_vel_mps += vel_alpha * (vel_n_mps - g_nav.filtered_north_vel_mps);
+            g_nav.filtered_east_vel_mps += vel_alpha * (vel_e_mps - g_nav.filtered_east_vel_mps);
+            g_nav.filtered_north_m += pos_alpha * (north_m - g_nav.filtered_north_m);
+            g_nav.filtered_east_m += pos_alpha * (east_m - g_nav.filtered_east_m);
           }
         }
       }
@@ -357,11 +364,26 @@ void Nav_Update(uint32_t now_ms, uint8_t motors_armed)
   /* Age/staleness grows every iteration regardless of whether a new sample arrived. */
   g_nav.age_ms = (g_have_seen_update != 0U) ? (now_ms - host_rx_ms) : 0xFFFFFFFFU;
 
-  /* Auto-latch the reference only while disarmed and GPS is already solid -
-   * mirrors the existing gyro-bias/attitude-zero "settle on the ground" pattern
-   * elsewhere in this codebase. Explicit Nav_LatchReference() (mode engagement)
-   * is the other, always-available path and works regardless of arm state. */
-  if ((g_nav.reference_valid == 0U) && (motors_armed == 0U) &&
+  /* Auto-latch the reference whenever GPS is already solid enough, regardless of
+   * arm state - originally disarmed-only (mirroring the gyro-bias/attitude-zero
+   * "settle on the ground" pattern), but that created a real deadlock (found
+   * 2026-08-30 from an actual flight): NAV_VELOCITY_BRAKE's own engagement path
+   * only calls Nav_LatchReference() from INSIDE its "nav_engage_ok" branch, and
+   * nav_engage_ok itself requires reference_valid - so if the reference hadn't
+   * latched yet by the moment the pilot armed (GPS just a little slow), NOTHING
+   * could ever latch it for the rest of that arm cycle: not the disarmed-only
+   * path (already armed), not NAVBRAKE's own call (gated behind the very
+   * reference it would set). A real flight hit exactly this - GPS never went
+   * valid the entire ~56s flight (bounced between POOR_ACCURACY/NO_REFERENCE/
+   * GPS_STALE) and only cleared a moment after disarming, leaving both NAVBRAKE
+   * and position-hold completely unavailable that whole flight. Removing the
+   * arm-state restriction lets the reference latch mid-flight the moment GPS
+   * genuinely becomes solid, exactly like it already would if the pilot had
+   * disarmed and rearmed - same accuracy/fix-quality bar, just not blocked on
+   * arm state. Rebasing north_m/east_m to 0 mid-flight is safe: NAVBRAKE's
+   * velocity brake never depended on absolute position, and position-hold
+   * (which does) only ever holds wherever it happens to latch a target anyway. */
+  if ((g_nav.reference_valid == 0U) &&
       (fix_type >= NAV_MIN_FIX_TYPE) && (h_acc_m <= NAV_MAX_HORIZONTAL_ACC_M) &&
       (g_nav.consecutive_valid >= NAV_MIN_CONSECUTIVE_VALID))
   {
@@ -384,7 +406,21 @@ void Nav_Update(uint32_t now_ms, uint8_t motors_armed)
   {
     g_nav.valid = 0U;
     g_nav.invalid_reason = NAV_INVALID_REASON_GPS_STALE;
-    g_nav.consecutive_valid = 0U;
+    /* Only force a full reacquisition (consecutive_valid=0, up to
+     * NAV_MIN_CONSECUTIVE_VALID more samples of REACQUIRING once fresh data
+     * resumes) once staleness has genuinely persisted past NAV_STALE_RESET_MS,
+     * not on every single brief gap past NAV_MAX_MESSAGE_AGE_MS (found
+     * 2026-08-30: a 120s stationary bench capture showed GPS 100% valid the
+     * whole time, but real flights showed frequent brief GPS_STALE/REACQUIRING
+     * cycling - motor-current interference causing isolated, self-recovering
+     * sample gaps, not a real/sustained GPS problem). g_nav.valid still drops
+     * immediately at NAV_MAX_MESSAGE_AGE_MS either way - this only avoids
+     * piling on an extra ~1s reacquisition penalty for a gap that was already
+     * over by the very next sample. */
+    if (g_nav.age_ms > NAV_STALE_RESET_MS)
+    {
+      g_nav.consecutive_valid = 0U;
+    }
   }
   else if (h_acc_m > NAV_MAX_HORIZONTAL_ACC_M)
   {

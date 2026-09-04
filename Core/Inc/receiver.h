@@ -21,6 +21,7 @@ typedef struct
   uint32_t overrun_error_count;
   uint32_t framing_error_count;
   uint32_t noise_error_count;
+  uint32_t implausible_frame_count;
 } receiver_state_t;
 
 void Receiver_Init(void);

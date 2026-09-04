@@ -19,6 +19,20 @@ static const char *WIFI_PASSWORD = "NrMaintain1!";
 static const char *BRIDGE_HOST = "kh7bridge.local";
 static const char *BRIDGE_MDNS_NAME = "kh7bridge"; // without ".local", for MDNS.queryHost()
 static const uint16_t BRIDGE_PORT = 3333;
+// Fallback fixed IP, tried only if BOTH WiFi.hostByName() and MDNS.queryHost() fail to
+// resolve BRIDGE_HOST (2026-08-30) - the bridge sketch
+// (tools/esp32_s3_uart6_wifi_bridge/esp32_s3_uart6_wifi_bridge.ino) has never actually
+// called MDNS.begin()/MDNS.addService() at any point in this project's history, so
+// "kh7bridge.local" has never been resolvable by anything - confirmed the same session
+// this was added, when sdlog_analyze.py --host kh7bridge.local also failed and every
+// other tool that night had to be run with --host 10.0.0.39 explicitly instead. This
+// display had no fallback at all, so it silently retried a lookup that could never
+// succeed, forever, with zero telemetry ever reaching the screen. Update this IP if the
+// bridge's DHCP lease ever changes; the real fix is adding an mDNS responder to the
+// bridge sketch itself so hostname resolution starts working for every tool, not just
+// this one - not done here since the bridge board's own availability wasn't confirmed
+// when this fallback was added.
+static const char *BRIDGE_FALLBACK_IP = "10.0.0.39";
 
 static const uint32_t WIFI_RETRY_MS = 4000;
 static const uint32_t BRIDGE_RETRY_MS = 3000;
@@ -237,6 +251,15 @@ static bool resolveBridgeIp(IPAddress &ip)
     {
       return true;
     }
+  }
+  // See BRIDGE_FALLBACK_IP's comment - hostname/mDNS resolution has never actually
+  // worked against this bridge, so fall back to the known-good fixed IP rather than
+  // retrying a lookup that can never succeed forever with no data ever reaching the
+  // screen.
+  if (ip.fromString(BRIDGE_FALLBACK_IP))
+  {
+    Serial.printf("[BRIDGE] hostname/mDNS resolution failed, using fallback IP %s\n", BRIDGE_FALLBACK_IP);
+    return true;
   }
   return false;
 }
