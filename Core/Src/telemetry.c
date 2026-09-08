@@ -312,6 +312,22 @@ void Telemetry_PrintBaroState(float altitude_m, float climb_rate_mps, uint8_t he
  * the fused h_cm. bias_mm_s2 scaled to mm/s^2 (vs. baro's cm-scale fields) since
  * accel bias is typically a much smaller quantity (~0.01-0.5 m/s^2) that would
  * otherwise round to 0 at cm-equivalent precision. */
+void Telemetry_PrintHorizEkfState(float north_m,
+                                  float east_m,
+                                  float north_vel_mps,
+                                  float east_vel_mps,
+                                  float accel_bias_north_mps2,
+                                  float accel_bias_east_mps2)
+{
+  printf("HEKF[n_cm e_cm vn_cms ve_cms biasn_mm_s2 biase_mm_s2]=[%ld %ld %ld %ld %ld %ld]\r\n",
+         (long)(north_m * 100.0f),
+         (long)(east_m * 100.0f),
+         (long)(north_vel_mps * 100.0f),
+         (long)(east_vel_mps * 100.0f),
+         (long)(accel_bias_north_mps2 * 1000.0f),
+         (long)(accel_bias_east_mps2 * 1000.0f));
+}
+
 void Telemetry_PrintVertEkfState(uint8_t healthy,
                                  float height_m,
                                  float climb_rate_mps,
@@ -350,9 +366,11 @@ void Telemetry_PrintAltholdState(uint8_t holding,
                                  float climb_error_mps,
                                  int32_t trim_us,
                                  int32_t damp_us,
-                                 float hover_throttle_us)
+                                 float hover_throttle_us,
+                                 uint16_t stick_ref_us,
+                                 uint8_t stick_dormant)
 {
-  printf("ALTHOLD[hold auth target_cm fused_cm setpt_cms err_cms trim_us damp_us hover_us]=[%u %u %ld %ld %ld %ld %ld %ld %ld]\r\n",
+  printf("ALTHOLD[hold auth target_cm fused_cm setpt_cms err_cms trim_us damp_us hover_us ref_us dorm]=[%u %u %ld %ld %ld %ld %ld %ld %ld %u %u]\r\n",
          (unsigned int)holding,
          (unsigned int)authority_active,
          (long)(target_alt_m * 100.0f),
@@ -361,7 +379,9 @@ void Telemetry_PrintAltholdState(uint8_t holding,
          (long)(climb_error_mps * 100.0f),
          (long)trim_us,
          (long)damp_us,
-         (long)hover_throttle_us);
+         (long)hover_throttle_us,
+         (unsigned int)stick_ref_us,
+         (unsigned int)stick_dormant);
 }
 
 void Telemetry_PrintGpsState(uint8_t configured,

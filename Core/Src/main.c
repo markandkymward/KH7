@@ -173,15 +173,25 @@ int main(void)
          (unsigned long)g_reset_cause_flags);
 
   App_Init();
-  /* IWDG disabled again 2026-08-20: re-enabling it to stop losing crash data to
-   * manual power-cycles reintroduced the exact hazard it was originally disabled
-   * for - a main-loop hang leaves the aircraft fully unresponsive (including to
-   * disarm) for up to the 4.0s reload period, then forces an uncontrolled
-   * full-system reset in the air, which is worse than the hang alone. The
-   * underlying cause of the hang itself is still unfixed; don't re-enable this
-   * until that's found - RAM_D3 fault_record.h/blackbox already capture
-   * HardFault-class crashes without needing the watchdog at all. */
-  /* MX_IWDG1_Init(); */
+  /* RE-ENABLED 2026-09-06 (deliberately, for diagnostic test flights only - see
+   * watchdog_disabled.md for the full back-and-forth history). Was disabled
+   * 2026-08-20 because a hang left the aircraft unresponsive for up to the
+   * 4.0s reload period before an uncontrolled reset - worse than the hang
+   * alone, for NORMAL flying. Tonight's incidents (multiple full hangs, RC
+   * unresponsive despite a good link) produced ZERO HardFault-class crash
+   * records across several confirmed hangs and their following power cycles -
+   * strong evidence these are plain main-loop livelocks/blocking calls, not
+   * CPU exceptions, so Fault_ReportAndHalt() never even runs for them. A
+   * livelock with the IWDG disabled can ONLY be recovered by a full battery
+   * pull, which also erases RAM_D3 (fault_record.h's LoopBreadcrumb_t)
+   * before it can ever be read. Re-enabling this is what makes that
+   * breadcrumb useful at all: a livelock now self-resets within ~4s (power
+   * stays applied - RAM_D3 and the breadcrumb survive), instead of hanging
+   * forever with no way to recover the data. This is an explicit, informed
+   * tradeoff for a deliberate diagnostic session, not a decision that this
+   * is now safe for normal flying - re-evaluate before treating it as the
+   * default. */
+  MX_IWDG1_Init();
 
   /* USER CODE END 2 */
 
@@ -193,7 +203,7 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     App_Update();
-    /* HAL_IWDG_Refresh(&hiwdg1); */ /* IWDG disabled - see note above MX_IWDG1_Init() */
+    HAL_IWDG_Refresh(&hiwdg1);
   }
   /* USER CODE END 3 */
 }

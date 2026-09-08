@@ -767,6 +767,26 @@ void CDC_ProcessCommandLine(const char *line)
     return;
   }
 
+  if (strcmp(line, "LEVEL TRIM SAVE") == 0)
+  {
+    float active_roll_deg;
+    float active_pitch_deg;
+
+    if (App_GetActiveLevelTrim(&active_roll_deg, &active_pitch_deg) == 0U)
+    {
+      printf("LEVEL_TRIM_SAVE[FAIL_NOT_CAPTURED_YET]\r\n");
+      return;
+    }
+    if (App_SaveLevelTrim(active_roll_deg, active_pitch_deg) == 0U)
+    {
+      printf("LEVEL_TRIM_SAVE[FAIL]\r\n");
+      return;
+    }
+    printf("LEVEL_TRIM_SAVE[OK roll=%.2f pitch=%.2f]\r\n",
+           (double)active_roll_deg, (double)active_pitch_deg);
+    return;
+  }
+
   if (strcmp(line, "ALTHOLD SAVE") == 0)
   {
     if (App_SaveAltholdSettings() == 0U)
@@ -836,6 +856,18 @@ void CDC_ProcessCommandLine(const char *line)
     /* Read-only: RC channel 7 (hi=on, lo=off) is the sole control for this flag now -
      * no command can set it, only query the current confirmed state. */
     App_PrintArmedTelemetryStatus();
+    return;
+  }
+
+  if (strcmp(line, "RESET STATUS") == 0)
+  {
+    App_PrintResetStatus();
+    return;
+  }
+
+  if (strcmp(line, "TEST HANG") == 0)
+  {
+    App_RequestTestHang();
     return;
   }
 

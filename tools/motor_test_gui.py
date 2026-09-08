@@ -67,6 +67,9 @@ MAG_CAL_STATUS_RE = re.compile(
     r"wxx=(-?\d*\.?\d+) wyy=(-?\d*\.?\d+) wzz=(-?\d*\.?\d+) "
     r"wxy=(-?\d*\.?\d+) wxz=(-?\d*\.?\d+) wyz=(-?\d*\.?\d+)\]"
 )
+LEVEL_TRIM_SAVE_RE = re.compile(
+    r"LEVEL_TRIM_SAVE\[(OK|FAIL|FAIL_NOT_CAPTURED_YET)(?: roll=(-?\d*\.?\d+) pitch=(-?\d*\.?\d+))?\]"
+)
 NAV_LINE_RE = re.compile(
     r"NAV\[valid ref reason fix sats hacc_cm age_ms upd_ms cv ci dup rej drop\]=\["
     r"(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(-?\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\]"
@@ -703,6 +706,22 @@ class Kh7GroundGui:
             row=8, column=4, columnspan=2, sticky="w", padx=(10, 4), pady=(0, 4)
         )
         self._redraw_mag_cal_coverage()
+
+        # Persistent level-trim (2026-09-05) - see app.c's APP_LEVEL_TRIM_FLASH_*
+        # comment for why this exists: rest the aircraft on a KNOWN LEVEL surface,
+        # confirm Pitch/Roll above read close to 0, then click this to persist that
+        # as the board's permanent zero reference (survives power cycles) instead
+        # of re-measuring it fresh - and possibly wrong - every single boot.
+        self.level_trim_button = ttk.Button(
+            sensor_box, text="Save Level Trim", command=self.level_trim_save
+        )
+        self.level_trim_button.grid(row=9, column=0, columnspan=2, sticky="we", padx=(10, 4), pady=(4, 2))
+        self.level_trim_status_var = tk.StringVar(
+            value="Rest on a level surface, confirm Pitch/Roll above read ~0, then save."
+        )
+        ttk.Label(sensor_box, textvariable=self.level_trim_status_var, foreground="#9aa6b2", wraplength=320).grid(
+            row=9, column=2, columnspan=4, sticky="w", padx=(4, 4), pady=(4, 2)
+        )
         self._make_collapsible(sensor_box, "Sensor Health")
 
         # Layout mirrors the field tester display: one prominent GPS status line
@@ -2935,6 +2954,17 @@ class Kh7GroundGui:
                 self.mag_cal_status_var.set("Compass cal: not calibrated")
             return
 
+        m_level_trim_save = LEVEL_TRIM_SAVE_RE.search(line)
+        if m_level_trim_save is not None:
+            result, roll, pitch = m_level_trim_save.groups()
+            if result == "OK":
+                self.level_trim_status_var.set(f"Saved (roll={roll} pitch={pitch}) - persists across power cycles.")
+            elif result == "FAIL_NOT_CAPTURED_YET":
+                self.level_trim_status_var.set("Failed - wait for attitude zero to finish capturing, then retry.")
+            else:
+                self.level_trim_status_var.set("Failed - board may be too far from level (>10deg) or armed.")
+            return
+
         m_mag_cal_fail = MAG_CAL_FAIL_RE.search(line)
         if m_mag_cal_fail is not None:
             reason = m_mag_cal_fail.group(1)
@@ -3292,6 +3322,10 @@ class Kh7GroundGui:
 
     def att_read(self) -> None:
         self.send_command("ATT GET")
+
+    def level_trim_save(self) -> None:
+        self.send_command("LEVEL TRIM SAVE")
+        self.level_trim_status_var.set("Saving...")
 
     def mag_cal_toggle(self) -> None:
         if not self.mag_cal_active:

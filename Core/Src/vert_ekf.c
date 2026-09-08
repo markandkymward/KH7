@@ -75,10 +75,46 @@
  * reference (a tape measure, or whichever range sensor isn't near its own limit at
  * that height). If it moves the wrong way, negate ALL FOUR arm constants together
  * (they share one convention) rather than re-deriving the geometry from scratch. */
-#define VERT_EKF_LIDAR_ARM_X_M    0.0990f   /* 140mm at 45deg, left-FORWARD -> +X */
-#define VERT_EKF_LIDAR_ARM_Y_M   -0.0990f   /* left -> -Y */
-#define VERT_EKF_SONAR_ARM_X_M   -0.0566f   /* 80mm at 45deg, left-AFT -> -X */
-#define VERT_EKF_SONAR_ARM_Y_M   -0.0566f   /* left -> -Y */
+/* CORRECTED 2026-09-05 (real mounting confirmed directly by the person who
+ * built the airframe, not re-measured/re-derived): LIDAR sits on the
+ * forward-RIGHT arm, NOT left-forward as previously assumed - the Y-arm term
+ * for lidar had the WRONG SIGN this entire time, pushing every roll-driven
+ * lever-arm correction the wrong direction instead of canceling it (a real,
+ * previously-unknown contributor to the fused-height error, on top of the
+ * separately-found-and-fixed AHRS/roll-extraction issues - every bench test
+ * tonight exercised roll heavily). SONAR's left-AFT direction was already
+ * correct, only the magnitude changes.
+ *
+ * LIDAR value replaced 2026-09-05, twice. First pass: string-suspended the
+ * airframe at a fixed, known height (a true rigid pivot), captured
+ * raw_range+attitude at a pure-roll hold and a pure-pitch hold, and SOLVED the
+ * resulting 2x2 linear system (raw*gz - (arm_x*gx+arm_y*gy) = h_true) exactly
+ * for arm_x/arm_y -> 84.5mm/27.3mm. That fit both calibration points with zero
+ * error by construction (2 equations, 2 unknowns) and looked good on a 3rd,
+ * independent validation hold too (0.29cm error, vs 2.28cm for the old 49.5/
+ * 49.5mm ruler guess) - but a since-taken DIRECT physical measurement (calipers,
+ * FC IMU chip to lidar optical aperture) came back 60mm forward / 47mm right,
+ * meaningfully different in both magnitude AND angle from the solved value.
+ * Trusting the direct measurement over the 2-point fit (an exact fit to only 2
+ * equations can silently absorb unrelated errors instead of reflecting real
+ * geometry) - re-checked against all 3 bench points and it does consistently
+ * better than the old 49.5/49.5mm assumption at every one, though a small
+ * residual (~0.7-1.7cm, growing with tilt) remains unexplained by lever-arm
+ * alone. That residual is NOT chased further here - see
+ * kh7-vertekf-tilt-divergence memory for the full session history (angle-scale
+ * and rate-reject investigations) if revisiting.
+ *
+ * SONAR value also replaced 2026-09-05 with the same direct caliper measurement
+ * (FC IMU chip to sonar transducer face) as lidar above: -45mm forward(X) /
+ * -75.5mm right(Y) - i.e. left-AFT, confirming the direction already assumed,
+ * but a meaningfully larger magnitude (~88mm) than the old 49.5/49.5mm ruler
+ * guess. NOT independently bench-validated the way lidar's value was (no
+ * string-suspension calibration run against sonar specifically this session) -
+ * trusted on measurement accuracy alone. */
+#define VERT_EKF_LIDAR_ARM_X_M    0.060f    /* measured 2026-09-05, see comment above */
+#define VERT_EKF_LIDAR_ARM_Y_M    0.047f    /* measured 2026-09-05, see comment above */
+#define VERT_EKF_SONAR_ARM_X_M   -0.045f    /* measured 2026-09-05, see comment above */
+#define VERT_EKF_SONAR_ARM_Y_M   -0.0755f   /* measured 2026-09-05, see comment above */
 
 /* --- Ground-effect R scheduling --- */
 #define VERT_EKF_ROTOR_DIAMETER_M            0.127f  /* 5-inch props */
@@ -100,8 +136,24 @@
  * characterization - see kh7-baro-hover-noise-characterization memory (~5-7cm std
  * observed). Squared for variance. */
 #define VERT_EKF_BARO_R_BASE_M2               (0.06f * 0.06f)
-#define VERT_EKF_LIDAR_R_BASE_M2              (0.03f * 0.03f)
-#define VERT_EKF_SONAR_R_BASE_M2              (0.02f * 0.02f)
+/* Lowered 4x (2026-09-05) - a dedicated diagnostic (tools/lidar_tilt_check.py)
+ * proved the raw LUNA/sonar readings, tilt-compensated with nothing but the
+ * plain geometry formula (no Kalman filtering at all), already track true
+ * height smoothly and stay well-bounded during fast hand-held tilting - while
+ * VertEkf's actual fused output swings wildly around that same clean signal
+ * on the SAME capture (see kh7_vertekf_tilt_divergence_2026_09_05 memory).
+ * That isolates the extra error to this filter's own predict/correct
+ * balance, not the sensor or attitude chain (both already separately fixed
+ * and confirmed correct this session). Two earlier attempts to fix this by
+ * RAISING process noise (Q) were tried and reverted - Q widens the general
+ * uncertainty band, which also amplifies ordinary measurement noise, and
+ * didn't help. Lowering R instead directly increases trust in fresh range
+ * corrections without that side effect - a different, not-yet-tried lever.
+ * NOT YET bench-validated at these values - re-run the same hand-held tilt
+ * test (bare fused-vs-LUNA metric AND tools/lidar_tilt_check.py side by
+ * side) before trusting this further. */
+#define VERT_EKF_LIDAR_R_BASE_M2              (0.015f * 0.015f)
+#define VERT_EKF_SONAR_R_BASE_M2              (0.01f * 0.01f)
 /* Baro-vs-range cross-check (2026-08-29, added after offline replay against
  * sdlog_raw_20260825_213713.txt - see kh7-baro-liftoff-transient memory -
  * showed the ~2-3s liftoff baro transient pulling fused height down ~2m 1:1.
@@ -164,6 +216,24 @@
  * angle away again. */
 #define VERT_EKF_SONAR_TILT_REJECT_GZ_MIN     0.9537f
 
+/* LIDAR rate-based reject - TRIED AND REVERTED 2026-09-05, same night. Motivated by
+ * a real finding (once the arm-offset calibration above was corrected, STATIC holds
+ * at any tilt up to 35-40deg matched true height to ~1-3cm, but continuous rotation
+ * through the same angles read up to ~20cm low, tracking rotation RATE rather than
+ * tilt angle). The reject-gate itself worked as designed in isolation (confirmed via
+ * telemetry: it correctly held the last value during a sustained high-rate window).
+ * But it created a dangerous COMPOUND failure with the rest of this function: if a
+ * single bad reading landed right as rate crossed the threshold, the gate would
+ * FREEZE that bad value for the entire high-rate window (up to ~1s, not one sample)
+ * instead of just skipping updates - and the frozen bad value then fed the
+ * sensor-vs-sensor cross-check below, which could mistakenly penalize the OTHER
+ * (correct) sensor for "disagreeing" with the stale frozen one. Confirmed on a bench
+ * capture: fused height dove to -128cm during exactly this sequence. A rate-based
+ * gate for lidar may still be worth revisiting, but needs a design that doesn't let
+ * a frozen last-value interact with the cross-check this way - e.g. actively
+ * invalidating (not just declining to update) the cross-check reference while
+ * rejected, not just leaving old data in place. Not re-attempted this session. */
+
 #define VERT_EKF_LIDAR_MAX_RANGE_M            8.0f
 #define VERT_EKF_LIDAR_FADE_START_M           7.0f
 #define VERT_EKF_LIDAR_FADE_R_GAIN            20.0f
@@ -185,9 +255,141 @@
  * could see and feel). */
 #define VERT_EKF_CROSSCHECK_R_PENALTY         8.0f
 
+/* Per-sensor self-consistency check (2026-09-07) - a real flight
+ * (tools/flight_20260907_fullpack_retest2.txt) showed sonar_h_cm jump
+ * 14->178cm and 11->142cm within ~120ms (lidar tracked normally through
+ * both), producing large climb_rate_error_mps spikes that fed straight into
+ * ALTHOLD's trim/damp terms and were felt by the pilot as a growing
+ * position-hold oscillation. The cross-check above didn't catch either
+ * spike because its r-vs-r tie-break trusts whichever sensor's OWN
+ * (temporal-median-based, ESP32-side) confidence metric looks better at that
+ * instant - and a multipath/UART-glitch sample can still score a deceptively
+ * good confidence there. This check is independent of that metric: it only
+ * asks whether THIS reading is physically plausible given THIS SAME
+ * sensor's own immediately-prior reading and the elapsed time (bounded by a
+ * generous max rate) - a question the cross-check's r-comparison never asks.
+ *
+ * Deliberately NOT the same shape as the 2026-09-05 "per-sensor median-of-3"
+ * attempt below, which was reverted for its interaction with a rate-reject
+ * gate that FROZE stale values and poisoned the cross-check with a stale
+ * reference (see that comment). This check never freezes anything: it only
+ * inflates the CURRENT reading's own r (so the cross-check below is more
+ * likely to correctly side with the other sensor), then still stores the
+ * true new value/inflated r as usual - so a genuinely sustained bad run
+ * still eventually looks "self-consistent" again next sample (same accepted
+ * limitation as the reverted attempt), but a truly isolated glitch can no
+ * longer masquerade as trustworthy. */
+#define VERT_EKF_SELFCHECK_MAX_RATE_MPS       4.0f   /* generous - above ALTHOLD's own 2.0 m/s cap */
+#define VERT_EKF_SELFCHECK_FLOOR_M            0.15f  /* covers arm/tilt-projection noise + short-dt jitter */
+#define VERT_EKF_SELFCHECK_MAX_AGE_MS         500U   /* beyond this, too stale to judge plausibility - skip */
+#define VERT_EKF_SELFCHECK_R_PENALTY          8.0f
+
+/* Baro-rate cross-check (2026-09-07, "first pass" at the Kalman internals) -
+ * closes a real gap the self-check/cross-check above can't: a CORRELATED
+ * fault where lidar and sonar drop together (real flight,
+ * tools/flight_20260907_postrollover_test.txt, t~46.7s: lidar 42->5cm and
+ * sonar 46->0cm within the same ~120ms). Each sensor's own jump individually
+ * sat just under VERT_EKF_SELFCHECK_MAX_RATE_MPS (picked generously to avoid
+ * rejecting real aircraft motion up to ~4m/s, and real flight data elsewhere
+ * this same night showed legitimate climbs up to 3.63m/s - the glitch and
+ * real-motion magnitudes genuinely overlap on THIS airframe, so no single
+ * rate threshold on either sensor's own history can cleanly separate them),
+ * and since both sensors agreed with EACH OTHER, the existing lidar-vs-sonar
+ * cross-check saw no disagreement to flag either.
+ *
+ * Baro is physically independent of both (pressure, not light/sound
+ * time-of-flight), so a correlated optical/acoustic glitch can't also fool
+ * it. Deliberately compares RATES (this range sensor's own implied-height
+ * delta since ITS last reading vs baro's independently-computed climb rate)
+ * rather than absolute heights - an early draft compared absolute baro
+ * altitude against range and produced hundreds of false positives per
+ * flight (tested against real captures before writing this), because raw
+ * baro altitude can carry a large, slowly-settling absolute offset early in
+ * a flight that has nothing to do with sensor health. Climb rate has no
+ * such offset problem.
+ *
+ * Gated to clear of ground effect (same VERT_EKF_GROUND_EFFECT_ZONE_M this
+ * file already uses for baro's own R scheduling) - baro's rate is
+ * known-unreliable close to the ground under thrust (propwash), which is
+ * also where genuine liftoff/landing bounces produce real fast height
+ * changes that would otherwise look exactly like the correlated-fault
+ * pattern this check targets. Restricting to clear-air hover/cruise is
+ * exactly where the real bug reproduced anyway (~40-50cm, well above the
+ * ~25cm ground-effect zone).
+ *
+ * Same bounded-penalty pattern as every other check in this file (inflates
+ * r, never rejects/freezes) - not a comparison against this filter's own
+ * state (g_x[0]/g_x[1]), so it does not carry the self-reinforcing-lockout
+ * risk that sank the two earlier g_x[0]-based attempts (see the REVERTED
+ * comment below): baro's rate is recomputed fresh from its own independent
+ * filter every call, with no memory of this filter's history, so it cannot
+ * get more "confident" over time in a shared wrong belief.
+ *
+ * FIRST PASS, offline-validated against three real flights before writing
+ * (rate-disagreement clustered at 300-400+cm/s for the known-bad events,
+ * clean separation from normal flight) but NOT YET flight-tested at these
+ * exact threshold values - treat as a starting point, not a final tuning. */
+#define VERT_EKF_BARO_RATE_CROSSCHECK_MAX_MPS     3.0f
+#define VERT_EKF_BARO_RATE_CROSSCHECK_MAX_AGE_MS  150U
+#define VERT_EKF_BARO_RATE_CROSSCHECK_R_PENALTY   8.0f
+
+/* Per-sensor median-of-3 outlier filter - TRIED AND REVERTED 2026-09-05, same
+ * night, alongside the rate-reject gate above. Was meant to catch an isolated
+ * corrupted single sample (implied ~1-3cm sandwiched between clean ~143cm
+ * readings - raw LUNA telemetry was clean on both sides of it, pointing at UART
+ * noise or a parsing edge case between the ESP32 and FC rather than the sensor
+ * itself; that text protocol has no checksum, unlike the raw TF-Luna frame).
+ * Deliberately compared each new reading against that SAME sensor's own last 2
+ * raw readings, never against the filter's own state - correctly avoided the
+ * lockout risk a same-night g_x[0]-based attempt had. But a median-of-3 can only
+ * ever catch a TRULY isolated single bad sample - it does nothing against a
+ * SUSTAINED run of bad values, which is exactly what the rate-reject gate above
+ * turned an isolated glitch into (freezing it for up to ~1s instead of one
+ * sample). Reverted together with that gate rather than kept on its own,
+ * since the interaction between the two was the actual danger, not either one
+ * in isolation. The original isolated-glitch symptom remains unfixed - see the
+ * rate-reject comment above for the design constraint any future attempt at
+ * either needs to respect. */
+
 /* --- Process noise --- */
+/* Tried raising 0.5f -> 3.0f (2026-09-05) to make the filter distrust its own
+ * accel-only prediction more between range corrections, on the theory that a
+ * hand-held bench test's ~70cm fused-height divergence during fast tilts was
+ * partly caused by the Kalman gain under-weighting fresh LUNA/baro
+ * measurements. REVERTED same night - flashed and bench-tested against the
+ * identical tilt test: made every error metric WORSE (mean 12.9->17.8cm,
+ * median 4.0->8.0cm, p90 38.5->52.0cm, max 67.5->97.0cm) instead of better.
+ * Higher process noise does increase the Kalman gain as intended, but it also
+ * widens the filter's own uncertainty band between corrections, letting
+ * ordinary measurement noise (not just predict-error) swing the fused output
+ * more - net effect here was negative. The real fix for the tilt-divergence
+ * problem turned out to be upstream, in attitude.c's AHRS trust-gating (see
+ * ATTITUDE_GYRO_TRUST_MIN_RATE_DPS's comment) - this constant was never
+ * actually the right lever. Left at its original 0.5 value; if revisited,
+ * treat this specific hypothesis as already tested and disproven, not
+ * untried. */
 #define VERT_EKF_ACCEL_NOISE_MPS2             0.5f     /* untuned starting point */
 #define VERT_EKF_BIAS_RW_MPS2_PER_S2          0.0004f  /* slow, deliberately small drift rate */
+
+/* Gyro-rate-scaled process noise - TRIED AND REVERTED (2026-09-05, same
+ * night). Motivated by a real, isolated finding: reconstructing implied
+ * height offline from raw LUNA + the correct telemetered attitude (already
+ * fixed by then) still disagreed with this filter's actual fused output
+ * specifically during fast tilting, suggesting the accel-only prediction
+ * lags reality when the vehicle rotates fast (a real, physically-motivated
+ * theory - a physical IMU senses genuine centripetal/tangential specific
+ * force from not being exactly at the rotation center, which the simple
+ * vertical-accel projection can't distinguish from a real climb). The fix
+ * inflated process noise above 60deg/s of rotation to make the Kalman gain
+ * lean harder on range/baro corrections when the prediction is least
+ * trustworthy. REVERTED after bench-testing: isolating just the large-tilt
+ * (>15deg) samples showed mean=10.3cm/median=4.8cm/max=56.3cm, statistically
+ * indistinguishable from pre-change large-tilt runs (mean 5-12cm, max
+ * 21-42cm) - no demonstrated improvement, just added complexity. Given how
+ * much run-to-run variance hand-held bench testing has, this specific
+ * mechanism was never actually validated as helping - if revisited, it
+ * needs a more repeatable test rig (not hand-tilting) to get a clean
+ * before/after signal, not another guess at threshold values. */
 
 /* Accel-magnitude outlier clamp (2026-08-30) - real flight telemetry
  * (liftoff_capture_20260830_velgate.txt) showed a single decimated print
@@ -248,9 +450,17 @@ static uint8_t g_gps_divergence_fault = 0U;
 static float g_lidar_last_implied_height_m = 0.0f;
 static float g_lidar_last_r = 0.0f;
 static uint32_t g_lidar_last_update_ms = 0U;
+
 static float g_sonar_last_implied_height_m = 0.0f;
 static float g_sonar_last_r = 0.0f;
 static uint32_t g_sonar_last_update_ms = 0U;
+
+/* Baro's own independently-computed climb rate, for the range self-check's
+ * baro-rate cross-check above - see VERT_EKF_BARO_RATE_CROSSCHECK_R_PENALTY's
+ * comment. Populated by VertEkf_UpdateBaro() every healthy call, not tied to
+ * this filter's own g_x state. */
+static float g_baro_last_climb_rate_mps = 0.0f;
+static uint32_t g_baro_rate_update_ms = 0U;
 
 void VertEkf_Init(void)
 {
@@ -286,6 +496,7 @@ void VertEkf_Reset(void)
 
   g_lidar_last_update_ms = 0U;
   g_sonar_last_update_ms = 0U;
+  g_baro_rate_update_ms = 0U;
 }
 
 void VertEkf_Predict(float accel_up_mps2, float dt_s)
@@ -378,6 +589,8 @@ static void VertEkf_ScalarHeightUpdate(float z, float R)
   float innovation;
   float S;
   float K[3];
+  float M[3][3];
+  float MP[3][3];
   int i;
   int j;
 
@@ -405,13 +618,37 @@ static void VertEkf_ScalarHeightUpdate(float z, float R)
   g_x[1] += K[1] * innovation;
   g_x[2] += K[2] * innovation;
 
-  /* P = (I - K*H)*P simplifies to P[i][j] -= K[i]*P[0][j] when H=[1,0,0] - no need
-   * for a general matrix subtract. */
+  /* Joseph-form covariance update (2026-09-07) - replaces the old
+   * P -= K*H*P shorthand. Both are exactly equivalent in infinite-precision
+   * arithmetic for the true optimal gain, but the shorthand can let P drift
+   * asymmetric or lose positive-definiteness under float32 rounding after
+   * enough updates over a long flight; Joseph form (P = (I-KH)P(I-KH)^T +
+   * KRK^T) stays PSD by construction - it's a congruence transform plus a
+   * positive-semi-definite outer product - regardless of any rounding error
+   * already sitting in K or P. Cheap insurance for a 3x3: a handful of extra
+   * flops for a failure mode that's otherwise invisible from the outside (P
+   * still looks like a covariance matrix right up until it silently isn't).
+   * M = I-K*H with H=[1,0,0] is just I with column 0 replaced by
+   * [1-K0,-K1,-K2]^T - hand-expanded the same way Predict() hand-expands
+   * F*P*F^T, not a generic matmul helper (see this file's top-of-file design
+   * comment for why). */
+  M[0][0] = 1.0f - K[0]; M[0][1] = 0.0f; M[0][2] = 0.0f;
+  M[1][0] = -K[1];       M[1][1] = 1.0f; M[1][2] = 0.0f;
+  M[2][0] = -K[2];       M[2][1] = 0.0f; M[2][2] = 1.0f;
+
   for (i = 0; i < 3; i++)
   {
     for (j = 0; j < 3; j++)
     {
-      g_P[i][j] -= K[i] * g_P[0][j];
+      MP[i][j] = (M[i][0] * g_P[0][j]) + (M[i][1] * g_P[1][j]) + (M[i][2] * g_P[2][j]);
+    }
+  }
+  for (i = 0; i < 3; i++)
+  {
+    for (j = 0; j < 3; j++)
+    {
+      g_P[i][j] = (MP[i][0] * M[j][0]) + (MP[i][1] * M[j][1]) + (MP[i][2] * M[j][2])
+                  + (K[i] * R * K[j]);
     }
   }
 }
@@ -423,6 +660,7 @@ static void VertEkf_ScalarHeightUpdate(float z, float R)
  * a borderline 2-sigma disagreement still gets the same treatment as before, but a
  * blatant 27-sigma one (an obviously faulty reading, not a marginal call) gets
  * inflated by a proportionally enormous amount instead of the same fixed 8x. */
+
 static float VertEkf_CrossCheckPenalty(float disagreement, float combined_sigma,
                                         float sigma_mult, float base_penalty)
 {
@@ -438,7 +676,8 @@ static float VertEkf_CrossCheckPenalty(float disagreement, float combined_sigma,
   return base_penalty * excess_ratio * excess_ratio;
 }
 
-void VertEkf_UpdateBaro(float raw_alt_m, uint8_t baro_healthy, float motor_power_delta_us)
+void VertEkf_UpdateBaro(float raw_alt_m, uint8_t baro_healthy, float motor_power_delta_us,
+                        float baro_climb_rate_mps)
 {
   float thrust_factor;
   float height_factor;
@@ -449,6 +688,13 @@ void VertEkf_UpdateBaro(float raw_alt_m, uint8_t baro_healthy, float motor_power
   {
     return;
   }
+
+  /* Stored regardless of where in this function we end up returning from below -
+   * see VERT_EKF_BARO_RATE_CROSSCHECK_R_PENALTY's comment. This is baro's own
+   * independently-filtered rate (baro.c), not anything derived from this EKF's
+   * own state. */
+  g_baro_last_climb_rate_mps = baro_climb_rate_mps;
+  g_baro_rate_update_ms = HAL_GetTick();
 
   thrust_factor = motor_power_delta_us / VERT_EKF_GROUND_EFFECT_THRUST_REF_US;
   if (thrust_factor < 0.0f) { thrust_factor = 0.0f; }
@@ -635,6 +881,63 @@ void VertEkf_UpdateRange(float raw_range_cm, float confidence, uint8_t is_lidar,
     r *= (1.0f + (fade_r_gain * fade_shape));
   }
 
+  /* Per-sensor self-consistency check - see VERT_EKF_SELFCHECK_R_PENALTY's
+   * declaration comment for the real flight that motivated this and why it's
+   * safe against the danger that sank the 2026-09-05 attempt (never freezes
+   * a value, only inflates this reading's own r before the cross-check
+   * below runs). Reads this sensor's OWN last stored reading BEFORE it gets
+   * overwritten at the end of this function. */
+  {
+    float own_last_height = is_lidar ? g_lidar_last_implied_height_m : g_sonar_last_implied_height_m;
+    uint32_t own_last_ms = is_lidar ? g_lidar_last_update_ms : g_sonar_last_update_ms;
+
+    if (own_last_ms != 0U)
+    {
+      uint32_t own_age_ms = now_ms - own_last_ms;
+      if (own_age_ms < VERT_EKF_SELFCHECK_MAX_AGE_MS)
+      {
+        float own_dt_s = ((float)own_age_ms) * 0.001f;
+        float max_plausible_delta_m = VERT_EKF_SELFCHECK_FLOOR_M +
+                                       (VERT_EKF_SELFCHECK_MAX_RATE_MPS * own_dt_s);
+        float own_disagreement = fabsf(implied_height_m - own_last_height);
+        if (own_disagreement > max_plausible_delta_m)
+        {
+          r *= VertEkf_CrossCheckPenalty(own_disagreement, max_plausible_delta_m, 1.0f,
+                                          VERT_EKF_SELFCHECK_R_PENALTY);
+        }
+      }
+    }
+  }
+
+  /* Baro-rate cross-check - see VERT_EKF_BARO_RATE_CROSSCHECK_R_PENALTY's
+   * declaration comment for the correlated-fault this catches and why rate
+   * (not absolute height) is compared. Gated clear of ground effect - baro's
+   * rate is known-unreliable there, and so is a real bounce, which would
+   * otherwise look like exactly the fault this targets. */
+  if (g_x[0] > VERT_EKF_GROUND_EFFECT_ZONE_M)
+  {
+    float own_last_height = is_lidar ? g_lidar_last_implied_height_m : g_sonar_last_implied_height_m;
+    uint32_t own_last_ms = is_lidar ? g_lidar_last_update_ms : g_sonar_last_update_ms;
+    uint32_t baro_age_ms = now_ms - g_baro_rate_update_ms;
+
+    if ((own_last_ms != 0U) && (g_baro_rate_update_ms != 0U) &&
+        (baro_age_ms < VERT_EKF_BARO_RATE_CROSSCHECK_MAX_AGE_MS))
+    {
+      uint32_t own_age_ms = now_ms - own_last_ms;
+      if ((own_age_ms > 0U) && (own_age_ms < VERT_EKF_SELFCHECK_MAX_AGE_MS))
+      {
+        float own_dt_s = ((float)own_age_ms) * 0.001f;
+        float implied_rate_mps = (implied_height_m - own_last_height) / own_dt_s;
+        float rate_disagreement = fabsf(implied_rate_mps - g_baro_last_climb_rate_mps);
+        if (rate_disagreement > VERT_EKF_BARO_RATE_CROSSCHECK_MAX_MPS)
+        {
+          r *= VertEkf_CrossCheckPenalty(rate_disagreement, VERT_EKF_BARO_RATE_CROSSCHECK_MAX_MPS,
+                                          1.0f, VERT_EKF_BARO_RATE_CROSSCHECK_R_PENALTY);
+        }
+      }
+    }
+  }
+
   /* Cross-validate against the OTHER range sensor's still-recent reading in the
    * 0-3m overlap band (per spec) - if they disagree beyond ~2-sigma combined,
    * penalize whichever ONE disagrees more with the filter's own current
@@ -689,9 +992,24 @@ void VertEkf_UpdateRange(float raw_range_cm, float confidence, uint8_t is_lidar,
       float disagreement = fabsf(implied_height_m - other_height);
       if (disagreement > (VERT_EKF_CROSSCHECK_SIGMA_MULT * combined_sigma))
       {
-        float this_err = fabsf(implied_height_m - g_x[0]);
-        float other_err = fabsf(other_height - g_x[0]);
-        if (this_err > other_err)
+        /* Tie-break on which sensor's OWN pre-penalty variance (r) is worse,
+         * NOT which one agrees more with g_x[0] (2026-09-06 fix, found via a
+         * real flight capture: TF-Luna read single-digit cm for several
+         * seconds while sonar and ground-truth rangefinder both agreed on
+         * 10-38cm, real tilt under 9 degrees throughout so this wasn't a
+         * projection-math error - the lidar reading was just genuinely bad).
+         * Comparing against g_x[0] is exactly the self-reinforcing-lockout
+         * pattern the comment below this block already identified and
+         * reverted elsewhere: once a bad sample pulls the filter state
+         * toward it, every SUBSEQUENT bad sample from the same sensor looks
+         * "close to what we believe" and passes unpenalized, while the
+         * good sensor's correct readings look "far from what we believe"
+         * and get penalized instead - defending the bad sensor and
+         * punishing the good one. r is a property of the sensor/reading
+         * itself (base noise, confidence, tilt-inflation, range-fade) and
+         * carries no memory of the filter's own possibly-wrong history, so
+         * it can't create the same lock. */
+        if (r > other_r)
         {
           r *= VertEkf_CrossCheckPenalty(disagreement, combined_sigma,
                                           VERT_EKF_CROSSCHECK_SIGMA_MULT,
@@ -700,6 +1018,24 @@ void VertEkf_UpdateRange(float raw_range_cm, float confidence, uint8_t is_lidar,
       }
     }
   }
+
+  /* REVERTED 2026-09-05, same session it was added: a self-consistency check against
+   * g_x[0] here creates a self-reinforcing lockout - if the filter's OWN state is
+   * ever wrong (e.g. cold-start at 0 while true height is 140cm), every subsequent
+   * CORRECT reading "disagrees" with that wrong state and gets penalized, so the
+   * filter can never correct itself. Confirmed on a bench capture: fused_h stayed
+   * locked at -9..+8cm for a full 30s capture while raw lidar correctly read
+   * ~140-155cm on 95% of samples - the good readings were being rejected for
+   * disagreeing with the filter's own persistent mistake. A permanently-wrong
+   * altitude estimate is a flight-safety regression, far worse than the isolated
+   * ~100ms corrupted-sample glitch this was meant to fix. Do not re-add a check
+   * that compares a fresh measurement against the filter's OWN state as the sole
+   * gate - only compare against something independent (the other range sensor,
+   * as the existing cross-check above already does), or add an explicit
+   * "still uninitialized/settling" carve-out that this attempt didn't have. The
+   * original isolated-glitch symptom (see kh7-vertekf-tilt-divergence memory) is
+   * still unfixed - it was a small, rare, self-correcting bench artifact, not
+   * worth another attempt without a safer design. */
 
   /* Remember this reading for the OTHER sensor's cross-check on ITS next update -
    * stored after the check above so this reading never checks against itself. */

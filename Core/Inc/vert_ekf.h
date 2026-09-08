@@ -30,7 +30,8 @@ void VertEkf_Predict(float accel_up_mps2, float dt_s);
  * to Baro_Update() (g_avg_motor_power_delta_us in app.c) - used here to
  * inflate baro's measurement noise near the ground under thrust, on top of
  * (not instead of) the bias correction Baro_Update() already applies. */
-void VertEkf_UpdateBaro(float raw_alt_m, uint8_t baro_healthy, float motor_power_delta_us);
+void VertEkf_UpdateBaro(float raw_alt_m, uint8_t baro_healthy, float motor_power_delta_us,
+                        float baro_climb_rate_mps);
 
 /* Range sensor measurement update - call directly from the point a fresh
  * reading arrives (App_SetRangefinderCm()/App_SetLunaCm() in app.c), NOT

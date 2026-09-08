@@ -24,6 +24,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
+#include <stddef.h>
 #include "fault_record.h"
 #include "motors.h"
 /* USER CODE END Includes */
@@ -59,6 +60,115 @@ void UsageFault_HandlerC(uint32_t *stack_frame);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 extern UART_HandleTypeDef huart6;
+
+/* Flash-word-aligned (32-byte) page for writing FaultFlashBlob_t (fault_record.h)
+ * to FAULT_FLASH_ADDRESS via HAL_FLASH_Program(FLASH_TYPEPROGRAM_FLASHWORD, ...),
+ * same union-of-blob-plus-words pattern app.c uses for its own flash blobs
+ * (App_LevelTrimFlashPage_t etc). Local to this file - only this file programs
+ * flash for the fault record; app.c only ever reads/erases it. */
+typedef union
+{
+  FaultFlashBlob_t blob;
+  uint32_t words[16]; /* 64 bytes = 2 flash words, >= sizeof(FaultFlashBlob_t) (48 bytes) */
+} FaultFlashPage_t;
+
+_Static_assert(sizeof(FaultFlashBlob_t) <= sizeof(FaultFlashPage_t), "fault flash blob too large");
+
+#if defined(__GNUC__)
+#define FAULT_FLASHWORD_ALIGN __attribute__((aligned(32)))
+#else
+#define FAULT_FLASHWORD_ALIGN
+#endif
+
+/* Same CRC32 (poly 0xEDB88320, init/final 0xFFFFFFFF) as app.c's App_Crc32() -
+ * duplicated here (rather than shared) because App_Crc32() is static to app.c
+ * and this runs in a fault context where pulling in app.c's dependencies isn't
+ * worth it for one small function. Must stay bit-for-bit identical to
+ * App_Crc32() or App_ReportAndClearFaultRecord()'s CRC check will never pass. */
+static uint32_t Fault_Crc32(const uint8_t *data, size_t len)
+{
+  uint32_t crc = 0xFFFFFFFFUL;
+  size_t i;
+  uint8_t bit;
+
+  for (i = 0U; i < len; i++)
+  {
+    crc ^= (uint32_t)data[i];
+    for (bit = 0U; bit < 8U; bit++)
+    {
+      if ((crc & 1UL) != 0U)
+      {
+        crc = (crc >> 1U) ^ 0xEDB88320UL;
+      }
+      else
+      {
+        crc >>= 1U;
+      }
+    }
+  }
+
+  return ~crc;
+}
+
+/* Best-effort write of the same fault data to internal FLASH (survives a full
+ * power cycle, unlike the RAM_D3 record below) so the cause of a fault survives
+ * even a battery pull - the only way to stop a hang with no IWDG in this build.
+ * "Best effort": we're already committed to hanging forever right after this
+ * regardless of outcome, so on any HAL failure this just falls through to the
+ * hang exactly as before - no retries, no error reporting (this runs in a fault
+ * context where we can't fully trust things). A 1-2s blocking sector erase here
+ * is fine: the "don't block the control loop" rule elsewhere doesn't apply once
+ * we're already spinning in while(1) forever. */
+static void Fault_WriteFlashRecord(const char *name, uint32_t *stack_frame)
+{
+  FLASH_EraseInitTypeDef erase;
+  uint32_t sector_error = 0U;
+  uint32_t address;
+  FaultFlashPage_t FAULT_FLASHWORD_ALIGN page;
+  uint8_t write_index;
+
+  memset(&page, 0xFF, sizeof(page));
+  page.blob.magic = FAULT_FLASH_MAGIC;
+  page.blob.version = FAULT_FLASH_VERSION;
+  memset(page.blob.name, 0, sizeof(page.blob.name));
+  strncpy(page.blob.name, name, sizeof(page.blob.name) - 1U);
+  page.blob.pc = stack_frame[6];
+  page.blob.lr = stack_frame[5];
+  page.blob.cfsr = SCB->CFSR;
+  page.blob.hfsr = SCB->HFSR;
+  page.blob.mmfar = SCB->MMFAR;
+  page.blob.bfar = SCB->BFAR;
+  page.blob.crc32 = Fault_Crc32((const uint8_t *)&page.blob, offsetof(FaultFlashBlob_t, crc32));
+
+  if (HAL_FLASH_Unlock() != HAL_OK)
+  {
+    return;
+  }
+
+  memset(&erase, 0, sizeof(erase));
+  erase.TypeErase = FLASH_TYPEERASE_SECTORS;
+  erase.Banks = FLASH_BANK_2;
+  erase.Sector = FLASH_SECTOR_3;
+  erase.NbSectors = 1U;
+  erase.VoltageRange = FLASH_VOLTAGE_RANGE_3;
+
+  if (HAL_FLASHEx_Erase(&erase, &sector_error) == HAL_OK)
+  {
+    address = FAULT_FLASH_ADDRESS;
+    for (write_index = 0U; write_index < 2U; write_index++)
+    {
+      if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_FLASHWORD,
+                            address,
+                            (uint32_t)&page.words[write_index * 8U]) != HAL_OK)
+      {
+        break;
+      }
+      address += 32U;
+    }
+  }
+
+  (void)HAL_FLASH_Lock();
+}
 
 /* Reports fault registers over UART6 (bypassing all buffering) and persists them in
  * RAM_D3 (survives the IWDG reset that follows) so the next boot can report/log them
@@ -98,6 +208,10 @@ static void Fault_ReportAndHalt(const char *name, uint32_t *stack_frame)
    * force the motors to idle before we spin, otherwise they stay at whatever
    * PWM they were at the instant of the fault. */
   Motors_ForceIdleRegistersOnly();
+
+  /* Best-effort: survives even the full power cycle a truly hung, watchdog-less
+   * board can only be stopped with, which erases the RAM_D3 copy above. */
+  Fault_WriteFlashRecord(name, stack_frame);
 
   while (1)
   {

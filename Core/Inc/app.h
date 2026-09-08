@@ -48,6 +48,8 @@ uint8_t App_RequestAttitudeSetAndSave(const App_AttitudeGains_t *gains);
 void App_RequestAttitudeDefaults(void);
 void App_RequestAttitudeZero(void);
 void App_RequestMagCalStart(void);
+void App_RequestTestHang(void);
+void App_PrintResetStatus(void);
 void App_RequestMagCalStop(void);
 void App_GetPidCommandDebug(uint32_t *queued_count,
 							uint32_t *handled_count,
@@ -136,6 +138,16 @@ uint8_t App_SetBaroVzDampLimit(float limit_us);
  * call anytime (read-only, no erase) - called once at boot in App_Init(). */
 uint8_t App_LoadAltholdSettings(void);
 uint8_t App_SaveAltholdSettings(void);
+/* Persistent level-trim (roll/pitch zero reference) - see app.c's
+ * APP_LEVEL_TRIM_FLASH_* comment for why this exists. App_LoadLevelTrim() is
+ * called once from App_Init(); App_SaveLevelTrim() persists an explicit
+ * roll/pitch trim (refuses while armed or implausibly far from level).
+ * App_GetActiveLevelTrim() reads whichever trim is currently in effect (see
+ * its own doc comment in app.c) for the "LEVEL TRIM SAVE" USB command to
+ * persist. */
+uint8_t App_LoadLevelTrim(float *roll_trim_deg, float *pitch_trim_deg);
+uint8_t App_SaveLevelTrim(float roll_trim_deg, float pitch_trim_deg);
+uint8_t App_GetActiveLevelTrim(float *roll_deg, float *pitch_deg);
 
 /* Live-tunable outer loop for NAV_POSHOLD (2026-09-04 rewrite - replaces the old
  * separate NAVBRAKE mode + independent poshold aux-switch overlay with ONE unified

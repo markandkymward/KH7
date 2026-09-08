@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <math.h>
+#include <Adafruit_NeoPixel.h>
 
 static const char *WIFI_SSID = "NachoWi-Fi";
 static const char *WIFI_PASSWORD = "NrMaintain1!";
@@ -62,26 +63,21 @@ static const float RANGE_US_PER_CM = 58.0f;            /* standard HC-SR04 conve
  * transmits and receives; a too-close echo can arrive before its own ringing settles).
  * NOT the fix for the much larger 43-597cm scatter observed 2026-08-23 - that was
  * traced to off-axis/multipath echoes (something besides a clean, close, perpendicular
- * surface in the ~15deg beam cone), not this near-field effect - see the bootstrap gate
- * below and kh7-rangefinder-setup memory for the real mitigation. */
+ * surface in the ~15deg beam cone), not this near-field effect - the bootstrap gate that
+ * used to mitigate that scatter was removed 2026-09-05 (see comment further down); see
+ * kh7-rangefinder-setup memory for the original characterization. */
 static const float RANGE_MIN_VALID_CM = 5.0f;
-/* Bootstrap validation gate (2026-08-23): the aircraft is always powered on the ground,
- * so true height at ESP32 boot is known to be a few cm at most - use that as a sanity
- * check to help find the sensor's correct near-ground echo among the multipath/off-axis
- * candidates it can otherwise lock onto, rather than trusting it blind from power-up.
- * Until confirmed, only readings plausible for "sitting on the ground"
- * (<=RANGE_BOOTSTRAP_REJECT_ABOVE_CM) are reported at all; several consecutive readings
- * landing convincingly close (<=RANGE_BOOTSTRAP_CONFIRM_BELOW_CM, deliberately a bit
- * looser than the reject line for hysteresis) confirms the sensor has locked onto the
- * real echo, after which it's trusted normally with NO upper bound - it needs to report
- * real, larger distances once airborne. Only resets on ESP32 power-up/reset (static
- * initializers below) - there's no other arm/liftoff signal visible from this board, but
- * that matches "always powered on the ground" since the bridge shares power with the FC. */
-static const float RANGE_BOOTSTRAP_REJECT_ABOVE_CM = 5.0f;
-static const float RANGE_BOOTSTRAP_CONFIRM_BELOW_CM = 10.0f;
-static const uint8_t RANGE_BOOTSTRAP_CONFIRM_COUNT = 5U;
-static uint8_t s_range_bootstrap_confirmed = 0U;
-static uint8_t s_range_bootstrap_streak = 0U;
+/* Bootstrap validation gate REMOVED (2026-09-05, at user's request) - it required 5
+ * consecutive sub-10cm readings right after an ESP32 boot before trusting anything
+ * above 5cm, which silently zeroed out every sonar reading for an entire flight
+ * whenever the aircraft wasn't left sitting flat on the ground for a moment right
+ * after power-up (a real, unnoticed cause of "sonar always reads 0 in flight" across
+ * multiple flights this session, despite the sensor working fine on the bench). Real
+ * tradeoff: this gate existed to help reject the multipath/off-axis scatter
+ * characterized 2026-08-23 (see kh7-rangefinder-setup memory, RANGE_MIN_VALID_CM's
+ * comment above) by using "known to be near-ground at boot" as a sanity anchor - with
+ * it gone, a bad multipath lock at boot has no equivalent safety net anymore. If wild
+ * sonar scatter reappears, this is the first place to look. */
 
 /* Written only from the ISR; read/cleared only from loop() with interrupts briefly
  * disabled around the read - keeps the ISR itself minimal (timestamp + flag only).
@@ -516,19 +512,28 @@ static void bridge_client_printf(const char *fmt, ...)
   }
 }
 
-/* Onboard addressable RGB LED (WS2812) - GPIO48 on ESP32-S3-DevKitC-1 (the exact board
- * this project targets per platformio.ini's board=esp32-s3-devkitc-1, before that file
- * was removed as stale - see git history). Was lit white by the factory/bootloader
- * firmware; goes dark once this sketch's own code starts running and never touches it.
- * Added 2026-08-23 as a visible "is everything actually working" indicator: off while
- * disconnected/(re)connecting, bright green once WiFi is up. rgbLedWrite() is the
- * arduino-esp32 core's built-in single-pixel helper (core 3.x+) - no external NeoPixel
- * library needed. */
+/* Status LED via the onboard addressable RGB (2026-09-06 RE-ENABLED on a fresh
+ * board): a previous board's onboard RGB never lit on any safe GPIO after a
+ * full pin sweep (see git history), so that unit fell back to a plain
+ * external LED on GPIO2 driven with digitalWrite(). This is a different
+ * physical board - back to the onboard RGB on GPIO48 (the standard
+ * ESP32-S3-DevKitC-1 onboard RGB pin) - off while disconnected/(re)connecting,
+ * bright green once WiFi is up. Uses the Adafruit_NeoPixel library rather than
+ * the arduino-esp32 core's built-in rgbLedWrite() helper - this project's
+ * PlatformIO espressif32 platform version (6.x) bundles arduino-esp32 core
+ * 2.x, which doesn't have rgbLedWrite() (added in core 3.x); NeoPixel drives
+ * the same WS2812 protocol directly and needs no core upgrade. If this
+ * board's onboard RGB also turns out to be dead, revert to the
+ * GPIO2-plain-LED approach above (in git history) rather than re-sweeping
+ * pins from scratch. */
 static const int STATUS_LED_PIN = 48;
+static Adafruit_NeoPixel s_status_led(1, STATUS_LED_PIN, NEO_GRB + NEO_KHZ800);
 
 static void connect_wifi()
 {
-  rgbLedWrite(STATUS_LED_PIN, 0, 0, 0);
+  s_status_led.begin();
+  s_status_led.setPixelColor(0, 0, 0, 0);
+  s_status_led.show();
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
@@ -540,7 +545,8 @@ static void connect_wifi()
     Serial.print(".");
   }
 
-  rgbLedWrite(STATUS_LED_PIN, 0, 255, 0);
+  s_status_led.setPixelColor(0, 0, 255, 0);
+  s_status_led.show();
   Serial.println("\n[ESP32] WiFi connected!");
   Serial.print("[ESP32] IP: ");
   Serial.println(WiFi.localIP());
@@ -618,7 +624,7 @@ static void range_service()
     interrupts();
 
     /* Always report exactly one line per completed echo cycle - cm=0.0 on any
-     * rejection path (echo timeout, near-field floor, unconfirmed-bootstrap-too-far)
+     * rejection path (echo timeout, near-field floor)
      * instead of silently doing nothing, so the far end can tell "actively rejecting
      * noise" apart from "sensor/link is dead" just by watching whether cm keeps
      * updating at all. Added 2026-08-23 after exactly that ambiguity cost real
@@ -643,35 +649,15 @@ static void range_service()
       if (distance_cm >= RANGE_MIN_VALID_CM)
       {
         /* Only feed already-past-the-near-field-floor candidates into the multipath
-         * filter - keeps this a clean, separate concern from the bootstrap gate below,
-         * which then operates on the filtered value instead of the raw one. */
+         * filter. */
         float confidence = 1.0f;
         float filtered_cm = range_filter_apply_ex(s_range_filter_buf, &s_range_filter_count,
                                                    &s_range_filter_idx, RANGE_FILTER_WINDOW,
                                                    distance_cm, &confidence);
 
-        if (s_range_bootstrap_confirmed == 0U)
-        {
-          if (filtered_cm <= RANGE_BOOTSTRAP_CONFIRM_BELOW_CM)
-          {
-            s_range_bootstrap_streak++;
-            if (s_range_bootstrap_streak >= RANGE_BOOTSTRAP_CONFIRM_COUNT)
-            {
-              s_range_bootstrap_confirmed = 1U;
-            }
-          }
-          else
-          {
-            s_range_bootstrap_streak = 0U;
-          }
-        }
-
-        if ((s_range_bootstrap_confirmed != 0U) || (filtered_cm <= RANGE_BOOTSTRAP_REJECT_ABOVE_CM))
-        {
-          report_cm = filtered_cm;
-          report_confidence = confidence;
-          report_valid = 1U;
-        }
+        report_cm = filtered_cm;
+        report_confidence = confidence;
+        report_valid = 1U;
       }
     }
 

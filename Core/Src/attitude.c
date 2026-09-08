@@ -81,11 +81,55 @@ void Attitude_Init(void)
  * angle drift even while the aircraft is physically level. A small nonzero
  * floor keeps a slow trickle of correction alive at all times. */
 #define ATTITUDE_ACCEL_TRUST_MIN_WEIGHT 0.05f
-/* Cutoff for the trust-gating magnitude filter - fast enough to still gate
- * out a real sustained tilt/acceleration event within ~200ms, slow enough to
- * average out prop/motor vibration (tens of Hz) so a level hover reads as
- * near-1g on average despite noisy instantaneous samples. */
-#define ATTITUDE_ACCEL_MAG_LPF_HZ 5.0f
+/* Cutoff for the trust-gating magnitude filter. Raised 5.0f -> 20.0f
+ * (2026-09-05) after a hand-held bench test (hold at constant height, tilt by
+ * hand, motors OFF so vibration is fully ruled out) showed VertEkf's fused
+ * height violently diverging - 15-20cm+ during real flight tilts, 40cm+ at
+ * the bench test's larger tilts - on every single pitch/roll excursion, while
+ * both raw range sensors (LUNA, sonar) stayed smooth throughout. Root cause:
+ * at the old 5Hz cutoff (~200ms lag), a fast real tilt's accelerometer
+ * deviation takes ~200ms to be detected and trust faded down, and in that
+ * window a still-highly-trusted correction at two_kp=3.0 drags the AHRS
+ * quaternion off true attitude - the EXACT same mechanism already found and
+ * partially mitigated for throttle-ramp transients on 2026-08-18 (see
+ * ATTITUDE_ACCEL_TRUST_MAX_DEV_G's comment above), just triggered by tilt
+ * instead of thrust. That corrupted quaternion then feeds BOTH
+ * Attitude_GetVerticalAccelMps2() (vert_ekf.c's predict step) and
+ * VertEkf_UpdateRange()'s tilt compensation, so the error shows up doubled.
+ * 20Hz (~50ms lag, a 4x cut) reacts to a real disturbance far faster while
+ * staying well below APP_GYRO_RATE_LPF_HZ=70Hz - this project's own
+ * already-flight-validated cutoff for rejecting this airframe's actual
+ * motor/prop vibration content - so genuine vibration should still average
+ * out here same as before; only the reaction time to a genuine sustained
+ * disturbance changed. NOT YET RE-VALIDATED on the bench as of this note -
+ * rerun the same hand-held tilt test and confirm the fused height stays
+ * close to LUNA/sonar through a tilt before trusting this in flight. */
+#define ATTITUDE_ACCEL_MAG_LPF_HZ 20.0f
+
+/* Gyro-rate accelerometer trust gate - TRIED AND REVERTED (2026-09-05, same
+ * night). Added a second trust signal gating on raw gyro rate (thresholds
+ * copied directly from iNav's imuCalculateAccelerometerWeightRateIgnore()
+ * defaults: full trust below 10deg/s, ramping to ZERO by 20deg/s), on the
+ * theory that gyro rate reacts to a fast rotation with no filtering lag,
+ * unlike the magnitude-deviation gate above. REVERTED after the very next
+ * bench test: user reported never tilting the aircraft more than ~20-30deg,
+ * but telemetry showed pitch/roll spiking to 90-128deg. Root-caused directly
+ * from that capture: real hand-tilt gyro rates were ABOVE 20deg/s in 54% of
+ * all samples, sustained for seconds at a time (ordinary repositioning
+ * easily produces 50-100+ deg/s, not just violent disturbances) - so this
+ * gate was killing accelerometer correction almost continuously during any
+ * real tilting, not just brief fast rotations, letting the quaternion
+ * integrate on gyro alone (with whatever real bias/drift the gyro has) for
+ * long enough to run away by 60+ degrees from true attitude (confirmed
+ * directly in that capture: pitch climbed smoothly 36->88deg over 2.5s while
+ * gyro rate stayed mostly 50-90dps the whole time - textbook uncorrected
+ * integration drift, not measurement noise). iNav's specific numeric
+ * defaults evidently don't transfer safely to this airframe/gyro without
+ * further validation this session didn't do before flashing it - do not
+ * reintroduce a gyro-rate trust gate without bench-testing candidate
+ * thresholds MUCH higher than 20deg/s (real hand-tilt/flight rates routinely
+ * exceed that) and confirming reported attitude tracks a known real motion
+ * before trusting it again. */
 
 void Attitude_UpdateIMU(float gx_rad_s,
                         float gy_rad_s,
@@ -240,6 +284,77 @@ float Attitude_GetVerticalAccelMps2(float ax_g, float ay_g, float az_g)
   return (up_g - 1.0f) * 9.80665f;
 }
 
+/* Tilt-compensated horizontal specific force in the vehicle's OWN current-
+ * heading frame (2026-09-05, feeds horiz_ekf.c's dead-reckoning predict step
+ * the same way Attitude_GetVerticalAccelMps2() feeds vert_ekf.c). Deliberately
+ * stops short of true north/east: this AHRS is IMU-only (gyro+accel, see
+ * Attitude_UpdateIMU()) with no magnetometer input of its own, so its
+ * internal yaw is corrected only indirectly, via app.c's mag_yaw_nudge_dps
+ * being subtracted from gz_rad_s BEFORE it reaches Attitude_UpdateIMU() -
+ * that keeps the externally-tracked yaw_deg (Attitude_GetBoardAnglesDeg()'s
+ * yaw output, minus app.c's one-time startup_yaw_offset_deg calibration)
+ * accurate, but this function has no reason to duplicate that by reading the
+ * quaternion's own absolute yaw. Instead it removes ONLY pitch/roll tilt -
+ * exact for any tilt angle (no small-angle approximation), not yaw-dependent
+ * at all - and leaves the final body-yaw-frame -> true-NED rotation to
+ * Nav_RotateBodyToNed(..., yaw_deg, ...), the SAME already-validated function
+ * every other body-frame-to-NED conversion in this codebase already uses.
+ * That split guarantees this estimator's NED frame can never silently
+ * disagree with NAVPOSHOLD's own stick-to-NED mapping over a startup-offset
+ * or yaw-source mismatch.
+ *
+ * Method: project body +X (forward) onto the plane perpendicular to world-up
+ * to get "forward" as it would read if the vehicle's current yaw were
+ * leveled out, then take "right" as up-cross-forward (consistent with this
+ * codebase's X-forward/Y-right/Z-up right-handed body frame - a level board
+ * reads world-up as its own +Z, per Attitude_GetWorldUpInBodyFrame()). Exact
+ * for combined pitch+roll, unlike the common ax*cos(pitch)+az*sin(pitch)-
+ * style approximation - worth the extra few lines given NAV_POSHOLD's own
+ * tilt authority now reaches the same ~35deg ATTITUDE-mode ceiling as manual
+ * flying, well outside where a small-angle approximation stays accurate. */
+void Attitude_GetHorizontalAccelBodyYaw(float ax_g, float ay_g, float az_g,
+                                        float *accel_fwd_mps2, float *accel_right_mps2)
+{
+  float gx;
+  float gy;
+  float gz;
+  float fwd_x;
+  float fwd_y;
+  float fwd_z;
+  float fwd_norm_sq;
+  float fwd_norm;
+  float right_x;
+  float right_y;
+  float right_z;
+
+  Attitude_GetWorldUpInBodyFrame(&gx, &gy, &gz);
+
+  fwd_x = 1.0f - (gx * gx);
+  fwd_y = -(gx * gy);
+  fwd_z = -(gx * gz);
+  fwd_norm_sq = (fwd_x * fwd_x) + (fwd_y * fwd_y) + (fwd_z * fwd_z);
+  if (fwd_norm_sq < 1e-6f)
+  {
+    /* Body +X is (near-)vertical - vehicle is pitched ~90deg, "forward" in
+     * the horizontal plane is undefined. Should never happen in normal
+     * flight; return zero rather than divide by ~zero. */
+    *accel_fwd_mps2 = 0.0f;
+    *accel_right_mps2 = 0.0f;
+    return;
+  }
+  fwd_norm = sqrtf(fwd_norm_sq);
+  fwd_x /= fwd_norm;
+  fwd_y /= fwd_norm;
+  fwd_z /= fwd_norm;
+
+  right_x = (gy * fwd_z) - (gz * fwd_y);
+  right_y = (gz * fwd_x) - (gx * fwd_z);
+  right_z = (gx * fwd_y) - (gy * fwd_x);
+
+  *accel_fwd_mps2 = ((ax_g * fwd_x) + (ay_g * fwd_y) + (az_g * fwd_z)) * 9.80665f;
+  *accel_right_mps2 = ((ax_g * right_x) + (ay_g * right_y) + (az_g * right_z)) * 9.80665f;
+}
+
 void Attitude_GetBoardAnglesDeg(float *pitch_deg,
                                 float *roll_deg,
                                 float *yaw_deg)
@@ -248,13 +363,31 @@ void Attitude_GetBoardAnglesDeg(float *pitch_deg,
   float g_y;
   float g_z;
   float pitch_denom;
-  float roll_denom;
   float yaw;
 
   Attitude_GetWorldUpInBodyFrame(&g_x, &g_y, &g_z);
 
+  /* pitch_denom uses sqrt(gy^2+gz^2) deliberately (this simplifies to exactly
+   * |cos(pitch)| for any roll, keeping the pitch extraction well-behaved and
+   * roll-independent - correct as originally written, verified 2026-09-05).
+   * roll does NOT get the equivalent treatment - roll is simply atan2(gy,gz),
+   * no denominator combination needed, because gy/gz = tan(roll) exactly
+   * (the cos(pitch) factor common to both cancels on its own).
+   *
+   * BUG FOUND AND FIXED 2026-09-05: this used to compute
+   * atan2f(g_y, sqrtf(gx^2+gz^2)) instead of atan2f(g_y, g_z) - only correct
+   * when pitch happens to be near zero (then sqrt(gx^2+gz^2) ~= |gz|).  At
+   * any combined large pitch+roll it diverges badly: numerically verified
+   * against a real bench-test moment (pitch=-50deg, roll=-65deg) - the old
+   * formula returned -35.6deg, 29 degrees off the true -65deg. Found while
+   * investigating a real fused-height divergence bug (vert_ekf.c's own tilt
+   * compensation reads gx/gy/gz directly from Attitude_GetWorldUpInBodyFrame()
+   * and was NOT affected by this - this bug hit ATTITUDE-mode's actual roll
+   * control and all roll_deg telemetry instead, independent of that other
+   * investigation, but found by the same person insisting the sin/cos math
+   * had to be wrong somewhere - they were right, just about a different
+   * consumer of it than first suspected). */
   pitch_denom = sqrtf((g_y * g_y) + (g_z * g_z));
-  roll_denom = sqrtf((g_x * g_x) + (g_z * g_z));
 
   /* Negated vs. the raw gravity-vector components so pitch/roll increase in the
    * same sense as gx_dps/gy_dps (the unflipped rate convention used everywhere
@@ -262,7 +395,7 @@ void Attitude_GetBoardAnglesDeg(float *pitch_deg,
    * target_roll/pitch_deg) - without this, ATTITUDE mode's angle error runs
    * away in the same direction as a real disturbance instead of opposing it. */
   *pitch_deg = Attitude_WrapAngle180(atan2f(-g_x, pitch_denom) * DEG_PER_RAD);
-  *roll_deg = Attitude_WrapAngle180(atan2f(g_y, roll_denom) * DEG_PER_RAD);
+  *roll_deg = Attitude_WrapAngle180(atan2f(g_y, g_z) * DEG_PER_RAD);
 
   yaw = -atan2f(2.0f * ((g_ahrs.q0 * g_ahrs.q3) + (g_ahrs.q1 * g_ahrs.q2)),
                 1.0f - 2.0f * ((g_ahrs.q2 * g_ahrs.q2) + (g_ahrs.q3 * g_ahrs.q3))) * DEG_PER_RAD;

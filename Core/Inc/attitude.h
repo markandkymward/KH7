@@ -26,6 +26,14 @@ float Attitude_GetVerticalAccelMps2(float ax_g, float ay_g, float az_g);
  * doc comment at its definition in attitude.c for what it's for (dot it with
  * any body-frame vector to get that vector's world-up component). */
 void Attitude_GetWorldUpInBodyFrame(float *gx, float *gy, float *gz);
+/* Tilt-compensated horizontal specific force, in m/s^2, expressed in the
+ * vehicle's OWN current-heading frame (forward/right) - NOT true north/east
+ * (this deliberately does not touch yaw at all; see the doc comment at its
+ * definition in attitude.c for why, and Nav_RotateBodyToNed() for the
+ * separate step that rotates this into true NED using the already-mag-
+ * corrected yaw_deg). Feeds HorizEkf_Predict(). */
+void Attitude_GetHorizontalAccelBodyYaw(float ax_g, float ay_g, float az_g,
+                                        float *accel_fwd_mps2, float *accel_right_mps2);
 
 #ifdef __cplusplus
 }

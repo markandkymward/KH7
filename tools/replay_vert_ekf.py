@@ -34,11 +34,17 @@ import numpy as np
 sys.path.insert(0, "tools")
 import sdlog_analyze as sd
 
-# ---- Mirrors Core/Src/vert_ekf.c constants exactly (2026-08-29) ----
-LIDAR_ARM_X_M = 0.0990
-LIDAR_ARM_Y_M = -0.0990
-SONAR_ARM_X_M = -0.0566
-SONAR_ARM_Y_M = -0.0566
+# ---- Mirrors Core/Src/vert_ekf.c constants exactly (2026-09-06 - re-synced after
+# this replay drifted out of date with the real firmware: arm offsets were still
+# the pre-caliper-measurement 2026-08-29 values, R bases were the pre-2026-09-05
+# ones, and the cross-check tie-break below still had the g_x[0]-based
+# self-reinforcing-lockout bug fixed in the real code 2026-09-06 - see that fix's
+# comment in vert_ekf.c for why comparing against the filter's own state there is
+# wrong) ----
+LIDAR_ARM_X_M = 0.060
+LIDAR_ARM_Y_M = 0.047
+SONAR_ARM_X_M = -0.045
+SONAR_ARM_Y_M = -0.0755
 
 ROTOR_DIAMETER_M = 0.127
 GROUND_EFFECT_ZONE_M = 2.0 * ROTOR_DIAMETER_M
@@ -46,8 +52,8 @@ GROUND_EFFECT_THRUST_REF_US = 350.0
 BARO_GROUND_EFFECT_R_GAIN = 20.0
 
 BARO_R_BASE_M2 = 0.06 * 0.06
-LIDAR_R_BASE_M2 = 0.03 * 0.03
-SONAR_R_BASE_M2 = 0.02 * 0.02
+LIDAR_R_BASE_M2 = 0.015 * 0.015
+SONAR_R_BASE_M2 = 0.01 * 0.01
 CONFIDENCE_FLOOR = 0.05
 
 BARO_CROSSCHECK_SIGMA_MULT = 3.0
@@ -204,18 +210,26 @@ class VertEkf:
             fade_shape = 0.5 - (0.5 * math.cos(fade_frac * math.pi))
             r *= (1.0 + (fade_r_gain * fade_shape))
 
-        if range_m < CROSSCHECK_MAX_M:
-            if is_lidar:
-                other_h, other_r, other_ms = self.sonar_last_h, self.sonar_last_r, self.sonar_last_ms
-            else:
-                other_h, other_r, other_ms = self.lidar_last_h, self.lidar_last_r, self.lidar_last_ms
+        if is_lidar:
+            other_h, other_r, other_ms = self.sonar_last_h, self.sonar_last_r, self.sonar_last_ms
+        else:
+            other_h, other_r, other_ms = self.lidar_last_h, self.lidar_last_r, self.lidar_last_ms
+        # 2026-08-30 fix (also missing from this replay until now): gate on
+        # EITHER sensor being in-band, not just the fresh reading's own range -
+        # otherwise a false-FAR reading from one sensor skips the cross-check
+        # entirely even when the other sensor has a perfectly good, current
+        # in-band reading that could have caught it.
+        either_in_band = (range_m < CROSSCHECK_MAX_M) or (abs(other_h) < CROSSCHECK_MAX_M)
+        if either_in_band:
             if other_ms != 0 and (now_ms - other_ms) < CROSSCHECK_MAX_AGE_MS:
                 combined_sigma = math.sqrt(r + other_r)
                 disagreement = abs(implied_h - other_h)
                 if disagreement > (CROSSCHECK_SIGMA_MULT * combined_sigma):
-                    this_err = abs(implied_h - self.x[0])
-                    other_err = abs(other_h - self.x[0])
-                    if this_err > other_err:
+                    # 2026-09-06 fix: tie-break on which sensor's OWN pre-penalty
+                    # variance (r) is worse, NOT which one agrees more with
+                    # self.x[0] - comparing against the filter's own state creates
+                    # a self-reinforcing lockout (see vert_ekf.c's matching fix).
+                    if r > other_r:
                         r *= cross_check_penalty(disagreement, combined_sigma,
                                                   CROSSCHECK_SIGMA_MULT, CROSSCHECK_R_PENALTY)
 

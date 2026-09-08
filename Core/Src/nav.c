@@ -1,6 +1,7 @@
 #include "nav.h"
 
 #include "gps.h"
+#include "horiz_ekf.h"
 
 #include <math.h>
 #include <string.h>
@@ -148,6 +149,11 @@ void Nav_LatchReference(void)
   g_nav.filtered_north_m = 0.0f;
   g_nav.filtered_east_m = 0.0f;
   g_have_prev_position = 0U;
+  /* horiz_ekf.c's position states are only ever meaningful relative to THIS
+   * origin - must reset in lockstep with it, not on some independent
+   * schedule, or its getters would keep reporting a distance measured from
+   * the OLD origin. */
+  HorizEkf_Reset();
 }
 
 /* Central "is this candidate sample sane" gate - a single function per the
@@ -281,8 +287,6 @@ void Nav_Update(uint32_t now_ms, uint8_t motors_armed)
 
         if (sample_ok != 0U)
         {
-          float dt_s = ((float)update_period_ms) * 0.001f;
-
           g_nav.north_m = north_m;
           g_nav.east_m = east_m;
           g_prev_north_m = north_m;
@@ -295,27 +299,18 @@ void Nav_Update(uint32_t now_ms, uint8_t motors_armed)
           g_nav.vel_e_mps = vel_e_mps;
           g_nav.vel_d_mps = vel_d_mps;
 
-          if (g_nav.consecutive_valid == 0U)
-          {
-            /* First sample after init/reacquisition: seed the filters directly,
-             * no transient from whatever stale value was there before. */
-            g_nav.filtered_north_vel_mps = vel_n_mps;
-            g_nav.filtered_east_vel_mps = vel_e_mps;
-            g_nav.filtered_north_m = north_m;
-            g_nav.filtered_east_m = east_m;
-          }
-          else
-          {
-            float vel_tau_s = 1.0f / (2.0f * 3.14159265f * NAV_VELOCITY_LPF_HZ);
-            float vel_alpha = 1.0f - expf(-dt_s / vel_tau_s);
-            float pos_tau_s = 1.0f / (2.0f * 3.14159265f * NAV_POSITION_LPF_HZ);
-            float pos_alpha = 1.0f - expf(-dt_s / pos_tau_s);
-
-            g_nav.filtered_north_vel_mps += vel_alpha * (vel_n_mps - g_nav.filtered_north_vel_mps);
-            g_nav.filtered_east_vel_mps += vel_alpha * (vel_e_mps - g_nav.filtered_east_vel_mps);
-            g_nav.filtered_north_m += pos_alpha * (north_m - g_nav.filtered_north_m);
-            g_nav.filtered_east_m += pos_alpha * (east_m - g_nav.filtered_east_m);
-          }
+          /* horiz_ekf.c's GPS measurement update, replacing the exponential
+           * LPF this block used to apply directly to raw GPS position/
+           * velocity (2026-09-05) - see horiz_ekf.c's top-of-file comment for
+           * why: a low-pass filter can only react to GPS data that has
+           * already arrived, while the dead-reckoning predict step (called
+           * from app.c every control-loop tick, not gated on a new GPS
+           * sample the way this block is) fills the gap between fixes with
+           * real accelerometer-derived motion instead. g_nav.filtered_*
+           * below is refreshed from this estimator's getters unconditionally
+           * at the end of Nav_Update(), not here, so it reflects the latest
+           * PREDICTED value even on iterations with no new GPS sample. */
+          HorizEkf_UpdateGps(north_m, east_m, vel_n_mps, vel_e_mps, h_acc_m, s_acc_mps);
         }
       }
       else if (sample_ok != 0U)
@@ -329,11 +324,10 @@ void Nav_Update(uint32_t now_ms, uint8_t motors_armed)
         g_nav.vel_e_mps = vel_e_mps;
         g_nav.vel_d_mps = vel_d_mps;
 
-        if (g_nav.consecutive_valid == 0U)
-        {
-          g_nav.filtered_north_vel_mps = vel_n_mps;
-          g_nav.filtered_east_vel_mps = vel_e_mps;
-        }
+        /* No horiz_ekf.c update here - its position states are only
+         * meaningful once a reference exists to measure them from, and
+         * g_nav.filtered_* is refreshed from its getters unconditionally
+         * below regardless of this branch. */
         sample_reject_reason = NAV_INVALID_REASON_NO_REFERENCE;
       }
 
@@ -389,6 +383,19 @@ void Nav_Update(uint32_t now_ms, uint8_t motors_armed)
   {
     Nav_LatchReference();
   }
+
+  /* Refresh from horiz_ekf.c's current PREDICTED state every call, regardless
+   * of whether this iteration carried a new GPS sample - this is the whole
+   * point of dead reckoning over a plain low-pass filter (see horiz_ekf.c's
+   * top-of-file comment): callers reading g_nav.filtered_* get an estimate
+   * that has already been advanced by real accelerometer-derived motion
+   * since the last GPS fix, not one waiting on the next fix to move at all.
+   * Placed before the validity decision below so its NONFINITE check (which
+   * reads these same fields) sees this iteration's fresh value. */
+  g_nav.filtered_north_m = HorizEkf_GetNorthM();
+  g_nav.filtered_east_m = HorizEkf_GetEastM();
+  g_nav.filtered_north_vel_mps = HorizEkf_GetNorthVelMps();
+  g_nav.filtered_east_vel_mps = HorizEkf_GetEastVelMps();
 
   /* ---- Single central validity decision (App_Update/telemetry/tests all use this same result). ---- */
   if ((Nav_IsFiniteF(lat_deg) == 0U) || (Nav_IsFiniteF(lon_deg) == 0U) ||

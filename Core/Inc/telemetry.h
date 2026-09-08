@@ -54,7 +54,9 @@ void Telemetry_PrintAltholdState(uint8_t holding,
                                  float climb_error_mps,
                                  int32_t trim_us,
                                  int32_t damp_us,
-                                 float hover_throttle_us);
+                                 float hover_throttle_us,
+                                 uint16_t stick_ref_us,
+                                 uint8_t stick_dormant);
 void Telemetry_PrintGpsState(uint8_t configured,
 							 uint8_t healthy,
 							 uint8_t fix_type,
@@ -88,6 +90,16 @@ void Telemetry_PrintNavState(uint8_t valid,
 							 uint32_t duplicate_count,
 							 uint32_t rejected_count,
 							 uint32_t dropout_count);
+/* horiz_ekf.c's fused state - the same "watch it live on the bench" idiom as
+ * Telemetry_PrintVertEkfState() (see this codebase's horiz_ekf.c for what a
+ * healthy walk/carry test should look like before ever trusting this in a
+ * hover). */
+void Telemetry_PrintHorizEkfState(float north_m,
+                                  float east_m,
+                                  float north_vel_mps,
+                                  float east_vel_mps,
+                                  float accel_bias_north_mps2,
+                                  float accel_bias_east_mps2);
 void Telemetry_PrintNavPosVel(float north_m,
 							 float east_m,
 							 float raw_vel_n_mps,

@@ -118,11 +118,19 @@ typedef struct
 #define NAV_MAX_VELOCITY_JUMP_MPS      8.0f
 #define NAV_MIN_CONSECUTIVE_VALID      5U
 #define NAV_MIN_FIX_TYPE               3U /* 3D fix */
-#define NAV_VELOCITY_LPF_HZ            0.5f
-/* Slower than the velocity LPF above - position-hold's job is slow wind-drift
- * correction, not tracking fast motion, and raw position noise is meter-scale
- * (see Nav_State_t.filtered_north_m/east_m above). */
-#define NAV_POSITION_LPF_HZ            0.3f
+/* Raised 2026-09-04 (0.5->1.5, 0.3->1.0): the ORIGINAL rationale below ("slow
+ * wind-drift correction, not fast motion") assumed the hold only ever fights
+ * gentle disturbance - a full session of real flight data instead showed the
+ * hold's corrections consistently arriving a beat late even after several
+ * rounds of raising control-loop gain/authority, because the FEEDBACK itself
+ * was lagging: at the old cutoffs, a step change in true velocity/position
+ * took ~0.3s/~0.5s (1/(2*pi*Hz)) just to reach 63% of its real value in the
+ * filtered signal the hold loop actually sees, regardless of how strong the
+ * eventual commanded tilt is. Raised ~3x each - still comfortably below the
+ * raw GPS sample rate (~3-5Hz) so real position/velocity noise between
+ * samples is still smoothed, just with far less lag once the drift is real. */
+#define NAV_VELOCITY_LPF_HZ            1.5f
+#define NAV_POSITION_LPF_HZ            1.0f
 
 void Nav_Init(void);
 /* Called every App_Update() iteration. armed/disarmed only affects automatic
